@@ -1,0 +1,48 @@
+{
+  "name": "default",
+  "version": 1,
+  "description": "Baseline SecurePR policy applied to any repository without a repo-specific override.",
+  "auto_approval_risk_threshold": 39,
+  "mandatory_ci_checks": [
+    "build",
+    "unit-tests",
+    "lint"
+  ],
+  "ci_check_aliases": {
+    "build": [
+      "Build / Install dependencies",
+      "build / install dependencies"
+    ],
+    "unit-tests": [
+      "Tests / Unit tests",
+      "tests / unit tests"
+    ],
+    "lint": [
+      "Lint / Ruff",
+      "lint / ruff"
+    ]
+  },
+  "blocked_paths": [
+    "**/secrets/**",
+    "**/*.pem",
+    "**/*.key",
+    "**/.env",
+    "infra/prod/**",
+    "**/migrations/**prod**"
+  ],
+  "human_review_required_paths": [
+    "**/auth/**",
+    "**/payments/**",
+    "**/billing/**",
+    "**/.github/workflows/**",
+    "**/Dockerfile",
+    "**/docker-compose*.yml"
+  ],
+  "max_files_for_auto_approval": 25,
+  "disallowed_authors": [],
+  "circuit_breaker_conditions": {
+    "auto_trip_on_critical_finding": true,
+    "auto_trip_after_n_blocked_prs": 3,
+    "auto_trip_window_minutes": 60
+  }
+}

@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SecurePR Dashboard</title>
+<link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+  <section id="authGate" class="auth-gate" aria-labelledby="authTitle">
+    <div class="auth-card">
+      <div class="brand-icon auth-icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 3v6c0 5-3.4 8.5-8 11-4.6-2.5-8-6-8-11V5l8-3z"/></svg>
+      </div>
+      <h1 id="authTitle">Sign in to SecurePR</h1>
+      <p class="section-sub">Use your provisioned SecurePR operator account.</p>
+      <form id="loginForm">
+        <label class="field-label" for="loginEmail">Email</label>
+        <input id="loginEmail" type="email" autocomplete="username" required />
+        <label class="field-label" for="loginPassword">Password</label>
+        <input id="loginPassword" type="password" autocomplete="current-password" required />
+        <button id="signInButton" class="btn" type="submit">Sign in</button>
+      </form>
+      <p id="authMessage" class="auth-message" role="status" aria-live="polite"></p>
+    </div>
+  </section>
+  <div id="app" hidden>
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-icon">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 3v6c0 5-3.4 8.5-8 11-4.6-2.5-8-6-8-11V5l8-3z"/></svg>
+        </div>
+        <div>
+          <div class="brand-title">SecurePR</div>
+          <div class="brand-sub">AI-Powered PR Risk Review</div>
+        </div>
+      </div>
+
+      <nav id="navLinks">
+        <button class="nav-link active" data-tab="overview">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10l9-7 9 7"/><path d="M5 10v10h5v-6h4v6h5V10"/></svg>
+          Overview
+        </button>
+        <button class="nav-link" data-tab="pull-requests">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="9" r="2.5"/><path d="M6 8.5V15.5"/><path d="M6 15.5c0-4 3-6.5 6-6.5h3.5"/></svg>
+          Repositories &amp; PRs
+        </button>
+        <button class="nav-link" data-tab="circuit-breaker">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4 14h6l-1 8 9-12h-6l1-8z"/></svg>
+          Circuit Breaker
+        </button>
+        <button class="nav-link" data-tab="evidence-replay">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9h10M7 13h10M7 17h6"/></svg>
+          Evidence &amp; Replay
+        </button>
+        <button class="nav-link" data-tab="impact-simulator">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="12" r="2.5"/><circle cx="19" cy="6" r="2.5"/><circle cx="19" cy="18" r="2.5"/><path d="M7.3 10.8L16.7 7.2M7.3 13.2L16.7 16.8"/></svg>
+          Change Impact
+        </button>
+        <button class="nav-link" data-tab="approval-config">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12l2 2 4-4"/><path d="M12 3l7 3v5c0 5-3 8.5-7 10-4-1.5-7-5-7-10V6l7-3z"/></svg>
+          Auto-Approval
+        </button>
+        <button class="nav-link" data-tab="policies">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h5"/></svg>
+          Policies
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="workspace-card">
+          <div class="workspace-avatar">SP</div>
+          <div class="workspace-meta">
+            <div class="workspace-name">SecurePR Workspace</div>
+            <div id="signedInUser" class="workspace-status"></div>
+          </div>
+        </div>
+        <button id="signOutButton" class="btn secondary" type="button">Sign out</button>
+        <div class="api-base">
+          <label>API base URL</label>
+          <input id="apiBase" value="" readonly />
+        </div>
+      </div>
+    </aside>
+
+    <main>
+      <!-- ============================================================ OVERVIEW -->
+      <section id="tab-overview" class="tab active">
+        <div class="topbar">
+          <div>
+            <h1>Overview</h1>
+            <p class="subtitle">Real-time pull request risk analysis, policy enforcement, and automated review insights.</p>
+          </div>
+          <div class="topbar-actions">
+            <div class="select-pill">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.9a3.1 3.1 0 0 0-.9-2.4c3-.3 6-1.5 6-6.6A5.1 5.1 0 0 0 19.6 5a4.8 4.8 0 0 0-.1-3.6s-1.1-.3-3.5 1.4a12.3 12.3 0 0 0-6.4 0C7.2 1.1 6.1 1.4 6.1 1.4A4.8 4.8 0 0 0 6 5a5.1 5.1 0 0 0-1.4 3.6c0 5.1 3 6.3 6 6.6a3.1 3.1 0 0 0-.9 2.4V21"/></svg>
+              <select id="overviewRepoFilter"><option value="">All repositories</option></select>
+            </div>
+            <div class="live-pill">
+              <span class="dot"></span> Live <span class="pill-sub">GitHub Connected</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="kpi-grid" id="overviewCards"></div>
+
+        <div class="grid-3">
+          <div class="panel">
+            <h2 class="section-title">Decision Distribution</h2>
+            <p class="section-sub">Outcome of finalized PR reviews.</p>
+            <div id="decisionDonut"></div>
+          </div>
+          <div class="panel">
+            <h2 class="section-title">Risk Distribution</h2>
+            <p class="section-sub">Risk level of analyzed pull requests.</p>
+            <div id="riskDonut"></div>
+          </div>
+          <div class="panel">
+            <h2 class="section-title">Analysis Trend</h2>
+            <p class="section-sub">PRs analyzed over the last 7 days.</p>
+            <div id="trendChart"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="section-title">Recent Pull Requests</h2>
+              <p class="section-sub">Latest PRs analyzed by SecurePR with risk and decision details.</p>
+            </div>
+            <button class="btn ghost" onclick="switchTab('pull-requests')">View All PRs →</button>
+          </div>
+          <div id="recentPrTableWrap"><div class="empty-state">Loading…</div></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="section-title">Connected Repositories</h2>
+              <p class="section-sub">Repositories linked to SecurePR for automated PR analysis.</p>
+            </div>
+          </div>
+          <div id="repoListWrap"><div class="empty-state">Loading…</div></div>
+        </div>
+      </section>
+
+      <!-- ===================================================== REPOS & PRs -->
+      <section id="tab-pull-requests" class="tab">
+        <div class="topbar">
+          <div>
+            <h1>Repositories &amp; Pull Requests</h1>
+            <p class="subtitle">Select a repository to see its pull requests — no IDs to copy or paste.</p>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="form-row">
+            <div>
+              <label class="field-label">Repository</label>
+              <select id="prRepoSelect" class="control-select" onchange="onPrRepoChange()"><option value="">Select a repository…</option></select>
+            </div>
+          </div>
+        </div>
+        <div class="panel" id="prListPanel"><div class="empty-state">Select a repository above to load its pull requests.</div></div>
+        <div class="panel" id="prDetailPanel" style="display:none;"></div>
+      </section>
+
+      <!-- ======================================================= CIRCUIT BREAKER -->
+      <section id="tab-circuit-breaker" class="tab">
+        <div class="topbar">
+          <div>
+            <h1>Circuit Breaker</h1>
+            <p class="subtitle">Suspend automatic approval globally, for a repository, or for a specific user — analysis and comments keep running either way.</p>
+          </div>
+        </div>
+        <div class="panel">
+          <h2 class="section-title">Trip a Circuit Breaker</h2>
+          <div class="form-row" style="margin-top:10px;">
+            <div>
+              <label class="field-label">Scope</label>
+              <select id="cbScope" class="control-select" onchange="onCbScopeChange()">
+                <option value="GLOBAL">Global — all repositories</option>
+                <option value="REPOSITORY">Repository</option>
+                <option value="USER">User</option>
+              </select>
+            </div>
+            <div id="cbRepoWrap" style="display:none;">
+              <label class="field-label">Repository</label>
+              <select id="cbRepoSelect" class="control-select"></select>
+            </div>
+            <div id="cbUserWrap" style="display:none;">
+              <label class="field-label">GitHub username</label>
+              <input id="cbUserLogin" placeholder="e.g. octocat" list="cbUserList" />
+              <datalist id="cbUserList"></datalist>
+            </div>
+            <div>
+              <label class="field-label">Reason</label>
+              <input id="cbReason" placeholder="e.g. investigating a bad merge" style="width:260px;" />
+            </div>
+            <div>
+              <label class="field-label">Auto-resume after (minutes, optional)</label>
+              <input id="cbSuspendMinutes" placeholder="e.g. 60" style="width:160px;" />
+            </div>
+          </div>
+          <button class="btn danger" onclick="tripBreaker()">Trip Breaker</button>
+        </div>
+        <div class="panel">
+          <h2 class="section-title">Active &amp; Historical Breakers</h2>
+          <button class="btn secondary" onclick="loadBreakers()">Refresh</button>
+          <div id="cbCardsWrap" style="margin-top:12px;"><div class="empty-state">Loading…</div></div>
+        </div>
+      </section>
+
+      <!-- ================================================== EVIDENCE & REPLAY -->
+      <section id="tab-evidence-replay" class="tab">
+        <div class="topbar">
+          <div>
+            <h1>Evidence-Backed Risk Assessment &amp; Decision Replay</h1>
+            <p class="subtitle">Pick a repository and a pull request to see the full history of every review ever run for it.</p>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="form-row">
+            <div>
+              <label class="field-label">Repository</label>
+              <select id="evRepoSelect" class="control-select" onchange="onEvRepoChange()"><option value="">Select a repository…</option></select>
+            </div>
+            <div>
+              <label class="field-label">Pull Request</label>
+              <select id="evPrSelect" class="control-select" onchange="onEvPrChange()"><option value="">Select a repository first…</option></select>
+            </div>
+            <button class="btn secondary" onclick="reevaluatePR()" style="align-self:flex-end;">Re-evaluate (keeps history)</button>
+          </div>
+        </div>
+        <div class="panel" id="reviewHistoryPanel"><div class="empty-state">Select a repository and pull request above.</div></div>
+      </section>
+
+      <!-- ====================================================== CHANGE IMPACT -->
+      <section id="tab-impact-simulator" class="tab">
+        <div class="topbar">
+          <div>
+            <h1>Change Impact Simulator</h1>
+            <p class="subtitle">Pick a recent review to see which components it predicts are affected.</p>
+          </div>
+        </div>
+        <div class="panel">
+          <label class="field-label">Recent reviews</label>
+          <select id="impactReviewSelect" class="control-select" onchange="onImpactReviewChange()" style="min-width:420px;"><option value="">Loading recent reviews…</option></select>
+        </div>
+        <div class="panel" id="impactPanel"><div class="empty-state">Select a review above.</div></div>
+      </section>
+
+      <!-- =================================================== AUTO-APPROVAL -->
+      <section id="tab-approval-config" class="tab">
+        <div class="topbar">
+          <div>
+            <h1>Automatic Approval Configuration</h1>
+            <p class="subtitle">Pull requests may only be automatically approved when all required checks pass, the risk score is below the configured threshold, no critical findings exist, policies pass, and the Circuit Breaker is inactive.</p>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="form-row">
+            <div>
+              <label class="field-label">Repository</label>
+              <select id="eligRepoSelect" class="control-select" onchange="onEligRepoChange()"><option value="">Select a repository…</option></select>
+            </div>
+            <div>
+              <label class="field-label">GitHub user</label>
+              <select id="eligUserSelect" class="control-select"><option value="">Select a known author…</option></select>
+            </div>
+            <div>
+              <label class="field-label">Or enter manually</label>
+              <input id="eligUserManual" placeholder="github username" style="width:160px;" />
+            </div>
+            <div>
+              <label class="field-label">Max risk threshold</label>
+              <input id="eligThreshold" value="39" style="width:100px;" />
+            </div>
+            <div>
+              <label class="field-label">Enabled</label>
+              <div style="padding-top:6px;"><input type="checkbox" id="eligEnabled" /></div>
+            </div>
+          </div>
+          <button class="btn" onclick="setEligibility()">Save</button>
+        </div>
+        <div class="panel" id="eligPanel"><div class="empty-state">Select a repository above to see configured users.</div></div>
+      </section>
+
+      <!-- ========================================================= POLICIES -->
+      <section id="tab-policies" class="tab">
+        <div class="topbar">
+          <div>
+            <h1>Policies</h1>
+            <p class="subtitle">Policy documents SecurePR evaluates pull requests against. Edit the JSON files under <code>/policies</code>, or see <code>docs/Policies.md</code> for the full reference.</p>
+          </div>
+        </div>
+        <div class="panel" id="policiesPanel"><div class="empty-state">Loading…</div></div>
+      </section>
+    </main>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.119.0/dist/umd/supabase.js"></script>
+  <script src="config.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

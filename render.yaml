@@ -1,0 +1,57 @@
+services:
+  - type: web
+    name: securepr-api
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: python run.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: SECUREPR_ENV
+        value: production
+      - key: SUPABASE_AUTH_AUDIENCE
+        value: authenticated
+      - key: GEMINI_MODEL
+        value: gemini-3.8-flash
+      - key: GEMINI_FALLBACK_MODEL
+        value: gemini-2.0-flash
+      - key: CI_WAIT_POLL_INTERVAL_SECONDS
+        value: "20"
+      - key: CI_WAIT_TIMEOUT_SECONDS
+        value: "900"
+      - key: POST_CI_WAITING_COMMENT
+        value: "true"
+      - key: AUTO_MERGE_ENABLED
+        value: "false"
+      - key: AUTO_MERGE_LOW_RISK_ONLY
+        value: "true"
+      - key: AUTO_MERGE_REQUIRE_ALL_CI
+        value: "true"
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_JWT_ALGORITHM
+        sync: false
+      - key: SECUREPR_OPERATOR_IDS
+        sync: false
+      - key: SECUREPR_ADMIN_IDS
+        sync: false
+      - key: GITHUB_APP_ID
+        sync: false
+      - key: GITHUB_PRIVATE_KEY
+        sync: false
+      - key: GITHUB_WEBHOOK_SECRET
+        sync: false
+      - key: DASHBOARD_ORIGIN
+        sync: false
+      - key: DASHBOARD_ORIGINS
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: SECUREPR_BASE_URL
+        sync: false
+      - key: NOTIFY_WEBHOOK_URL
+        sync: false
