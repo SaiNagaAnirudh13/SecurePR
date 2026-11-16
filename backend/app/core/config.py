@@ -13,7 +13,6 @@ from uuid import UUID
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 SUPPORTED_SUPABASE_JWT_ALGORITHMS = frozenset(
     {"HS256", "ES256", "ES384", "RS256", "EdDSA"}
 )
@@ -38,6 +37,7 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-3.8-flash"
     GEMINI_FALLBACK_MODEL: str = "gemini-2.0-flash"
+    GEMINI_REQUEST_TIMEOUT_SECONDS: int = 20
 
     # App
     SECUREPR_ENV: str = "development"

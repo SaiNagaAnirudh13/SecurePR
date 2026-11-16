@@ -1,13 +1,12 @@
 """Safety-gate tests for auto-merge; all GitHub calls are faked."""
 from types import SimpleNamespace
-import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 
+import pytest
 from app.core.db import Base
 from app.models import models as m
 from app.services import auto_merge
-
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 POLICY = {"mandatory_ci_checks": ["build", "unit-tests", "lint"], "blocked_paths": [],
           "human_review_required_paths": [], "max_files_for_auto_approval": 25,
@@ -69,6 +68,15 @@ def test_disabled_never_calls_github(db_session, monkeypatch):
     assert _attempt(db_session, repo, pr, review).status == "DISABLED_GLOBAL"
 
 
+def test_repository_opt_in_is_required(db_session, monkeypatch):
+    repo, pr, review = _objects(db_session)
+    _enable(monkeypatch)
+    _github_ok(monkeypatch)
+    repo.is_auto_merge_enabled = False
+
+    assert _attempt(db_session, repo, pr, review).status == "DISABLED_REPOSITORY"
+
+
 def test_medium_or_high_findings_never_merge(db_session, monkeypatch):
     repo, pr, review = _objects(db_session); _enable(monkeypatch); _github_ok(monkeypatch)
     review.risk_category = "MEDIUM"
@@ -80,11 +88,70 @@ def test_medium_or_high_findings_never_merge(db_session, monkeypatch):
     assert result.status == "NOT_ELIGIBLE"
 
 
+def test_risk_categories_require_explicit_repository_policy_permission(db_session, monkeypatch):
+    repo, pr, review = _objects(db_session)
+    _enable(monkeypatch)
+    monkeypatch.setattr(auto_merge, "get_settings", lambda: SimpleNamespace(
+        AUTO_MERGE_ENABLED=True, AUTO_MERGE_LOW_RISK_ONLY=False, AUTO_MERGE_REQUIRE_ALL_CI=True))
+    _github_ok(monkeypatch)
+    review.risk_category = "MEDIUM"
+    review.overall_score = 45
+
+    def attempt(policy_doc):
+        return auto_merge.attempt(
+            db=db_session,
+            repo=repo,
+            pr=pr,
+            review=review,
+            installation_id="99",
+            policy_doc=policy_doc,
+            findings=[],
+            author_eligible=True,
+            author_threshold=60,
+        )
+
+    for category in ("MEDIUM", "HIGH"):
+        review.risk_category = category
+        result = attempt(POLICY)
+        assert result.status == "NOT_ELIGIBLE"
+        assert "policy" in result.reason
+
+    review.risk_category = "MEDIUM"
+    policy = {**POLICY, "auto_merge_allowed_risk_categories": ["LOW", "MEDIUM"]}
+    result = attempt(policy)
+    assert result.status == "MERGED"
+
+
 def test_conflict_or_ci_pending_requires_manual_merge(db_session, monkeypatch):
     repo, pr, review = _objects(db_session); _enable(monkeypatch); _github_ok(monkeypatch)
     monkeypatch.setattr(auto_merge.github_client, "get_pull_request", lambda *a: {
         "state": "open", "mergeable": False, "mergeable_state": "dirty", "head_sha": "head1", "base_ref": "main"})
     assert _attempt(db_session, repo, pr, review).status == "MANUAL_REQUIRED"
+
+
+def test_mandatory_ci_is_required_even_if_legacy_toggle_is_disabled(db_session, monkeypatch):
+    repo, pr, review = _objects(db_session)
+    _enable(monkeypatch)
+    monkeypatch.setattr(auto_merge, "get_settings", lambda: SimpleNamespace(
+        AUTO_MERGE_ENABLED=True, AUTO_MERGE_LOW_RISK_ONLY=True, AUTO_MERGE_REQUIRE_ALL_CI=False))
+    _github_ok(monkeypatch)
+    monkeypatch.setattr(
+        auto_merge.github_client,
+        "get_check_runs",
+        lambda *args: [{"name": "build", "status": "completed", "conclusion": "success"}],
+    )
+    merged = []
+    monkeypatch.setattr(
+        auto_merge.github_client,
+        "merge_pull_request",
+        lambda *args: merged.append(True) or {"succeeded": True, "status_code": 200, "payload": {"merged": True}},
+    )
+
+    result = _attempt(db_session, repo, pr, review)
+
+    assert result.status == "MANUAL_REQUIRED"
+    assert "not all complete" in result.reason
+    assert merged == []
 
 
 def test_circuit_breaker_requires_manual_merge(db_session, monkeypatch):

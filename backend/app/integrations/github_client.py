@@ -6,8 +6,9 @@ PR diffs/CI checks, posting review comments, and submitting (never merging)
 PR reviews, re-validating PR state, and (only through the guarded pipeline)
 merging eligible pull requests.
 """
-import time
 import logging
+import threading
+import time
 
 import jwt
 import requests
@@ -17,11 +18,15 @@ from app.core.config import get_settings
 logger = logging.getLogger("securepr.github")
 
 GITHUB_API = "https://api.github.com"
+GITHUB_PAGE_SIZE = 100
+INSTALLATION_TOKEN_CACHE_SECONDS = 45 * 60
 
 
 class GitHubClient:
     def __init__(self):
         self.settings = get_settings()
+        self._installation_tokens: dict[str, tuple[str, float]] = {}
+        self._installation_token_lock = threading.Lock()
 
     def _private_key(self) -> str:
         if self.settings.GITHUB_PRIVATE_KEY:
@@ -35,40 +40,76 @@ class GitHubClient:
         return jwt.encode(payload, self._private_key(), algorithm="RS256")
 
     def _installation_token(self, installation_id: str) -> str:
-        app_jwt = self._app_jwt()
-        resp = requests.post(
-            f"{GITHUB_API}/app/installations/{installation_id}/access_tokens",
-            headers={"Authorization": f"Bearer {app_jwt}", "Accept": "application/vnd.github+json"},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        return resp.json()["token"]
+        with self._installation_token_lock:
+            now = time.monotonic()
+            cached = self._installation_tokens.get(installation_id)
+            if cached and cached[1] > now:
+                return cached[0]
+
+            app_jwt = self._app_jwt()
+            resp = requests.post(
+                f"{GITHUB_API}/app/installations/{installation_id}/access_tokens",
+                headers={"Authorization": f"Bearer {app_jwt}", "Accept": "application/vnd.github+json"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            token = resp.json().get("token")
+            if not isinstance(token, str) or not token:
+                raise ValueError("GitHub did not return an installation access token.")
+            self._installation_tokens[installation_id] = (
+                token,
+                time.monotonic() + INSTALLATION_TOKEN_CACHE_SECONDS,
+            )
+            return token
 
     def _headers(self, installation_id: str) -> dict:
         token = self._installation_token(installation_id)
         return {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
 
-    def get_pr_files(self, installation_id: str, owner: str, repo: str, pr_number: int) -> list[dict]:
-        headers = self._headers(installation_id)
-        files, page = [], 1
+    def _get_paginated_items(self, url: str, headers: dict, collection_key: str | None = None) -> list[dict]:
+        items: list[dict] = []
+        page = 1
         while True:
             resp = requests.get(
-                f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}/files",
-                headers=headers, params={"per_page": 100, "page": page}, timeout=20,
+                url,
+                headers=headers,
+                params={"per_page": GITHUB_PAGE_SIZE, "page": page},
+                timeout=20,
             )
             resp.raise_for_status()
-            batch = resp.json()
-            if not batch:
-                break
-            for f in batch:
-                files.append({
-                    "file_path": f["filename"],
-                    "change_type": f["status"],
-                    "additions": f.get("additions", 0),
-                    "deletions": f.get("deletions", 0),
-                    "patch_excerpt": (f.get("patch") or "")[:4000],
-                })
+            payload = resp.json()
+            if collection_key is None:
+                batch = payload
+            elif isinstance(payload, dict):
+                batch = payload.get(collection_key)
+            else:
+                batch = None
+            if not isinstance(batch, list) or any(not isinstance(item, dict) for item in batch):
+                field = collection_key or "response"
+                raise ValueError(f"GitHub API response must contain a list of objects in '{field}'.")
+            items.extend(batch)
+            if len(batch) < GITHUB_PAGE_SIZE:
+                return items
             page += 1
+
+    def get_pr_files(self, installation_id: str, owner: str, repo: str, pr_number: int) -> list[dict]:
+        headers = self._headers(installation_id)
+        payload = self._get_paginated_items(
+            f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}/files",
+            headers,
+        )
+        files = []
+        for item in payload:
+            filename = item.get("filename")
+            if not isinstance(filename, str) or not filename:
+                raise ValueError("GitHub pull-request file response is missing a filename.")
+            files.append({
+                "file_path": filename,
+                "change_type": item.get("status"),
+                "additions": item.get("additions", 0),
+                "deletions": item.get("deletions", 0),
+                "patch_excerpt": (item.get("patch") or "")[:4000],
+            })
         return files
 
     def get_check_runs(self, installation_id: str, owner: str, repo: str, head_sha: str) -> list[dict]:
@@ -80,14 +121,14 @@ class GitHubClient:
         None for anything not yet completed.
         """
         headers = self._headers(installation_id)
-        resp = requests.get(
+        runs = self._get_paginated_items(
             f"{GITHUB_API}/repos/{owner}/{repo}/commits/{head_sha}/check-runs",
-            headers=headers, timeout=20,
+            headers,
+            "check_runs",
         )
-        resp.raise_for_status()
-        return [{"name": c["name"], "status": c.get("status"), "conclusion": c.get("conclusion"),
+        return [{"name": c.get("name"), "status": c.get("status"), "conclusion": c.get("conclusion"),
                  "html_url": c.get("html_url"), "completed_at": c.get("completed_at"),
-                 "started_at": c.get("started_at"), "id": c.get("id")} for c in resp.json().get("check_runs", [])]
+                 "started_at": c.get("started_at"), "id": c.get("id")} for c in runs]
 
     def get_commit_statuses(self, installation_id: str, owner: str, repo: str, head_sha: str) -> list[dict]:
         """Legacy commit-status API (used by some non-Actions CI providers).
@@ -95,13 +136,13 @@ class GitHubClient:
         state "pending" -> status "in_progress"/conclusion None; "success"/"failure"/
         "error" map straight to both status "completed" and that conclusion."""
         headers = self._headers(installation_id)
-        resp = requests.get(
+        statuses = self._get_paginated_items(
             f"{GITHUB_API}/repos/{owner}/{repo}/commits/{head_sha}/status",
-            headers=headers, timeout=20,
+            headers,
+            "statuses",
         )
-        resp.raise_for_status()
         out = []
-        for s in resp.json().get("statuses", []):
+        for s in statuses:
             state = s.get("state")
             if state == "pending":
                 out.append({"name": s.get("context"), "status": "in_progress", "conclusion": None,

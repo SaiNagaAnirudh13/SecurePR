@@ -8,7 +8,7 @@ services:
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.9
+        value: 3.12.4
       - key: SECUREPR_ENV
         value: production
       - key: SUPABASE_AUTH_AUDIENCE
@@ -17,6 +17,8 @@ services:
         value: gemini-3.8-flash
       - key: GEMINI_FALLBACK_MODEL
         value: gemini-2.0-flash
+      - key: GEMINI_REQUEST_TIMEOUT_SECONDS
+        value: "20"
       - key: CI_WAIT_POLL_INTERVAL_SECONDS
         value: "20"
       - key: CI_WAIT_TIMEOUT_SECONDS

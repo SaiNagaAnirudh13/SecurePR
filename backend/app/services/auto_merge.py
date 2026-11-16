@@ -22,8 +22,20 @@ def attempt(*, db, repo, pr, review, installation_id, policy_doc, findings, auth
         return AutoMergeResult("NOT_ELIGIBLE", "Final SecurePR decision is not APPROVED.")
     if not review.github_action_confirmed:
         return AutoMergeResult("MANUAL_REQUIRED", "GitHub did not confirm SecurePR's approval action.")
+    allowed_categories = policy_doc.get("auto_merge_allowed_risk_categories", ["LOW"])
+    valid_categories = {"LOW", "MEDIUM", "HIGH"}
+    if (
+        not isinstance(allowed_categories, list)
+        or any(
+            not isinstance(category, str) or category not in valid_categories
+            for category in allowed_categories
+        )
+    ):
+        return AutoMergeResult("NOT_ELIGIBLE", "Repository policy has invalid auto-merge risk categories.")
+    if review.risk_category not in allowed_categories:
+        return AutoMergeResult("NOT_ELIGIBLE", "Repository policy does not permit auto-merge at this risk category.")
     if settings.AUTO_MERGE_LOW_RISK_ONLY and review.risk_category != "LOW":
-        return AutoMergeResult("NOT_ELIGIBLE", "Auto-merge requires LOW risk.")
+        return AutoMergeResult("NOT_ELIGIBLE", "Global configuration permits auto-merge only for LOW risk.")
     if not settings.AUTO_MERGE_ENABLED:
         return AutoMergeResult("DISABLED_GLOBAL", "Automatic merging is disabled by configuration.")
     if not repo.is_auto_merge_enabled:
@@ -51,8 +63,11 @@ def attempt(*, db, repo, pr, review, installation_id, policy_doc, findings, auth
         live_policy = policy_engine.evaluate_policy(policy_doc, [], live_checks, pr.author_login)
         if live_policy.violations or live_policy.mandatory_checks_failed:
             return AutoMergeResult("MANUAL_REQUIRED", "Mandatory CI checks are failing or policy validation failed on re-check.")
-        if settings.AUTO_MERGE_REQUIRE_ALL_CI and live_policy.mandatory_checks_pending:
-            return AutoMergeResult("MANUAL_REQUIRED", "Mandatory CI checks are not all complete and successful on re-check.")
+        if live_policy.mandatory_checks_pending:
+            return AutoMergeResult(
+                "MANUAL_REQUIRED",
+                "Mandatory CI checks are not all complete and successful on re-check.",
+            )
         tripped, reason = circuit_breaker.is_tripped(db, repo.id, pr.author_login)
         if tripped:
             return AutoMergeResult("MANUAL_REQUIRED", f"Circuit breaker became active: {reason}")

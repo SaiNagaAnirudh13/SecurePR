@@ -6,7 +6,6 @@ second analysis pass once checks complete -> final APPROVED review linked
 back to the placeholder via superseded_review_id.
 """
 import os
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -145,7 +144,8 @@ def _patch_github(monkeypatch, changed_files, check_runs_sequence):
     return posted_reviews
 
 
-def test_waits_then_finalizes_once_ci_completes(db_session, repo_and_pr, monkeypatch):
+def test_waits_then_finalizes_once_ci_completes(db_session, repo_and_pr, monkeypatch, caplog):
+    caplog.set_level("INFO", logger="securepr.pipeline")
     repo, pr = repo_and_pr
     files = [{"file_path": "app/utils.py", "additions": 2, "deletions": 1, "patch_excerpt": "+def greet(): pass"}]
     pending_checks = [{"name": "build", "status": "completed", "conclusion": "success"},
@@ -174,6 +174,12 @@ def test_waits_then_finalizes_once_ci_completes(db_session, repo_and_pr, monkeyp
     assert review2.is_ci_wait_placeholder is False
     assert review2.superseded_review_id == review1.id
     assert [review["event"] for review in posted_reviews] == ["COMMENT", "COMMENT"]
+    assert any(
+        getattr(record, "timing_event", None) == "analysis"
+        and getattr(record, "stage", None) == "total"
+        and record.duration_ms >= 0
+        for record in caplog.records
+    )
     assert "Waiting for CI" in posted_reviews[0]["body"]
     assert "SecurePR Review" in posted_reviews[1]["body"]
 
@@ -194,7 +200,7 @@ def test_completed_check_event_finalizes_waiting_review_once(db_session, repo_an
     retried delivery) and verifies that it produces exactly one final comment.
     """
     repo, pr = repo_and_pr
-    files = [{"file_path": "app/utils.py", "additions": 2, "deletions": 1, "patch_excerpt": ""}]
+    files = [{"file_path": "README.md", "additions": 2, "deletions": 1, "patch_excerpt": ""}]
     pending_checks = [{"name": "build", "status": "completed", "conclusion": "success"},
                       {"name": "unit-tests", "status": "in_progress", "conclusion": None},
                       {"name": "lint", "status": "completed", "conclusion": "success"}]
@@ -218,6 +224,7 @@ def test_completed_check_event_finalizes_waiting_review_once(db_session, repo_an
     assert [review.decision for review in reviews] == [m.DecisionStatus.WAITING_FOR_CI, m.DecisionStatus.MANUAL_REVIEW]
     assert reviews[-1].superseded_review_id == waiting.id
     assert [review["event"] for review in posted_reviews] == ["COMMENT", "COMMENT"]
+    assert "found 1 changed file(s)" in posted_reviews[0]["body"]
 
 
 @pytest.mark.parametrize("event_name", ["check_run", "check_suite"])
@@ -402,10 +409,13 @@ def test_repeated_and_concurrent_completion_events_publish_once(
     monkeypatch.setattr(gh_mod.github_client, "get_check_runs", lambda *a, **kw: completed)
     factory = sessionmaker(bind=db_session.get_bind(), future=True)
     monkeypatch.setattr(pipeline, "get_session_factory", lambda: factory)
+    repository_id = repo.id
+    pull_request_id = pr.id
+    head_sha = pr.head_sha
 
     def deliver(event_name):
         pipeline.handle_check_event_finalization(
-            repo.id, pr.head_sha, "999", event_name
+            repository_id, head_sha, "999", event_name
         )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -414,8 +424,8 @@ def test_repeated_and_concurrent_completion_events_publish_once(
 
     db_session.expire_all()
     reviews = db_session.query(m.Review).filter(
-        m.Review.pull_request_id == pr.id,
-        m.Review.head_sha == pr.head_sha,
+        m.Review.pull_request_id == pull_request_id,
+        m.Review.head_sha == head_sha,
         m.Review.is_ci_wait_placeholder == False,  # noqa: E712
         m.Review.is_reevaluation == False,  # noqa: E712
     ).all()
@@ -424,6 +434,103 @@ def test_repeated_and_concurrent_completion_events_publish_once(
         m.Notification.review_id == reviews[0].id
     ).count() == 1
     assert [review["event"] for review in posted_reviews] == ["COMMENT", "COMMENT"]
+
+
+def test_ci_status_webhook_finalizes_current_head(
+    db_session, repo_and_pr, monkeypatch
+):
+    repo, pr = repo_and_pr
+    _patch_github(
+        monkeypatch,
+        [{"file_path": "README.md", "additions": 1, "deletions": 0, "patch_excerpt": ""}],
+        [
+            [{"name": "build", "status": "in_progress", "conclusion": None}],
+            [
+                {"name": "build", "status": "completed", "conclusion": "success"},
+                {"name": "unit-tests", "status": "completed", "conclusion": "success"},
+                {"name": "lint", "status": "completed", "conclusion": "success"},
+            ],
+        ],
+    )
+    waiting = pipeline.run_analysis(db_session, repo, pr, "999")
+    assert waiting.decision == m.DecisionStatus.WAITING_FOR_CI
+
+    factory = sessionmaker(bind=db_session.get_bind(), future=True)
+    monkeypatch.setattr(pipeline, "get_session_factory", lambda: factory)
+    background_tasks = BackgroundTasks()
+    response = _handle_check_event(
+        db_session,
+        background_tasks,
+        {
+            "repository": {"id": 1, "full_name": "octo/widgets"},
+            "sha": pr.head_sha,
+            "state": "success",
+        },
+        "status",
+    )
+
+    assert response["status"] == "accepted"
+    assert len(background_tasks.tasks) == 1
+    task = background_tasks.tasks[0]
+    task.func(*task.args, **task.kwargs)
+
+    db_session.expire_all()
+    final_reviews = db_session.query(m.Review).filter(
+        m.Review.pull_request_id == pr.id,
+        m.Review.head_sha == pr.head_sha,
+        m.Review.is_ci_wait_placeholder == False,  # noqa: E712
+    ).all()
+    assert len(final_reviews) == 1
+
+
+def test_changed_file_fetch_failure_is_not_reported_as_an_empty_pr(
+    db_session, repo_and_pr, monkeypatch
+):
+    repo, pr = repo_and_pr
+    posted_reviews = _patch_github(
+        monkeypatch,
+        [],
+        [[
+            {"name": "build", "status": "completed", "conclusion": "success"},
+            {"name": "unit-tests", "status": "completed", "conclusion": "success"},
+            {"name": "lint", "status": "completed", "conclusion": "success"},
+        ]],
+    )
+
+    def failed_file_fetch(*args, **kwargs):
+        raise RuntimeError("GitHub API unavailable")
+
+    monkeypatch.setattr(gh_mod.github_client, "get_pr_files", failed_file_fetch)
+    review = pipeline.run_analysis(db_session, repo, pr, "999")
+
+    assert review.decision == m.DecisionStatus.MANUAL_REVIEW
+    assert review.risk_category == "NOT_EVALUATED"
+    assert any("could not provide" in reason for reason in review.decision_reasons)
+    assert db_session.query(m.ChangedFile).filter(m.ChangedFile.review_id == review.id).count() == 0
+    assert "Analysis incomplete" in posted_reviews[-1]["body"]
+    assert "Changed Files (0 files" not in posted_reviews[-1]["body"]
+
+
+def test_waiting_comment_does_not_claim_zero_files_when_github_fetch_fails(
+    db_session, repo_and_pr, monkeypatch
+):
+    repo, pr = repo_and_pr
+    posted_reviews = _patch_github(
+        monkeypatch,
+        [],
+        [[{"name": "build", "status": "in_progress", "conclusion": None}]],
+    )
+    monkeypatch.setattr(
+        gh_mod.github_client,
+        "get_pr_files",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("GitHub API unavailable")),
+    )
+
+    review = pipeline.run_analysis(db_session, repo, pr, "999")
+
+    assert review.decision == m.DecisionStatus.WAITING_FOR_CI
+    assert "could not retrieve the changed-file list" in posted_reviews[0]["body"]
+    assert "found 0 changed file(s)" not in posted_reviews[0]["body"]
 
 
 def test_polling_fallback_racing_webhook_publishes_once(
@@ -481,7 +588,7 @@ def test_force_final_routes_to_manual_review_not_silent_approval(db_session, rep
     """Simulates the polling timeout path: checks are still pending, but
     force_final=True must never result in a silent APPROVED."""
     repo, pr = repo_and_pr
-    files = [{"file_path": "app/utils.py", "additions": 2, "deletions": 1, "patch_excerpt": ""}]
+    files = [{"file_path": "README.md", "additions": 2, "deletions": 1, "patch_excerpt": ""}]
     pending_checks = [{"name": "build", "status": "in_progress", "conclusion": None}]
     _patch_github(monkeypatch, files, [pending_checks])
 

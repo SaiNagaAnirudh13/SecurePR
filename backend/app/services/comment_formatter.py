@@ -47,13 +47,19 @@ def _score_bar(score: float) -> str:
     return "█" * filled + "░" * (10 - filled)
 
 
-def format_waiting_comment(*, pending_checks: list[str], changed_files_count: int,
-                            policy_name: str, policy_version: int, dashboard_url: str) -> str:
+def format_waiting_comment(*, pending_checks: list[str], changed_files_count: int | None,
+                            policy_name: str, policy_version: int, dashboard_url: str,
+                            changed_files_unavailable: bool = False) -> str:
     checks_md = "\n".join(f"- ⏳ `{c}` — not yet completed" for c in pending_checks) or "- (no mandatory checks configured)"
+    files_summary = (
+        "SecurePR could not retrieve the changed-file list, so no file count is shown."
+        if changed_files_unavailable
+        else f"SecurePR found {changed_files_count or 0} changed file(s) in this Pull Request."
+    )
     return (
         f"## ⏳ SecurePR Review — **Waiting for CI**\n\n"
-        f"SecurePR has analyzed this Pull Request's {changed_files_count} changed file(s) and is holding its "
-        f"final decision until the following **mandatory** check(s) report a result:\n\n"
+        f"{files_summary} SecurePR is holding its final decision until the following "
+        f"**mandatory** check(s) report a result:\n\n"
         f"{checks_md}\n\n"
         f"No action is needed — SecurePR is watching this commit and will post the final review "
         f"as soon as all mandatory checks finish. If checks remain pending, SecurePR will "
@@ -69,7 +75,7 @@ def format_comment(*, decision: str, reasons: list[str], overall_score: float, c
                     circuit_breaker_tripped: bool, circuit_breaker_reason: str | None,
                     impact_items: list, policy_name: str, policy_version: int,
                     dashboard_url: str, ci_checks: list[dict] | None = None,
-                    waited_for_ci: bool = False) -> str:
+                    waited_for_ci: bool = False, analysis_error: str | None = None) -> str:
     meta = DECISION_META.get(decision, {"emoji": "", "label": decision})
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
@@ -85,6 +91,8 @@ def format_comment(*, decision: str, reasons: list[str], overall_score: float, c
         f"| **Reviewed** | {now}{' (after waiting for CI to complete)' if waited_for_ci else ''} |",
         "",
     ]
+    if analysis_error:
+        lines.extend([f"> **Analysis incomplete:** {analysis_error}", ""])
 
     # ------------------------------------------------------------- risk grid
     lines.append("<details open>\n<summary><b>📊 Risk Breakdown</b></summary>\n")

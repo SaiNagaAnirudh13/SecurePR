@@ -24,6 +24,7 @@ import json
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Iterator
@@ -61,6 +62,35 @@ _active_ci_waits_lock = threading.Lock()
 
 _fallback_revision_locks: dict[tuple[str, int], threading.RLock] = {}
 _fallback_revision_locks_guard = threading.Lock()
+
+
+def _log_analysis_timing(
+    stage: str,
+    started_at: float,
+    trigger: str,
+    repo: m.Repository,
+    pr: m.PullRequest,
+) -> None:
+    duration_ms = round((time.perf_counter() - started_at) * 1000)
+    logger.info(
+        "SecurePR analysis timing: stage=%s duration_ms=%s trigger=%s repository=%s "
+        "pr_number=%s head_sha=%s",
+        stage,
+        duration_ms,
+        trigger,
+        repo.full_name,
+        pr.github_pr_number,
+        pr.head_sha,
+        extra={
+            "timing_event": "analysis",
+            "stage": stage,
+            "duration_ms": duration_ms,
+            "trigger": trigger,
+            "repository": repo.full_name,
+            "pr_number": pr.github_pr_number,
+            "head_sha": pr.head_sha,
+        },
+    )
 
 
 @contextmanager
@@ -183,26 +213,37 @@ def _fetch_ci_checks(installation_id: str, owner: str, repo_name: str, head_sha:
     """
     checks: list[dict] = []
     fetch_failed = False
-    for source, getter in (("check runs", github_client.get_check_runs),
-                           ("commit statuses", github_client.get_commit_statuses)):
-        try:
-            checks.extend(getter(installation_id, owner, repo_name, head_sha))
-        except Exception:
-            fetch_failed = True
-            logger.exception("Failed to fetch GitHub %s for head_sha=%s", source, head_sha)
+    getters = (
+        ("check runs", github_client.get_check_runs),
+        ("commit statuses", github_client.get_commit_statuses),
+    )
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="github-ci") as executor:
+        futures = [
+            (source, executor.submit(getter, installation_id, owner, repo_name, head_sha))
+            for source, getter in getters
+        ]
+        for source, future in futures:
+            try:
+                checks.extend(future.result())
+            except Exception:
+                fetch_failed = True
+                logger.exception("Failed to fetch GitHub %s for head_sha=%s", source, head_sha)
     return checks, fetch_failed
 
 
 def _persist_ci_wait(db: Session, repo: m.Repository, pr: m.PullRequest, installation_id: str,
                      owner: str, repo_name: str, policy_id: str, policy_eval, existing_placeholder,
-                     changed_files: list[dict] | None = None, extra_reason: str | None = None) -> m.Review:
+                     changed_files: list[dict] | None = None, changed_files_error: bool = False,
+                     extra_reason: str | None = None) -> m.Review:
     """Persist one idempotent, explicitly non-final CI waiting state."""
     pending = policy_eval.mandatory_checks_pending
     reasons = list(policy_eval.warnings)
-    reasons.append(extra_reason or (
+    reasons.append(
         f"Waiting for mandatory CI check(s) to complete: {', '.join(pending)}. "
         "SecurePR will finalize after GitHub reports terminal results for this commit."
-    ))
+    )
+    if extra_reason:
+        reasons.append(extra_reason)
     if existing_placeholder:
         existing_placeholder.ci_wait_pending_checks = pending
         existing_placeholder.decision_reasons = reasons
@@ -224,13 +265,22 @@ def _persist_ci_wait(db: Session, repo: m.Repository, pr: m.PullRequest, install
                               is_blocked_path=False, patch_excerpt=f.get("patch_excerpt")))
     db.add(m.Evidence(review_id=review.id, evidence_type="ci_wait", source="securepr",
                       content=f"Waiting for: {', '.join(pending)}"))
+    if changed_files_error:
+        db.add(m.Evidence(
+            review_id=review.id,
+            evidence_type="ci_wait_file_fetch",
+            source="github",
+            content="Changed-file list is unavailable; no file-count claim was made.",
+        ))
     db.commit()
     db.refresh(review)
 
     if settings.POST_CI_WAITING_COMMENT:
         try:
             body = format_waiting_comment(
-                pending_checks=pending, changed_files_count=len(changed_files or []),
+                pending_checks=pending,
+                changed_files_count=None if changed_files_error else len(changed_files or []),
+                changed_files_unavailable=changed_files_error,
                 policy_name=policy_eval.policy_name, policy_version=policy_eval.policy_version,
                 dashboard_url=f"{settings.DASHBOARD_ORIGIN}/#/pr/{pr.id}",
             )
@@ -707,6 +757,7 @@ def _run_analysis_locked(
         logger.info("Analysis already finalized for this revision; skipping duplicate: review_id=%s", existing_final.id)
         return existing_final
 
+    analysis_started_at = time.perf_counter()
     started = datetime.utcnow()
     owner, repo_name = repo.full_name.split("/", 1)
 
@@ -725,7 +776,9 @@ def _run_analysis_locked(
     # analysis.  A missing mandatory check is deliberately indistinguishable
     # from a queued one here: both mean GitHub has not supplied a terminal
     # verification result yet.
+    ci_fetch_started_at = time.perf_counter()
     ci_checks, ci_fetch_failed = _fetch_ci_checks(installation_id, owner, repo_name, pr.head_sha)
+    _log_analysis_timing("ci_fetch", ci_fetch_started_at, trigger, repo, pr)
     logger.info(
         "CI state re-fetched: trigger=%s event_type=%s repository=%s pr_number=%s "
         "head_sha=%s checks=%s fetch_failed=%s",
@@ -779,43 +832,97 @@ def _run_analysis_locked(
                 "pending_checks": ci_gate.mandatory_checks_pending,
             },
         )
-        return _persist_ci_wait(
-            db, repo, pr, installation_id, owner, repo_name, policy_id, ci_gate, existing_placeholder,
-            extra_reason=(
+        waiting_changed_files = None
+        waiting_changed_files_error = False
+        if not existing_placeholder:
+            waiting_files_started_at = time.perf_counter()
+            try:
+                waiting_changed_files = github_client.get_pr_files(
+                    installation_id, owner, repo_name, pr.github_pr_number
+                )
+            except Exception:
+                waiting_changed_files_error = True
+                logger.exception(
+                    "GitHub PR-file fetch failed while creating CI wait: "
+                    "repository_id=%s pull_request_id=%s",
+                    repo.id,
+                    pr.id,
+                )
+            _log_analysis_timing("waiting_file_fetch", waiting_files_started_at, trigger, repo, pr)
+
+        wait_reasons = []
+        if ci_fetch_failed:
+            wait_reasons.append(
                 "SecurePR could not fully read GitHub CI yet; it will keep waiting rather than make a final "
                 "decision from incomplete CI information."
-                if ci_fetch_failed else None
-            ),
+            )
+        if waiting_changed_files_error:
+            wait_reasons.append(
+                "SecurePR could not retrieve the changed-file list; no changed-file count is available yet."
+            )
+        review = _persist_ci_wait(
+            db, repo, pr, installation_id, owner, repo_name, policy_id, ci_gate, existing_placeholder,
+            changed_files=waiting_changed_files,
+            changed_files_error=waiting_changed_files_error,
+            extra_reason="\n".join(wait_reasons) or None,
         )
+        _log_analysis_timing("total", analysis_started_at, trigger, repo, pr)
+        return review
 
     # CI is terminal (or the controlled timeout explicitly requested a final
     # manual-review result), so now fetch source data and perform final risk
     # analysis. One CI endpoint may be unavailable while the other provides
     # every required terminal result; that is still sufficient verification.
     analysis_complete = True
+    changed_files_error: str | None = None
     changed_files: list[dict] = []
+    files_fetch_started_at = time.perf_counter()
     try:
         changed_files = github_client.get_pr_files(installation_id, owner, repo_name, pr.github_pr_number)
     except Exception:
         logger.exception("GitHub PR-file fetch failed: repository_id=%s pull_request_id=%s", repo.id, pr.id)
         analysis_complete = False
+        changed_files_error = (
+            "GitHub could not provide this pull request's changed files. "
+            "No risk assessment or auto-merge was performed."
+        )
+    _log_analysis_timing("changed_files_fetch", files_fetch_started_at, trigger, repo, pr)
 
     # --- 2. Policy evaluation (also classifies mandatory checks as
     #        succeeded/failed/pending -- see policy_engine.evaluate_policy) ---
     policy_eval = policy_engine.evaluate_policy(policy_doc, changed_files, ci_checks, pr.author_login)
 
     # --- 3. Risk scoring (deterministic + optional AI) --------------------------
-    heuristic_scores = risk_engine.compute_deterministic_scores(changed_files, ci_checks)
-    heuristic_scores["policy_compliance"] = risk_engine.compute_policy_compliance_score(policy_eval.violations)
-
+    scoring_started_at = time.perf_counter()
     ai_scores = None
-    try:
-        ai_scores = gemini_client.score_dimensions(changed_files)
-    except Exception:
-        logger.exception("Gemini scoring raised unexpectedly; continuing with heuristic-only scores")
-
-    blended = risk_engine.blend_with_ai(heuristic_scores, ai_scores)
-    assessment = risk_engine.compute_overall(blended)
+    if analysis_complete:
+        heuristic_scores = risk_engine.compute_deterministic_scores(changed_files, ci_checks)
+        heuristic_scores["policy_compliance"] = risk_engine.compute_policy_compliance_score(policy_eval.violations)
+        gemini_started_at = time.perf_counter()
+        try:
+            ai_scores = gemini_client.score_dimensions(changed_files)
+        except Exception:
+            logger.exception("Gemini scoring raised unexpectedly; continuing with heuristic-only scores")
+        _log_analysis_timing("gemini_scoring", gemini_started_at, trigger, repo, pr)
+        blended = risk_engine.blend_with_ai(heuristic_scores, ai_scores)
+        assessment = risk_engine.compute_overall(blended)
+    else:
+        rationale = "Not evaluated because GitHub did not provide the changed-file list."
+        blended = {
+            dimension: risk_engine.DimensionScore(
+                dimension=dimension,
+                score=0,
+                rationale=rationale,
+                source="not_evaluated",
+            )
+            for dimension in risk_engine.RISK_DIMENSIONS
+        }
+        assessment = risk_engine.RiskAssessment(
+            scores=blended,
+            overall_score=0,
+            category="NOT_EVALUATED",
+        )
+    _log_analysis_timing("risk_scoring", scoring_started_at, trigger, repo, pr)
 
     # --- 4. Findings --------------------------------------------------------
     findings: list[dict] = []
@@ -833,7 +940,7 @@ def _run_analysis_locked(
                               "description": s.rationale, "file_path": None, "is_mandatory_blocker": False})
 
     # --- 5. Impact Simulator --------------------------------------------------
-    impact_items = impact_simulator.simulate(changed_files)
+    impact_items = impact_simulator.simulate(changed_files) if analysis_complete else []
 
     # --- 6. Circuit breaker ----------------------------------------------------
     cb_tripped, cb_reason = circuit_breaker.is_tripped(db, repo.id, pr.author_login)
@@ -859,6 +966,8 @@ def _run_analysis_locked(
         author_eligible=author_eligible, author_risk_threshold=author_threshold,
         analysis_complete=analysis_complete, mandatory_checks_pending=pending_for_decision,
     ))
+    if changed_files_error:
+        decision.reasons = [changed_files_error]
     if force_final and policy_eval.mandatory_checks_pending and decision.status not in (
             m.DecisionStatus.BLOCKED,):
         # Timed out waiting for CI -- never silently approve on an incomplete
@@ -882,6 +991,7 @@ def _run_analysis_locked(
             db.commit()
             logger.info("CI-wait placeholder reused (still pending): review_id=%s pending=%s",
                         existing_placeholder.id, policy_eval.mandatory_checks_pending)
+            _log_analysis_timing("total", analysis_started_at, trigger, repo, pr)
             return existing_placeholder
 
         review = m.Review(
@@ -935,6 +1045,7 @@ def _run_analysis_locked(
             db.commit()
         except Exception:
             logger.exception("Failed to post CI-wait comment: review_id=%s", review.id)
+        _log_analysis_timing("total", analysis_started_at, trigger, repo, pr)
         return review
 
     # ===================================================================
@@ -975,7 +1086,8 @@ def _run_analysis_locked(
                            content=json.dumps(ci_checks)))
     if not analysis_complete:
         db.add(m.Evidence(review_id=review.id, evidence_type="error", source="github_fetch",
-                           content="Failed to fetch PR files/checks from GitHub; analysis treated as incomplete."))
+                           content=changed_files_error or
+                           "Failed to fetch PR files from GitHub; analysis treated as incomplete."))
 
     review.score_change_surface = blended["change_surface"].score
     review.score_reversibility = blended["reversibility"].score
@@ -1020,11 +1132,13 @@ def _run_analysis_locked(
         circuit_breaker_tripped=cb_tripped, circuit_breaker_reason=cb_reason, impact_items=impact_items,
         policy_name=policy_eval.policy_name, policy_version=policy_eval.policy_version, dashboard_url=dashboard_url,
         ci_checks=ci_checks, waited_for_ci=waited_for_ci,
+        analysis_error=changed_files_error,
     )
 
     event_map = {"APPROVED": "APPROVE", "BLOCKED": "REQUEST_CHANGES", "MANUAL_REVIEW": "COMMENT"}
     gh_event = event_map.get(decision.status.value, "COMMENT")
 
+    github_publish_started_at = time.perf_counter()
     try:
         result = github_client.post_review(installation_id, owner, repo_name, pr.github_pr_number, body, gh_event)
         db.add(m.GithubAction(review_id=review.id, action_type="submit_review",
@@ -1064,9 +1178,11 @@ def _run_analysis_locked(
         logger.exception("GitHub review/comment failed with exception: review_id=%s", review.id)
         db.add(m.GithubAction(review_id=review.id, action_type="submit_review", succeeded=False))
         db.commit()
+    _log_analysis_timing("github_publish", github_publish_started_at, trigger, repo, pr)
 
     # --- Auto-merge: separate, fail-closed gate after the final review ---
     # This never runs for WAITING_FOR_CI and re-fetches mutable GitHub state.
+    auto_merge_started_at = time.perf_counter()
     if decision.status == m.DecisionStatus.APPROVED:
         merge_result = auto_merge.attempt(
             db=db, repo=repo, pr=pr, review=review, installation_id=installation_id,
@@ -1105,8 +1221,10 @@ def _run_analysis_locked(
             db.commit()
         except Exception:
             logger.exception("Failed to post auto-merge outcome comment: review_id=%s", review.id)
+    _log_analysis_timing("auto_merge", auto_merge_started_at, trigger, repo, pr)
 
     # --- Notify owner --------------------------------------------------
+    notification_started_at = time.perf_counter()
     try:
         github_client.notify_owner(
             installation_id, owner, repo_name, pr.github_pr_number,
@@ -1128,6 +1246,8 @@ def _run_analysis_locked(
             review.id,
         )
 
+    _log_analysis_timing("notification", notification_started_at, trigger, repo, pr)
+    _log_analysis_timing("total", analysis_started_at, trigger, repo, pr)
     return review
 
 

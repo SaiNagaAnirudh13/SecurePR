@@ -6,9 +6,9 @@ mirrored on disk under /policies for human editing) and evaluates a PR
 against them. Policies are data, not code -- changing approval rules never
 requires touching application source.
 """
+import fnmatch
 import json
 import os
-import fnmatch
 import re
 from dataclasses import dataclass, field
 
@@ -72,20 +72,37 @@ def _check_matches_required_name(policy: dict, required_name: str, candidate_nam
 
     alias_names = {normalize_check_name(alias) for alias in _configured_aliases(policy, required_name)}
     alias_names.add(required_norm)
-    if candidate_norm in alias_names:
-        return True
+    return candidate_norm in alias_names
 
-    # The fallback intentionally avoids broad matches across unrelated check names.
-    # We only consider exact normalized equality and same-name containment within an
-    # explicit alias / configured mapping, or the logical name occurring within the
-    # GitHub-run title. This covers "Build / Install dependencies" for the logical
-    # requirement "build" without treating unrelated checks as equivalents.
-    for alias in alias_names | {required_norm}:
-        if alias and alias in candidate_norm:
-            return True
-        if candidate_norm and candidate_norm in alias:
-            return True
-    return False
+
+def _prefer_check(candidate: dict, previous: dict) -> bool:
+    candidate_time = (
+        candidate.get("started_at")
+        or candidate.get("created_at")
+        or candidate.get("completed_at")
+        or ""
+    )
+    previous_time = (
+        previous.get("started_at")
+        or previous.get("created_at")
+        or previous.get("completed_at")
+        or ""
+    )
+    if candidate_time and previous_time and candidate_time != previous_time:
+        return candidate_time > previous_time
+    if candidate_time != previous_time:
+        return bool(candidate_time)
+
+    candidate_pending = candidate.get("status") != "completed"
+    previous_pending = previous.get("status") != "completed"
+    if candidate_pending != previous_pending:
+        return candidate_pending
+
+    candidate_failed = candidate.get("conclusion") not in ("success", "neutral", "skipped")
+    previous_failed = previous.get("conclusion") not in ("success", "neutral", "skipped")
+    if candidate_failed != previous_failed:
+        return candidate_failed
+    return True
 
 
 @dataclass
@@ -148,17 +165,8 @@ def evaluate_policy(policy: dict, changed_files: list[dict], ci_checks: list[dic
         if matched_required is None:
             continue
 
-        # If a check re-runs, GitHub may list multiple entries for the same name;
-        # keep the most recently reported one by simply letting later entries win.
         previous = checks_by_name.get(matched_required)
-        # Both the Checks API and legacy Status API can report the same
-        # context. Prefer an in-progress re-run over an older completed run;
-        # otherwise retain the newest timestamp when GitHub supplies one.
-        if previous is None:
-            checks_by_name[matched_required] = c
-        elif previous.get("status") == "completed" and c.get("status") != "completed":
-            checks_by_name[matched_required] = c
-        elif (c.get("completed_at") or c.get("started_at") or "") >= (previous.get("completed_at") or previous.get("started_at") or ""):
+        if previous is None or _prefer_check(c, previous):
             checks_by_name[matched_required] = c
 
     succeeded, failed, pending = set(), set(), set()

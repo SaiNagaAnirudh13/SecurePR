@@ -1,6 +1,9 @@
 import pytest
-
-from app.core.config import Settings, get_dashboard_origins, validate_production_settings
+from app.core.config import (
+    Settings,
+    get_dashboard_origins,
+    validate_production_settings,
+)
 
 OPERATOR_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
@@ -59,7 +62,7 @@ def test_production_requires_operator_allowlists():
 def test_production_rejects_database_without_ssl():
     settings = production_settings(DATABASE_URL="postgresql://securepr@db.example.invalid/postgres")
 
-    with pytest.raises(RuntimeError, match="PostgreSQL with SSL"):
+    with pytest.raises(RuntimeError, match="DATABASE_URL must use SSL"):
         validate_production_settings(settings)
 
 

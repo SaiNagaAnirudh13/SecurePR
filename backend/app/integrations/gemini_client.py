@@ -56,7 +56,12 @@ class GeminiClient:
     def _resolve_model_name(self) -> str:
         """Probe whether the configured model is listed for this API key; fall back if not."""
         try:
-            available = {m.name.split("/")[-1] for m in self._genai.list_models()}
+            available = {
+                m.name.split("/")[-1]
+                for m in self._genai.list_models(
+                    request_options={"timeout": self.settings.GEMINI_REQUEST_TIMEOUT_SECONDS}
+                )
+            }
         except Exception as exc:  # network / auth errors
             logger.warning("Could not list Gemini models (%s); assuming configured model is usable.", exc)
             return self.settings.GEMINI_MODEL
@@ -93,7 +98,10 @@ class GeminiClient:
 
         try:
             model = self._genai.GenerativeModel(self._model_name)
-            response = model.generate_content(prompt)
+            response = model.generate_content(
+                prompt,
+                request_options={"timeout": self.settings.GEMINI_REQUEST_TIMEOUT_SECONDS},
+            )
             text = response.text.strip()
             if text.startswith("```"):
                 text = text.strip("`")

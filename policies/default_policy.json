@@ -1,8 +1,11 @@
 {
   "name": "default",
-  "version": 1,
+  "version": 2,
   "description": "Baseline SecurePR policy applied to any repository without a repo-specific override.",
   "auto_approval_risk_threshold": 39,
+  "auto_merge_allowed_risk_categories": [
+    "LOW"
+  ],
   "mandatory_ci_checks": [
     "build",
     "unit-tests",

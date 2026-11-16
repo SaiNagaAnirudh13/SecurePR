@@ -1,4 +1,4 @@
-from app.services import policy_engine, impact_simulator
+from app.services import impact_simulator, policy_engine
 
 
 def test_blocked_path_detected():
@@ -56,6 +56,46 @@ def test_mandatory_ci_aliases_match_human_readable_github_names():
     assert ev.mandatory_checks_failed == []
     assert ev.mandatory_checks_pending == []
     assert not ev.violations
+
+
+def test_mandatory_ci_does_not_match_unconfigured_substrings():
+    policy = {
+        "mandatory_ci_checks": ["build"],
+        "ci_check_aliases": {},
+    }
+
+    ev = policy_engine.evaluate_policy(
+        policy,
+        [],
+        [{"name": "build-docs", "status": "completed", "conclusion": "success"}],
+        author_login="alice",
+    )
+
+    assert ev.mandatory_checks_pending == ["build"]
+    assert ev.mandatory_checks_failed == []
+
+
+def test_newest_check_run_wins_over_stale_in_progress_run():
+    policy = {"mandatory_ci_checks": ["build"]}
+    checks = [
+        {
+            "name": "build",
+            "status": "completed",
+            "conclusion": "success",
+            "started_at": "2026-01-02T00:00:00Z",
+        },
+        {
+            "name": "build",
+            "status": "in_progress",
+            "conclusion": None,
+            "started_at": "2026-01-01T00:00:00Z",
+        },
+    ]
+
+    ev = policy_engine.evaluate_policy(policy, [], checks, author_login="alice")
+
+    assert ev.mandatory_checks_pending == []
+    assert ev.mandatory_checks_failed == []
 
 
 def test_human_review_path():

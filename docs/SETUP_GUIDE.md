@@ -119,11 +119,12 @@ service-role key formats and requires HTTPS origins.
 6. **Permissions** (Repository permissions):
    - Pull requests: **Read & write** (to read diffs and post reviews/comments)
    - Checks: **Read-only** (to read CI check results)
+   - Commit statuses: **Read-only** (to read legacy CI provider results)
    - Contents: **Read & write** (required by GitHub for the Pull Request merge API)
    - Issues: **Read & write** (to post owner-notification comments)
    - Metadata: **Read-only** (mandatory)
    - Do not grant any broader permissions than those listed. Contents write is used only by SecurePR's guarded merge flow; branch protection is never bypassed.
-7. **Subscribe to events:** `Pull request`, `Check run`, `Check suite`.
+7. **Subscribe to events:** `Pull request`, `Check run`, `Check suite`, and `Commit status`.
    The last two are what let SecurePR notice the moment your CI finishes and finalize
    its decision within seconds, instead of waiting for the next poll — see
    "Waiting for CI before the final decision" below.
@@ -196,6 +197,13 @@ replace checking GitHub's actual terminal CI results.
 
 Auto-merge is off by default and runs only after the existing final analysis produces `APPROVED`; the CI-wait placeholder never merges anything.
 
+The repository policy's `auto_merge_allowed_risk_categories` defaults to
+`["LOW"]`; MEDIUM/HIGH categories require explicit inclusion in that
+repository's policy. `AUTO_MERGE_LOW_RISK_ONLY=true` remains a global cap
+that a repository policy cannot override. All mandatory CI checks are
+always required for auto-merge; `AUTO_MERGE_REQUIRE_ALL_CI` cannot disable
+this safety gate.
+
 For local testing, set the following in `backend/.env` and restart the backend:
 
 ```env
@@ -262,14 +270,16 @@ Git repository to each provider and select the `render.yaml` Blueprint for
 Render. For Vercel, set the project root to `frontend/dashboard`; the
 configured build creates `dist/`.
 
-Render starts the backend with `python run.py` and checks `/health`. Set the
+Render starts the backend with `python run.py`, uses Python 3.12.4 (matching
+the repository's Python 3.12 target), and checks `/health`. Set the
 required backend environment values in Render; its `PORT` value is consumed
 automatically. Set the following backend **public configuration**:
 
 - `SECUREPR_ENV=production`
 - `SUPABASE_AUTH_AUDIENCE`
 - `SUPABASE_JWT_ALGORITHM`
-- `GEMINI_MODEL` and `GEMINI_FALLBACK_MODEL`
+- `GEMINI_MODEL`, `GEMINI_FALLBACK_MODEL`, and
+  `GEMINI_REQUEST_TIMEOUT_SECONDS`
 - `CI_WAIT_POLL_INTERVAL_SECONDS`, `CI_WAIT_TIMEOUT_SECONDS`,
   `POST_CI_WAITING_COMMENT`
 - `AUTO_MERGE_ENABLED`, `AUTO_MERGE_LOW_RISK_ONLY`,
