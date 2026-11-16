@@ -227,6 +227,66 @@ def test_completed_check_event_finalizes_waiting_review_once(db_session, repo_an
     assert "found 1 changed file(s)" in posted_reviews[0]["body"]
 
 
+@pytest.mark.parametrize("finalization_path", ["webhook", "polling"])
+def test_production_check_names_wait_for_lint_then_finalize_once(
+    finalization_path, db_session, repo_and_pr, monkeypatch
+):
+    repo, pr = repo_and_pr
+    files = [{
+        "file_path": "README.md",
+        "additions": 1,
+        "deletions": 0,
+        "patch_excerpt": "",
+    }]
+    production_checks = [
+        {"name": "build", "status": "completed", "conclusion": "success"},
+        {"name": "test", "status": "completed", "conclusion": "success"},
+        {"name": "dependency-audit", "status": "completed", "conclusion": "success"},
+        {"name": "secret-scan", "status": "completed", "conclusion": "success"},
+    ]
+    completed_checks = production_checks + [
+        {"name": "lint", "status": "completed", "conclusion": "success"},
+    ]
+    posted_reviews = _patch_github(
+        monkeypatch, files, [production_checks, completed_checks]
+    )
+
+    def failed_status_fetch(*args, **kwargs):
+        raise RuntimeError("GitHub commit statuses unavailable")
+
+    monkeypatch.setattr(
+        gh_mod.github_client, "get_commit_statuses", failed_status_fetch
+    )
+    waiting = pipeline.run_analysis(db_session, repo, pr, "999")
+    assert waiting.decision == m.DecisionStatus.WAITING_FOR_CI
+    assert waiting.ci_wait_pending_checks == ["lint"]
+
+    factory = sessionmaker(bind=db_session.get_bind(), future=True)
+    monkeypatch.setattr(pipeline, "get_session_factory", lambda: factory)
+    if finalization_path == "webhook":
+        pipeline.handle_check_event_finalization(
+            repo.id, pr.head_sha, "999", "check_run"
+        )
+        pipeline.handle_check_event_finalization(
+            repo.id, pr.head_sha, "999", "check_suite"
+        )
+    else:
+        monkeypatch.setattr(pipeline.settings, "CI_WAIT_POLL_INTERVAL_SECONDS", 0.01)
+        monkeypatch.setattr(pipeline.settings, "CI_WAIT_TIMEOUT_SECONDS", 5)
+        pipeline._ci_wait_poll_loop(repo.id, pr.id, "999", pr.head_sha)
+
+    db_session.expire_all()
+    reviews = db_session.query(m.Review).filter(
+        m.Review.pull_request_id == pr.id,
+        m.Review.head_sha == pr.head_sha,
+        m.Review.is_ci_wait_placeholder.is_(False),
+    ).all()
+    final_reviews = [review for review in reviews if not review.is_ci_wait_placeholder]
+    assert len(final_reviews) == 1
+    assert final_reviews[0].superseded_review_id == waiting.id
+    assert [review["event"] for review in posted_reviews] == ["COMMENT", "COMMENT"]
+
+
 @pytest.mark.parametrize("event_name", ["check_run", "check_suite"])
 def test_ci_completion_webhook_finalizes_initially_pending_pr(
     event_name, db_session, repo_and_pr, monkeypatch

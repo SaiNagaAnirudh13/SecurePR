@@ -18,7 +18,8 @@
     ],
     "unit-tests": [
       "Tests / Unit tests",
-      "tests / unit tests"
+      "tests / unit tests",
+      "test"
     ],
     "lint": [
       "Lint / Ruff",

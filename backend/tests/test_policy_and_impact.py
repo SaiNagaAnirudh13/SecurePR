@@ -58,6 +58,65 @@ def test_mandatory_ci_aliases_match_human_readable_github_names():
     assert not ev.violations
 
 
+def test_production_check_names_map_only_verified_aliases():
+    policy = policy_engine.load_default_policy()
+    files = [{
+        "file_path": "app/main.py",
+        "additions": 1,
+        "deletions": 0,
+        "patch_excerpt": "",
+    }]
+    ev = policy_engine.evaluate_policy(
+        policy,
+        files,
+        ci_checks=[
+            {"name": "build", "status": "completed", "conclusion": "success"},
+            {"name": "test", "status": "completed", "conclusion": "success"},
+            {"name": "dependency-audit", "status": "completed", "conclusion": "success"},
+            {"name": "secret-scan", "status": "completed", "conclusion": "success"},
+        ],
+        author_login="alice",
+    )
+
+    assert ev.mandatory_checks_pending == ["lint"]
+    assert ev.mandatory_checks_failed == []
+    assert ev.mandatory_checks_missing == ["lint"]
+    assert not ev.violations
+
+    completed = policy_engine.evaluate_policy(
+        policy,
+        files,
+        ci_checks=[
+            {"name": "build", "status": "completed", "conclusion": "success"},
+            {"name": "test", "status": "completed", "conclusion": "success"},
+            {"name": "lint", "status": "completed", "conclusion": "success"},
+            {"name": "dependency-audit", "status": "completed", "conclusion": "success"},
+            {"name": "secret-scan", "status": "completed", "conclusion": "success"},
+        ],
+        author_login="alice",
+    )
+    assert completed.mandatory_checks_pending == []
+    assert completed.mandatory_checks_failed == []
+
+
+def test_failed_test_alias_does_not_satisfy_unit_tests():
+    policy = policy_engine.load_default_policy()
+    ev = policy_engine.evaluate_policy(
+        policy,
+        [],
+        [
+            {"name": "build", "status": "completed", "conclusion": "success"},
+            {"name": "test", "status": "completed", "conclusion": "failure"},
+            {"name": "lint", "status": "completed", "conclusion": "success"},
+        ],
+        author_login="alice",
+    )
+
+    assert ev.mandatory_checks_failed == ["unit-tests"]
+    assert ev.mandatory_checks_pending == []
+    assert ev.violations
+
+
 def test_mandatory_ci_does_not_match_unconfigured_substrings():
     policy = {
         "mandatory_ci_checks": ["build"],
