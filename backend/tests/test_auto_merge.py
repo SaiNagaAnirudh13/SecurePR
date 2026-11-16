@@ -2,11 +2,12 @@
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
 from app.core.db import Base
 from app.models import models as m
 from app.services import auto_merge
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 
 POLICY = {"mandatory_ci_checks": ["build", "unit-tests", "lint"], "blocked_paths": [],
           "human_review_required_paths": [], "max_files_for_auto_approval": 25,
@@ -46,6 +47,7 @@ def _github_ok(monkeypatch):
         "state": "open", "mergeable": True, "mergeable_state": "clean", "head_sha": "head1", "base_ref": "main"})
     monkeypatch.setattr(auto_merge.github_client, "get_check_runs", lambda *a: CHECKS)
     monkeypatch.setattr(auto_merge.github_client, "get_commit_statuses", lambda *a: [])
+    monkeypatch.setattr(auto_merge.github_client, "get_check_suites", lambda *a: [])
     monkeypatch.setattr(auto_merge.github_client, "merge_pull_request", lambda *a: {
         "succeeded": True, "status_code": 200, "payload": {"merged": True, "sha": "merge1"}})
 
@@ -150,7 +152,7 @@ def test_mandatory_ci_is_required_even_if_legacy_toggle_is_disabled(db_session, 
     result = _attempt(db_session, repo, pr, review)
 
     assert result.status == "MANUAL_REQUIRED"
-    assert "not all complete" in result.reason
+    assert "running" in result.reason
     assert merged == []
 
 

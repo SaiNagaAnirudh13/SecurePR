@@ -69,15 +69,13 @@ SecurePR/
   with no AI dependency, and it is the only thing that produces an
   APPROVED/BLOCKED/MANUAL_REVIEW/WAITING_FOR_CI decision. AI scores can only
   raise a heuristic risk score, never lower one (`risk_engine.blend_with_ai`).
-- **SecurePR waits for your CI before deciding.** If a mandatory check
-  (`policies/*.json` → `mandatory_ci_checks`) hasn't completed yet, SecurePR
-  posts a short "⏳ Waiting for CI" comment and defers its verdict — it does
-  not guess, and it does not treat "hasn't reported yet" the same as
-  "failed". A webhook fast path (`check_run`/`check_suite` events)
-  finalizes within seconds of your CI finishing; a background poller is the
-  fallback if that webhook is ever missed, with a timeout that routes to
-  MANUAL_REVIEW rather than silently approving. See `docs/Policies.md` and
-  `docs/SETUP_GUIDE.md` section 9 for the full mechanism.
+- **SecurePR discovers CI dynamically.** It discovers check runs, commit
+  statuses, and check suites for each PR head SHA without assuming check
+  names. Webhooks and polling share a stabilization-aware evaluator; pending
+  checks, late-arriving checks, and API errors cannot be mistaken for success.
+  Repositories without CI and unavailable CI are surfaced explicitly and
+  routed to manual review. Optional repository policies can still require
+  named checks. See `docs/Policies.md` and `docs/SETUP_GUIDE.md` section 9.
 - **Gemini model fallback.** `gemini-3.8-flash` is configured by default, but
   `integrations/gemini_client.py` probes model availability at call time and
   falls back to `GEMINI_FALLBACK_MODEL` (default `gemini-2.0-flash`) if it

@@ -23,6 +23,8 @@ services:
         value: "20"
       - key: CI_WAIT_TIMEOUT_SECONDS
         value: "900"
+      - key: CI_DISCOVERY_STABILIZATION_SECONDS
+        value: "30"
       - key: POST_CI_WAITING_COMMENT
         value: "true"
       - key: AUTO_MERGE_ENABLED

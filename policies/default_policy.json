@@ -1,31 +1,13 @@
 {
   "name": "default",
-  "version": 2,
-  "description": "Baseline SecurePR policy applied to any repository without a repo-specific override.",
+  "version": 3,
+  "description": "Dynamic GitHub CI discovery with no globally required check names.",
   "auto_approval_risk_threshold": 39,
   "auto_merge_allowed_risk_categories": [
     "LOW"
   ],
-  "mandatory_ci_checks": [
-    "build",
-    "unit-tests",
-    "lint"
-  ],
-  "ci_check_aliases": {
-    "build": [
-      "Build / Install dependencies",
-      "build / install dependencies"
-    ],
-    "unit-tests": [
-      "Tests / Unit tests",
-      "tests / unit tests",
-      "test"
-    ],
-    "lint": [
-      "Lint / Ruff",
-      "lint / ruff"
-    ]
-  },
+  "mandatory_ci_checks": [],
+  "ci_check_aliases": {},
   "blocked_paths": [
     "**/secrets/**",
     "**/*.pem",

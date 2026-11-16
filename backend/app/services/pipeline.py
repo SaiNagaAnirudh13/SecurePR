@@ -5,13 +5,12 @@ Wires together: GitHub fetch -> risk engine -> policy engine -> circuit
 breaker -> impact simulator -> decision engine -> persistence -> GitHub
 comment/review publish -> notifications.
 
-CI-wait: if a repository's mandatory CI checks haven't reported a final
-result yet, run_analysis() persists a lightweight WAITING_FOR_CI placeholder.
-The primary path re-runs analysis as soon as a matching check_run,
-check_suite, or status webhook arrives. A polling thread is retained only as a
-fallback for missed webhooks, and the configured timeout routes indefinitely
-pending CI to manual review. Both paths re-fetch authoritative CI state and
-share a per-PR database lock, so only one can publish the final result.
+CI discovery persists a lightweight WAITING_FOR_CI placeholder while GitHub
+checks are running or the discovered result set is stabilizing. Check-run,
+check-suite, and status webhooks trigger the same authoritative evaluator as
+the fallback poller. A bounded timeout routes unavailable or indefinitely
+pending CI to manual review. Both paths share a per-PR database lock, so only
+one can publish the final result.
 
 Every FINAL review run is persisted as a new, immutable Review row (see
 models.Review). Re-evaluating a PR NEVER mutates or deletes a prior final
@@ -39,6 +38,7 @@ from app.integrations.github_client import github_client
 from app.models import models as m
 from app.services import (
     auto_merge,
+    ci_status,
     circuit_breaker,
     decision_engine,
     impact_simulator,
@@ -204,49 +204,166 @@ def _cancel_ci_wait_poller(pull_request_id: str, head_sha: str) -> None:
         stop_event.set()
 
 
-def _fetch_ci_checks(installation_id: str, owner: str, repo_name: str, head_sha: str) -> tuple[list[dict], bool]:
-    """Read both GitHub CI representations for one immutable commit.
+def _fetch_ci_checks(
+    installation_id: str, owner: str, repo_name: str, head_sha: str
+) -> tuple[list[dict], list[dict], list[str]]:
+    """Read GitHub CI representations for one immutable commit.
 
     GitHub Actions uses check runs, while several CI vendors still publish
-    legacy commit statuses. A transient failure in either endpoint is treated
-    as incomplete CI, never as an absent/complete check set.
+    legacy commit statuses. Suites are discovery signals, not substitutes for
+    their individual check runs. Any API failure remains visible to evaluation.
     """
     checks: list[dict] = []
-    fetch_failed = False
+    suites: list[dict] = []
+    fetch_errors: list[str] = []
     getters = (
         ("check runs", github_client.get_check_runs),
         ("commit statuses", github_client.get_commit_statuses),
+        ("check suites", github_client.get_check_suites),
     )
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="github-ci") as executor:
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="github-ci") as executor:
         futures = [
             (source, executor.submit(getter, installation_id, owner, repo_name, head_sha))
             for source, getter in getters
         ]
         for source, future in futures:
             try:
-                checks.extend(future.result())
+                result = future.result()
+                if source == "check suites":
+                    suites.extend(result)
+                else:
+                    checks.extend(result)
             except Exception:
-                fetch_failed = True
+                fetch_errors.append(source)
                 logger.exception("Failed to fetch GitHub %s for head_sha=%s", source, head_sha)
-    return checks, fetch_failed
+    return checks, suites, fetch_errors
+
+
+def _read_ci_result(db: Session, review_id: str | None) -> dict | None:
+    if not review_id:
+        return None
+    evidence = (
+        db.query(m.Evidence)
+        .filter(m.Evidence.review_id == review_id, m.Evidence.evidence_type == "ci_result")
+        .first()
+    )
+    if not evidence or not evidence.content:
+        return None
+    try:
+        value = json.loads(evidence.content)
+    except (TypeError, ValueError):
+        logger.warning("Stored CI evidence is malformed: review_id=%s", review_id)
+        return None
+    if isinstance(value, list):
+        return {"checks": value, "check_suites": []}
+    return value if isinstance(value, dict) else None
+
+
+def _store_ci_result(db: Session, review_id: str, result: dict) -> None:
+    evidence = (
+        db.query(m.Evidence)
+        .filter(m.Evidence.review_id == review_id, m.Evidence.evidence_type == "ci_result")
+        .first()
+    )
+    content = json.dumps(result)
+    if evidence:
+        evidence.source = "github"
+        evidence.content = content
+    else:
+        db.add(m.Evidence(
+            review_id=review_id,
+            evidence_type="ci_result",
+            source="github",
+            content=content,
+        ))
+
+
+def _ci_snapshot(
+    db: Session,
+    placeholder: m.Review | None,
+    checks: list[dict],
+    suites: list[dict],
+    head_sha: str,
+    fetch_errors: list[str],
+    required_checks_pending: list[str],
+    force_final: bool,
+) -> tuple[dict, ci_status.CIStatus]:
+    now = datetime.utcnow()
+    previous = _read_ci_result(db, placeholder.id if placeholder else None) or {}
+    signature = ci_status.snapshot_signature(checks, suites)
+    previous_signature = previous.get("signature")
+    try:
+        last_change_at = datetime.fromisoformat(
+            str(previous.get("last_change_at", ""))
+        )
+        if last_change_at.tzinfo is not None:
+            last_change_at = last_change_at.replace(tzinfo=None)
+    except ValueError:
+        last_change_at = now
+    if signature != previous_signature:
+        last_change_at = now
+
+    started_at = placeholder.ci_wait_started_at if placeholder else None
+    if started_at is None:
+        try:
+            started_at = datetime.fromisoformat(
+                str(previous.get("started_at", ""))
+            )
+            if started_at.tzinfo is not None:
+                started_at = started_at.replace(tzinfo=None)
+        except ValueError:
+            started_at = now
+
+    elapsed = max(0.0, (now - started_at).total_seconds())
+    quiet_seconds = max(0.0, (now - last_change_at).total_seconds())
+    timed_out = force_final or elapsed >= settings.CI_WAIT_TIMEOUT_SECONDS
+    error = (
+        "GitHub CI APIs were unavailable: " + ", ".join(fetch_errors)
+        if fetch_errors
+        else None
+    )
+    status = ci_status.evaluate_ci_status(
+        checks,
+        suites,
+        required_checks_pending=required_checks_pending,
+        fetch_error=error,
+        quiet_seconds=quiet_seconds,
+        stabilization_seconds=settings.CI_DISCOVERY_STABILIZATION_SECONDS,
+        timed_out=timed_out,
+    )
+    result = {
+        "state": status.state,
+        "sha": head_sha,
+        "checks": checks,
+        "check_suites": suites,
+        "signature": signature,
+        "started_at": started_at.isoformat(),
+        "last_change_at": last_change_at.isoformat(),
+        "updated_at": now.isoformat(),
+        "error": status.error,
+    }
+    return result, status
 
 
 def _persist_ci_wait(db: Session, repo: m.Repository, pr: m.PullRequest, installation_id: str,
                      owner: str, repo_name: str, policy_id: str, policy_eval, existing_placeholder,
                      changed_files: list[dict] | None = None, changed_files_error: bool = False,
-                     extra_reason: str | None = None) -> m.Review:
+                     extra_reason: str | None = None, pending_checks: list[str] | None = None,
+                     ci_result: dict | None = None) -> m.Review:
     """Persist one idempotent, explicitly non-final CI waiting state."""
-    pending = policy_eval.mandatory_checks_pending
+    pending = pending_checks if pending_checks is not None else policy_eval.mandatory_checks_pending
     reasons = list(policy_eval.warnings)
     reasons.append(
-        f"Waiting for mandatory CI check(s) to complete: {', '.join(pending)}. "
-        "SecurePR will finalize after GitHub reports terminal results for this commit."
+        f"Waiting for CI: {', '.join(pending)}. "
+        "SecurePR will finalize after the discovered checks finish and the results stabilize."
     )
     if extra_reason:
         reasons.append(extra_reason)
     if existing_placeholder:
         existing_placeholder.ci_wait_pending_checks = pending
         existing_placeholder.decision_reasons = reasons
+        if ci_result:
+            _store_ci_result(db, existing_placeholder.id, ci_result)
         db.commit()
         return existing_placeholder
 
@@ -265,6 +382,8 @@ def _persist_ci_wait(db: Session, repo: m.Repository, pr: m.PullRequest, install
                               is_blocked_path=False, patch_excerpt=f.get("patch_excerpt")))
     db.add(m.Evidence(review_id=review.id, evidence_type="ci_wait", source="securepr",
                       content=f"Waiting for: {', '.join(pending)}"))
+    if ci_result:
+        _store_ci_result(db, review.id, ci_result)
     if changed_files_error:
         db.add(m.Evidence(
             review_id=review.id,
@@ -283,6 +402,7 @@ def _persist_ci_wait(db: Session, repo: m.Repository, pr: m.PullRequest, install
                 changed_files_unavailable=changed_files_error,
                 policy_name=policy_eval.policy_name, policy_version=policy_eval.policy_version,
                 dashboard_url=f"{settings.DASHBOARD_ORIGIN}/#/pr/{pr.id}",
+                ci_state=ci_result.get("state") if ci_result else None,
             )
             result = github_client.post_review(installation_id, owner, repo_name, pr.github_pr_number, body, "COMMENT")
             db.add(m.GithubAction(review_id=review.id, action_type="post_waiting_comment",
@@ -290,6 +410,52 @@ def _persist_ci_wait(db: Session, repo: m.Repository, pr: m.PullRequest, install
             db.commit()
         except Exception:
             logger.exception("Failed to post CI-wait comment: review_id=%s", review.id)
+    return review
+
+
+def _finalize_unverified_ci_wait(
+    db: Session,
+    repo: m.Repository,
+    pr: m.PullRequest,
+    installation_id: str,
+    owner: str,
+    repo_name: str,
+    policy_id: str,
+    policy_eval,
+    existing_placeholder,
+    changed_files: list[dict],
+    ci_result: dict,
+    reason: str,
+) -> m.Review:
+    """Close a timed-out wait locally when GitHub revision verification fails."""
+    ci_result["state"] = "TIMEOUT"
+    ci_result["error"] = reason
+    review = _persist_ci_wait(
+        db,
+        repo,
+        pr,
+        installation_id,
+        owner,
+        repo_name,
+        policy_id,
+        policy_eval,
+        existing_placeholder,
+        changed_files=changed_files,
+        pending_checks=["Final GitHub verification unavailable"],
+        ci_result=ci_result,
+        extra_reason=reason,
+    )
+    review.is_ci_wait_placeholder = False
+    review.ci_wait_pending_checks = []
+    review.decision = m.DecisionStatus.MANUAL_REVIEW
+    review.decision_reasons = [
+        reason,
+        "No GitHub review was published because the current PR revision could not be verified.",
+    ]
+    review.analysis_completed_at = datetime.utcnow()
+    _store_ci_result(db, review.id, ci_result)
+    db.commit()
+    db.refresh(review)
     return review
 
 
@@ -491,10 +657,7 @@ def _ci_wait_poll_loop(
     head_sha: str,
     stop_event: threading.Event | None = None,
 ) -> None:
-    """Fallback poller: periodically re-runs analysis (cheap no-op if still
-    pending) until CI resolves or CI_WAIT_TIMEOUT_SECONDS elapses, at which
-    point it force-finalizes with whatever is known so the PR is never stuck
-    WAITING_FOR_CI indefinitely."""
+    """Polls until CI stabilizes or the bounded timeout forces manual review."""
     session_factory = get_session_factory()
     stop_event = stop_event or threading.Event()
     deadline = time.monotonic() + settings.CI_WAIT_TIMEOUT_SECONDS
@@ -716,7 +879,7 @@ def run_analysis(
             trigger=trigger,
             event_name=event_name,
         )
-        if review.decision != m.DecisionStatus.WAITING_FOR_CI:
+        if review is None or review.decision != m.DecisionStatus.WAITING_FOR_CI:
             _cancel_ci_wait_poller(current_pr.id, current_pr.head_sha)
         return review
 
@@ -731,7 +894,7 @@ def _run_analysis_locked(
     force_final: bool = False,
     trigger: str = "analysis",
     event_name: str | None = None,
-) -> m.Review:
+) -> m.Review | None:
     """
     Runs one analysis pass. Returns either:
       - a WAITING_FOR_CI placeholder review (mandatory checks still running
@@ -743,9 +906,40 @@ def _run_analysis_locked(
     and does not re-post the "waiting" comment -- callers (the poller and the
     webhook fast path) can call this repeatedly without spamming the PR.
     """
+    owner, repo_name = repo.full_name.split("/", 1)
+    pull_request_fetch_error = None
+    try:
+        live_pr = github_client.get_pull_request(
+            installation_id, owner, repo_name, pr.github_pr_number
+        )
+        live_sha = live_pr.get("head_sha")
+        if live_pr.get("state") != "open":
+            pr.state = live_pr.get("state") or pr.state
+            db.commit()
+            return None
+        if not isinstance(live_sha, str) or not live_sha:
+            raise ValueError("GitHub pull-request response is missing its head SHA.")
+        if live_sha != pr.head_sha:
+            logger.info(
+                "PR head refreshed before CI evaluation: repository=%s pr_number=%s "
+                "stored_head_sha=%s live_head_sha=%s",
+                repo.full_name,
+                pr.github_pr_number,
+                pr.head_sha,
+                live_sha,
+            )
+            pr.head_sha = live_sha
+            db.commit()
+    except Exception:
+        pull_request_fetch_error = "pull_request"
+        logger.exception(
+            "Failed to verify live PR revision before CI evaluation: repository=%s pr_number=%s",
+            repo.full_name,
+            pr.github_pr_number,
+        )
+
     # A retry of an already-finalized delivery must not issue another GitHub
-    # review.  Re-evaluation callers explicitly opt out by supplying their
-    # own review lineage.
+    # review. Re-evaluation callers explicitly opt out of this check.
     existing_final = (
         db.query(m.Review)
         .filter(m.Review.pull_request_id == pr.id, m.Review.head_sha == pr.head_sha,
@@ -759,7 +953,6 @@ def _run_analysis_locked(
 
     analysis_started_at = time.perf_counter()
     started = datetime.utcnow()
-    owner, repo_name = repo.full_name.split("/", 1)
 
     existing_placeholder = (
         db.query(m.Review)
@@ -772,16 +965,18 @@ def _run_analysis_locked(
     policy_doc = policy_engine.load_repo_policy(repo.full_name)
     policy_id = _get_or_create_policy_row(db, repo, policy_doc)
 
-    # --- 1. CI gate: inspect the exact PR head before doing expensive final
-    # analysis.  A missing mandatory check is deliberately indistinguishable
-    # from a queued one here: both mean GitHub has not supplied a terminal
-    # verification result yet.
+    # --- 1. Discover the checks attached to the live PR head. A transient
+    # GitHub failure is represented explicitly and never treated as success.
     ci_fetch_started_at = time.perf_counter()
-    ci_checks, ci_fetch_failed = _fetch_ci_checks(installation_id, owner, repo_name, pr.head_sha)
+    ci_checks, ci_suites, ci_fetch_errors = _fetch_ci_checks(
+        installation_id, owner, repo_name, pr.head_sha
+    )
+    if pull_request_fetch_error:
+        ci_fetch_errors.append(pull_request_fetch_error)
     _log_analysis_timing("ci_fetch", ci_fetch_started_at, trigger, repo, pr)
     logger.info(
         "CI state re-fetched: trigger=%s event_type=%s repository=%s pr_number=%s "
-        "head_sha=%s checks=%s fetch_failed=%s",
+        "head_sha=%s checks=%s check_suites=%s fetch_errors=%s",
         trigger,
         event_name or "none",
         repo.full_name,
@@ -789,13 +984,20 @@ def _run_analysis_locked(
         pr.head_sha,
         [
             {
+                "identity": check.get("identity"),
                 "name": check.get("name"),
+                "provider": check.get("provider"),
                 "status": check.get("status"),
                 "conclusion": check.get("conclusion"),
             }
             for check in ci_checks
         ],
-        ci_fetch_failed,
+        [
+            {"identity": suite.get("identity"), "status": suite.get("status"),
+             "conclusion": suite.get("conclusion")}
+            for suite in ci_suites
+        ],
+        ci_fetch_errors,
         extra={
             "finalization_trigger": trigger,
             "event_type": event_name,
@@ -804,6 +1006,7 @@ def _run_analysis_locked(
             "head_sha": pr.head_sha,
             "required_check_states": [
                 {
+                    "identity": check.get("identity"),
                     "name": check.get("name"),
                     "status": check.get("status"),
                     "conclusion": check.get("conclusion"),
@@ -813,23 +1016,43 @@ def _run_analysis_locked(
         },
     )
     ci_gate = policy_engine.evaluate_policy(policy_doc, [], ci_checks, pr.author_login)
-    if ci_gate.mandatory_checks_pending and not force_final:
+    ci_result, ci_evaluation = _ci_snapshot(
+        db,
+        existing_placeholder,
+        ci_checks,
+        ci_suites,
+        pr.head_sha,
+        ci_fetch_errors,
+        ci_gate.mandatory_checks_pending,
+        force_final,
+    )
+    no_ci_detected = ci_evaluation.state in ("NO_CI_CONFIGURED", "NO_CHECKS_FOUND")
+    ci_wait_pending = list(ci_evaluation.pending_checks)
+    if ci_gate.mandatory_checks_pending:
+        ci_wait_pending = sorted(set(ci_wait_pending + ci_gate.mandatory_checks_pending))
+    should_wait_for_policy = bool(
+        ci_gate.mandatory_checks_pending and not no_ci_detected and not force_final
+    )
+    should_wait_for_ci = not ci_evaluation.finalized and not force_final
+    if should_wait_for_ci or should_wait_for_policy:
         logger.info(
-            "CI still pending: trigger=%s event_type=%s repository=%s pr_number=%s head_sha=%s "
-            "pending_checks=%s",
+            "CI discovery is not stable: trigger=%s event_type=%s repository=%s pr_number=%s "
+            "head_sha=%s ci_state=%s pending_checks=%s",
             trigger,
             event_name or "none",
             repo.full_name,
             pr.github_pr_number,
             pr.head_sha,
-            ci_gate.mandatory_checks_pending,
+            ci_evaluation.state,
+            ci_wait_pending,
             extra={
                 "finalization_trigger": trigger,
                 "event_type": event_name,
                 "repository": repo.full_name,
                 "pr_number": pr.github_pr_number,
                 "head_sha": pr.head_sha,
-                "pending_checks": ci_gate.mandatory_checks_pending,
+                "ci_state": ci_evaluation.state,
+                "pending_checks": ci_wait_pending,
             },
         )
         waiting_changed_files = None
@@ -851,9 +1074,9 @@ def _run_analysis_locked(
             _log_analysis_timing("waiting_file_fetch", waiting_files_started_at, trigger, repo, pr)
 
         wait_reasons = []
-        if ci_fetch_failed:
+        if ci_fetch_errors:
             wait_reasons.append(
-                "SecurePR could not fully read GitHub CI yet; it will keep waiting rather than make a final "
+                "SecurePR could not fully read GitHub CI yet; it will retry rather than make a final "
                 "decision from incomplete CI information."
             )
         if waiting_changed_files_error:
@@ -865,14 +1088,14 @@ def _run_analysis_locked(
             changed_files=waiting_changed_files,
             changed_files_error=waiting_changed_files_error,
             extra_reason="\n".join(wait_reasons) or None,
+            pending_checks=ci_wait_pending,
+            ci_result=ci_result,
         )
         _log_analysis_timing("total", analysis_started_at, trigger, repo, pr)
         return review
 
-    # CI is terminal (or the controlled timeout explicitly requested a final
-    # manual-review result), so now fetch source data and perform final risk
-    # analysis. One CI endpoint may be unavailable while the other provides
-    # every required terminal result; that is still sufficient verification.
+    # The discovered checks are terminal and stable, or the bounded timeout /
+    # no-CI path will force a manual review before any approval can be published.
     analysis_complete = True
     changed_files_error: str | None = None
     changed_files: list[dict] = []
@@ -957,7 +1180,12 @@ def _run_analysis_locked(
     author_threshold = eligibility.max_risk_threshold if eligibility else None
 
     # --- 8. Decision (deterministic) --------------------------------------------
-    pending_for_decision = [] if force_final else policy_eval.mandatory_checks_pending
+    ci_timed_out = ci_evaluation.state == "TIMEOUT"
+    pending_for_decision = (
+        []
+        if force_final or ci_timed_out or no_ci_detected
+        else policy_eval.mandatory_checks_pending
+    )
     decision = decision_engine.decide(decision_engine.DecisionInput(
         overall_score=assessment.overall_score, risk_category=assessment.category, findings=findings,
         policy_violations=policy_eval.violations, policy_warnings=policy_eval.warnings,
@@ -968,16 +1196,192 @@ def _run_analysis_locked(
     ))
     if changed_files_error:
         decision.reasons = [changed_files_error]
-    if force_final and policy_eval.mandatory_checks_pending and decision.status not in (
-            m.DecisionStatus.BLOCKED,):
+    if ci_timed_out and decision.status not in (m.DecisionStatus.BLOCKED,):
         # Timed out waiting for CI -- never silently approve on an incomplete
         # verification picture; route to manual review and say why.
         decision = decision_engine.Decision(
             m.DecisionStatus.MANUAL_REVIEW,
-            [f"Timed out after {settings.CI_WAIT_TIMEOUT_SECONDS}s waiting for mandatory check(s) "
-             f"{', '.join(policy_eval.mandatory_checks_pending)} to complete; routed to manual review "
-             f"rather than approving without a final verification result."] + decision.reasons,
+            [
+                (
+                    f"Timed out after {settings.CI_WAIT_TIMEOUT_SECONDS}s waiting for GitHub CI "
+                    "to become available and stable; routed to manual review rather than approving "
+                    "without a final verification result."
+                )
+            ] + decision.reasons,
         )
+    elif no_ci_detected and decision.status not in (m.DecisionStatus.BLOCKED,):
+        state_text = (
+            "No CI checks were detected for this commit."
+            if ci_evaluation.state == "NO_CI_CONFIGURED"
+            else "GitHub reported check suites but no check runs or commit statuses were found."
+        )
+        decision = decision_engine.Decision(
+            m.DecisionStatus.MANUAL_REVIEW,
+            [f"{state_text} SecurePR did not treat the absence of checks as successful CI."] +
+            decision.reasons,
+        )
+
+    if decision.status != m.DecisionStatus.WAITING_FOR_CI:
+        try:
+            latest_pr = github_client.get_pull_request(
+                installation_id, owner, repo_name, pr.github_pr_number
+            )
+        except Exception:
+            logger.exception(
+                "Could not verify the live PR revision before finalization: "
+                "repository=%s pr_number=%s head_sha=%s",
+                repo.full_name,
+                pr.github_pr_number,
+                pr.head_sha,
+            )
+            reason = "GitHub could not verify the PR revision before finalization."
+            if force_final or ci_timed_out:
+                review = _finalize_unverified_ci_wait(
+                    db, repo, pr, installation_id, owner, repo_name, policy_id,
+                    policy_eval, existing_placeholder, changed_files, ci_result, reason,
+                )
+            else:
+                ci_result["state"] = "ERROR"
+                ci_result["error"] = reason
+                review = _persist_ci_wait(
+                    db,
+                    repo,
+                    pr,
+                    installation_id,
+                    owner,
+                    repo_name,
+                    policy_id,
+                    policy_eval,
+                    existing_placeholder,
+                    changed_files=changed_files,
+                    pending_checks=["GitHub PR revision unavailable"],
+                    ci_result=ci_result,
+                    extra_reason=reason,
+                )
+            _log_analysis_timing("total", analysis_started_at, trigger, repo, pr)
+            return review
+
+        latest_sha = latest_pr.get("head_sha")
+        if latest_pr.get("state") != "open":
+            pr.state = latest_pr.get("state") or pr.state
+            db.commit()
+            return None
+        if not isinstance(latest_sha, str) or not latest_sha:
+            logger.error(
+                "GitHub PR response did not contain a head SHA before finalization: "
+                "repository=%s pr_number=%s",
+                repo.full_name,
+                pr.github_pr_number,
+            )
+            reason = "GitHub could not verify the PR revision before finalization."
+            if force_final or ci_timed_out:
+                review = _finalize_unverified_ci_wait(
+                    db, repo, pr, installation_id, owner, repo_name, policy_id,
+                    policy_eval, existing_placeholder, changed_files, ci_result, reason,
+                )
+            else:
+                ci_result["state"] = "ERROR"
+                ci_result["error"] = reason
+                review = _persist_ci_wait(
+                    db,
+                    repo,
+                    pr,
+                    installation_id,
+                    owner,
+                    repo_name,
+                    policy_id,
+                    policy_eval,
+                    existing_placeholder,
+                    changed_files=changed_files,
+                    pending_checks=["GitHub PR revision unavailable"],
+                    ci_result=ci_result,
+                    extra_reason=reason,
+                )
+            _log_analysis_timing("total", analysis_started_at, trigger, repo, pr)
+            return review
+        if latest_sha != pr.head_sha:
+            logger.info(
+                "Finalization stopped because the PR head changed during analysis: "
+                "repository=%s pr_number=%s reviewed_head_sha=%s current_head_sha=%s",
+                repo.full_name,
+                pr.github_pr_number,
+                pr.head_sha,
+                latest_sha,
+            )
+            pr.head_sha = latest_sha
+            db.commit()
+            return None
+
+        final_ci_checks, final_ci_suites, final_ci_errors = _fetch_ci_checks(
+            installation_id, owner, repo_name, latest_sha
+        )
+        final_ci_gate = policy_engine.evaluate_policy(
+            policy_doc, [], final_ci_checks, pr.author_login
+        )
+        final_ci_result, final_ci_evaluation = _ci_snapshot(
+            db,
+            existing_placeholder,
+            final_ci_checks,
+            final_ci_suites,
+            latest_sha,
+            final_ci_errors,
+            final_ci_gate.mandatory_checks_pending,
+            force_final,
+        )
+        final_signature_changed = (
+            final_ci_result["signature"] != ci_result.get("signature")
+        )
+        if final_signature_changed and not (force_final or ci_timed_out):
+            final_ci_result["state"] = "DISCOVERING"
+            final_ci_result["last_change_at"] = datetime.utcnow().isoformat()
+            final_ci_evaluation = ci_status.CIStatus(
+                "DISCOVERING",
+                False,
+                ("Waiting for newly discovered CI results to stabilize",),
+            )
+        if not final_ci_evaluation.finalized and not (
+            force_final or ci_timed_out
+        ):
+            final_pending = list(final_ci_evaluation.pending_checks)
+            if not final_pending:
+                final_pending = ["Waiting for CI checks to stabilize"]
+            ci_result = final_ci_result
+            review = _persist_ci_wait(
+                db,
+                repo,
+                pr,
+                installation_id,
+                owner,
+                repo_name,
+                policy_id,
+                final_ci_gate,
+                existing_placeholder,
+                changed_files=changed_files,
+                pending_checks=final_pending,
+                ci_result=final_ci_result,
+                extra_reason=final_ci_evaluation.error,
+            )
+            _log_analysis_timing("total", analysis_started_at, trigger, repo, pr)
+            return review
+
+        ci_checks = final_ci_checks
+        ci_suites = final_ci_suites
+        ci_result = final_ci_result
+        ci_evaluation = final_ci_evaluation
+        if ci_evaluation.state == "TIMEOUT":
+            ci_timed_out = True
+            policy_eval = final_ci_gate
+            if decision.status != m.DecisionStatus.BLOCKED:
+                decision = decision_engine.Decision(
+                    m.DecisionStatus.MANUAL_REVIEW,
+                    [
+                        (
+                            f"Timed out after {settings.CI_WAIT_TIMEOUT_SECONDS}s waiting for GitHub CI "
+                            "to become available and stable; routed to manual review rather than approving "
+                            "without a final verification result."
+                        )
+                    ] + decision.reasons,
+                )
 
     dashboard_url = f"{settings.DASHBOARD_ORIGIN}/#/pr/{pr.id}"
 
@@ -987,7 +1391,8 @@ def _run_analysis_locked(
     # ===================================================================
     if decision.status == m.DecisionStatus.WAITING_FOR_CI:
         if existing_placeholder:
-            existing_placeholder.ci_wait_pending_checks = policy_eval.mandatory_checks_pending
+            existing_placeholder.ci_wait_pending_checks = ci_wait_pending
+            _store_ci_result(db, existing_placeholder.id, ci_result)
             db.commit()
             logger.info("CI-wait placeholder reused (still pending): review_id=%s pending=%s",
                         existing_placeholder.id, policy_eval.mandatory_checks_pending)
@@ -998,7 +1403,7 @@ def _run_analysis_locked(
             pull_request_id=pr.id, policy_id=policy_id, head_sha=pr.head_sha, is_reevaluation=is_reevaluation,
             superseded_review_id=previous_review_id, analysis_started_at=started,
             is_ci_wait_placeholder=True, ci_wait_started_at=started,
-            ci_wait_pending_checks=policy_eval.mandatory_checks_pending,
+            ci_wait_pending_checks=ci_wait_pending,
             decision=m.DecisionStatus.WAITING_FOR_CI, decision_reasons=decision.reasons,
             risk_category="NOT_EVALUATED", circuit_breaker_active=cb_tripped,
         )
@@ -1011,6 +1416,7 @@ def _run_analysis_locked(
                                   patch_excerpt=f.get("patch_excerpt")))
         db.add(m.Evidence(review_id=review.id, evidence_type="ci_wait", source="securepr",
                            content=f"Waiting for: {', '.join(policy_eval.mandatory_checks_pending)}"))
+        _store_ci_result(db, review.id, ci_result)
         db.commit()
         db.refresh(review)
         logger.info(
@@ -1035,9 +1441,10 @@ def _run_analysis_locked(
 
         try:
             body = format_waiting_comment(
-                pending_checks=policy_eval.mandatory_checks_pending, changed_files_count=len(changed_files),
+                    pending_checks=ci_wait_pending, changed_files_count=len(changed_files),
                 policy_name=policy_eval.policy_name, policy_version=policy_eval.policy_version,
                 dashboard_url=dashboard_url,
+                    ci_state=ci_result.get("state"),
             )
             result = github_client.post_review(installation_id, owner, repo_name, pr.github_pr_number, body, "COMMENT")
             db.add(m.GithubAction(review_id=review.id, action_type="post_waiting_comment",
@@ -1081,9 +1488,7 @@ def _run_analysis_locked(
     if ai_scores and ai_scores.get("summary"):
         db.add(m.Evidence(review_id=review.id, evidence_type="ai_rationale", source="gemini",
                            content=ai_scores["summary"]))
-    if ci_checks:
-        db.add(m.Evidence(review_id=review.id, evidence_type="ci_result", source="github",
-                           content=json.dumps(ci_checks)))
+    _store_ci_result(db, review.id, ci_result)
     if not analysis_complete:
         db.add(m.Evidence(review_id=review.id, evidence_type="error", source="github_fetch",
                            content=changed_files_error or
@@ -1132,6 +1537,7 @@ def _run_analysis_locked(
         circuit_breaker_tripped=cb_tripped, circuit_breaker_reason=cb_reason, impact_items=impact_items,
         policy_name=policy_eval.policy_name, policy_version=policy_eval.policy_version, dashboard_url=dashboard_url,
         ci_checks=ci_checks, waited_for_ci=waited_for_ci,
+        ci_state=ci_evaluation.state,
         analysis_error=changed_files_error,
     )
 

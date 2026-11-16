@@ -126,8 +126,8 @@ service-role key formats and requires HTTPS origins.
    - Do not grant any broader permissions than those listed. Contents write is used only by SecurePR's guarded merge flow; branch protection is never bypassed.
 7. **Subscribe to events:** `Pull request`, `Check run`, `Check suite`, and `Commit status`.
    The last two are what let SecurePR notice the moment your CI finishes and finalize
-   its decision within seconds, instead of waiting for the next poll — see
-   "Waiting for CI before the final decision" below.
+   its CI discovery promptly, instead of waiting for the next poll; final
+   review still waits for the configured stabilization window.
 8. **Where can this GitHub App be installed:** "Only on this account" is fine for testing.
 9. Click **Create GitHub App**. Note the **App ID** shown at the top → put it in `GITHUB_APP_ID`.
 10. Scroll down → **Generate a private key** → a `.pem` file downloads. For local development, create a `backend/secrets/` folder, store the key there, and set `GITHUB_PRIVATE_KEY_PATH=./secrets/github-app-private-key.pem`. For Render, enter the PEM contents in the backend-only `GITHUB_PRIVATE_KEY` secret setting. Literal `\n` sequences are also normalized by the backend. Do not commit the key or put it in `GITHUB_PRIVATE_KEY_PATH` as a public URL.
@@ -146,30 +146,32 @@ service-role key formats and requires HTTPS origins.
    since AI scoring is only one input into the deterministic decision engine,
    never a requirement for it to run.
 
-## 9. How SecurePR waits for GitHub checks before deciding
+## 9. Dynamic GitHub CI discovery and stabilization
 
-SecurePR never finalizes a decision while a mandatory check (as configured in
-`policies/default_policy.json` → `mandatory_ci_checks`) is still queued or
-running. Instead:
+The default policy does not require names such as `build`, `unit-tests`, or
+`lint`. For each revision SecurePR refreshes the PR head SHA, retrieves Check
+Runs, legacy commit statuses, and Check Suites for that exact SHA, then
+persists each check's identity, provider, name, status, conclusion, URL, and
+SHA as review evidence.
 
-1. It posts a short **"⏳ Waiting for CI"** comment on the PR listing which
-   checks it's still waiting on, and nothing else happens yet — no
-   approve/block verdict, no circuit-breaker/risk-threshold evaluation.
-2. As soon as GitHub reports a `check_suite`, `check_run`, or legacy `status` as terminal
-   for that commit, the webhook handler matches the event against open PRs'
-   current head SHAs and queues an immediate analysis. It re-fetches the
-   authoritative check state before deciding. This works even if the CI event
-   arrives before the initial analysis has saved its waiting row.
-3. As a fallback in case that webhook delivery is ever missed, a background
-   poller also re-checks every `CI_WAIT_POLL_INTERVAL_SECONDS` (default 20s)
-   for up to `CI_WAIT_TIMEOUT_SECONDS` (default 900s / 15 minutes). A poll
-   can finalize as soon as it sees terminal checks; the timeout is only the
-   last-resort manual-review behavior if checks remain pending. Both values
-   are configurable in `.env`. The poller is signaled to stop once a webhook
-   or another poll has finalized that revision.
-4. If the timeout is reached and checks are still pending, SecurePR does
-   **not** silently approve — it finalizes as `MANUAL_REVIEW` and says
-   explicitly in the comment and dashboard that it timed out waiting for CI.
+1. Pending/queued checks keep the PR in **CI running**. SecurePR listens to
+   every `check_run`, `check_suite`, and `status` transition, including
+   non-terminal events, and re-fetches authoritative state.
+2. Once discovered results become terminal, SecurePR waits for
+   `CI_DISCOVERY_STABILIZATION_SECONDS` (default 30s) without new or changed
+   checks before normal finalization. A late check resets the window. Webhook
+   and polling paths use the same evaluator.
+3. If no checks or suites are discovered after stabilization, SecurePR records
+   `NO_CI_CONFIGURED`; if suites exist but no check runs or statuses appear,
+   it records `NO_CHECKS_FOUND`. Neither state is reported as successful CI;
+   the review is routed to manual review.
+4. GitHub API failures stay unavailable/error and are retried. The bounded
+   poller checks every `CI_WAIT_POLL_INTERVAL_SECONDS` (default 20s) until
+   `CI_WAIT_TIMEOUT_SECONDS` (default 900s / 15 minutes), then records
+   `TIMEOUT` and routes to manual review. All three values are configurable in
+   the backend environment.
+5. Explicit `mandatory_ci_checks` in a repository-specific policy remain a
+   separate policy gate. Missing required checks are never treated as passed.
 
 All review creation and publication for one repository/PR is serialized with
 a PostgreSQL session advisory lock (or a SQL Server application lock when
@@ -189,8 +191,9 @@ GitHub App, edit the App's webhook event subscriptions to add `Check run`,
 GitHub asks you to.
 
 The optional waiting comment is controlled by `POST_CI_WAITING_COMMENT`
-(default `true`). `CI_WAIT_POLL_INTERVAL_SECONDS` and
-`CI_WAIT_TIMEOUT_SECONDS` configure only the fallback monitor; they do not
+(default `true`). `CI_DISCOVERY_STABILIZATION_SECONDS` controls the quiet
+window after the last discovered/changed result. `CI_WAIT_POLL_INTERVAL_SECONDS`
+and `CI_WAIT_TIMEOUT_SECONDS` configure the fallback monitor; they do not
 replace checking GitHub's actual terminal CI results.
 
 ## 10. Safe auto-merge
@@ -200,9 +203,10 @@ Auto-merge is off by default and runs only after the existing final analysis pro
 The repository policy's `auto_merge_allowed_risk_categories` defaults to
 `["LOW"]`; MEDIUM/HIGH categories require explicit inclusion in that
 repository's policy. `AUTO_MERGE_LOW_RISK_ONLY=true` remains a global cap
-that a repository policy cannot override. All mandatory CI checks are
-always required for auto-merge; `AUTO_MERGE_REQUIRE_ALL_CI` cannot disable
-this safety gate.
+that a repository policy cannot override. All discovered CI checks must be
+available, terminal, and non-failing before auto-merge; no-check and API-error
+states are not mergeable. Explicit mandatory checks remain separately
+enforced. `AUTO_MERGE_REQUIRE_ALL_CI` cannot disable these safety gates.
 
 For local testing, set the following in `backend/.env` and restart the backend:
 
@@ -221,7 +225,7 @@ WHERE full_name = 'OWNER/REPOSITORY';
 
 Set `AUTO_MERGE_ENABLED=false` or that repository flag to `FALSE` to disable it. Both switches must be true. The App requires Pull requests: Read & write, Checks: Read-only, Issues: Read & write, Metadata: Read-only, and Contents: Read & write. Existing App installations must be updated or reinstalled after the Contents permission change.
 
-Immediately before merging, SecurePR refetches the PR and requires: open state; unchanged reviewed head/base; GitHub mergeability and no conflict; successful mandatory checks; approved/LOW decision within the eligible author's threshold; no HIGH/CRITICAL/mandatory-blocker finding or policy violation; and an inactive circuit breaker. The merge API includes the reviewed SHA as a stale-head guard. Branch protection is not bypassed.
+Immediately before merging, SecurePR refetches the PR and requires: open state; unchanged reviewed head/base; GitHub mergeability and no conflict; all discovered checks terminal and non-failing; approved/LOW decision within the eligible author's threshold; no HIGH/CRITICAL/mandatory-blocker finding or policy violation; and an inactive circuit breaker. The merge API includes the reviewed SHA as a stale-head guard. Branch protection is not bypassed.
 
 The review stores `auto_merge_status`, attempt/merge timestamps, merge SHA, and failure reason. Every attempt is also stored in `github_actions` and evidence. Permissions, protection, conflicts, or race failures leave the PR open and produce an Approved, Manual Merge Required comment.
 
@@ -281,7 +285,7 @@ automatically. Set the following backend **public configuration**:
 - `GEMINI_MODEL`, `GEMINI_FALLBACK_MODEL`, and
   `GEMINI_REQUEST_TIMEOUT_SECONDS`
 - `CI_WAIT_POLL_INTERVAL_SECONDS`, `CI_WAIT_TIMEOUT_SECONDS`,
-  `POST_CI_WAITING_COMMENT`
+  `CI_DISCOVERY_STABILIZATION_SECONDS`, `POST_CI_WAITING_COMMENT`
 - `AUTO_MERGE_ENABLED`, `AUTO_MERGE_LOW_RISK_ONLY`,
   `AUTO_MERGE_REQUIRE_ALL_CI`
 - `SECUREPR_BASE_URL` — the Render HTTPS origin
@@ -330,8 +334,8 @@ processing; a sleeping instance can delay webhook responses.
 | Webhook never fires                                                   | Confirm the GitHub App's webhook URL is reachable from the internet (`ngrok` for local tests, permanent HTTPS backend URL for production), and that the App is installed on the repository.                                                                                                                                                           |
 | Gemini calls fail silently                                            | Check `GEMINI_API_KEY` is set; SecurePR falls back to heuristic-only scoring automatically and logs a warning — this is expected behavior, not a crash.                                                                                                                                                                                               |
 | GitHub review/comment doesn't post                                    | Check the App's permissions include Pull requests: Read & write, and that the installation ID stored for the repo matches an active installation.                                                                                                                                                                                                     |
-| A PR is stuck showing "Waiting for CI"                                | Confirm your GitHub App is subscribed to `Check run`/`Check suite`/`Status` events (section 7), inspect the CI lifecycle log fields (`event_type`, `repository`, `pr_number`, `head_sha`, `matched_current_revision`, `ignore_reason`), and verify logical check names or their `ci_check_aliases` in the active policy. Polling is only a fallback; the 15-minute timeout is not the normal finalization path. |
-| "Mandatory CI check not passing" even though CI later passed          | This is the exact bug the CI-wait feature fixes. Confirm you're running the current `pipeline.py`/`decision_engine.py` and that the App has the `Check run`/`Check suite` subscriptions from section 7.                                                                                                                                               |
+| A PR is stuck showing "Waiting for CI"                                | Confirm your GitHub App is subscribed to `Check run`/`Check suite`/`Status` events (section 7), inspect the CI lifecycle log fields (`event_type`, `repository`, `pr_number`, `head_sha`, `matched_current_revision`, `ignore_reason`), and check GitHub API availability. Polling is a fallback; the 15-minute timeout is the final manual-review path. |
+| A configured mandatory check is still pending                         | Confirm the check name or explicit `ci_check_aliases` in the repository policy, then verify GitHub reports that check on the current PR head SHA. Missing mandatory checks are never treated as successful.                                                                                                                                       |
 | Dashboard page asks you to type an ID                                 | Shouldn't happen — every page loads its own dropdown data from the backend. Check the browser console and backend log for the underlying failed request.                                                                                                                                                                                              |
 | Dashboard shows "API error" toasts on every page                      | Usually CORS or a wrong API base URL — confirm the sidebar's "API base URL" field matches where `uvicorn` is running, and that `DASHBOARD_ORIGIN` in `.env` matches where you're serving the dashboard from.                                                                                                                                          |
 | Port `8000` or `5173` already in use                                  | Start on another port, e.g. `uvicorn app.main:app --reload --port 8001` (update the dashboard's API base URL field to match), or `python -m http.server 5174`.                                                                                                                                                                                        |

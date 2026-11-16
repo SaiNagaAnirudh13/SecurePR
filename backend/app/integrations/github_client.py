@@ -20,6 +20,8 @@ logger = logging.getLogger("securepr.github")
 GITHUB_API = "https://api.github.com"
 GITHUB_PAGE_SIZE = 100
 INSTALLATION_TOKEN_CACHE_SECONDS = 45 * 60
+GITHUB_GET_MAX_ATTEMPTS = 3
+GITHUB_GET_MAX_RETRY_DELAY_SECONDS = 10
 
 
 class GitHubClient:
@@ -66,17 +68,47 @@ class GitHubClient:
         token = self._installation_token(installation_id)
         return {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
 
+    def _get_with_retry(self, url: str, headers: dict, params: dict | None = None):
+        for attempt in range(GITHUB_GET_MAX_ATTEMPTS):
+            try:
+                resp = requests.get(url, headers=headers, params=params, timeout=20)
+            except requests.RequestException:
+                if attempt + 1 == GITHUB_GET_MAX_ATTEMPTS:
+                    raise
+                time.sleep(min(0.25 * (2 ** attempt), GITHUB_GET_MAX_RETRY_DELAY_SECONDS))
+                continue
+
+            status = resp.status_code
+            rate_limited = status == 403 and (
+                resp.headers.get("X-RateLimit-Remaining") == "0"
+                or "Retry-After" in resp.headers
+            )
+            retryable = status in (429, 500, 502, 503, 504) or rate_limited
+            if not retryable or attempt + 1 == GITHUB_GET_MAX_ATTEMPTS:
+                resp.raise_for_status()
+                return resp
+
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                if retry_after is not None:
+                    delay = float(retry_after)
+                elif rate_limited and resp.headers.get("X-RateLimit-Reset"):
+                    delay = float(resp.headers["X-RateLimit-Reset"]) - time.time()
+                else:
+                    delay = 0.25 * (2 ** attempt)
+            except ValueError:
+                delay = 0.25 * (2 ** attempt)
+            time.sleep(min(max(delay, 0), GITHUB_GET_MAX_RETRY_DELAY_SECONDS))
+
     def _get_paginated_items(self, url: str, headers: dict, collection_key: str | None = None) -> list[dict]:
         items: list[dict] = []
         page = 1
         while True:
-            resp = requests.get(
+            resp = self._get_with_retry(
                 url,
-                headers=headers,
+                headers,
                 params={"per_page": GITHUB_PAGE_SIZE, "page": page},
-                timeout=20,
             )
-            resp.raise_for_status()
             payload = resp.json()
             if collection_key is None:
                 batch = payload
@@ -126,9 +158,58 @@ class GitHubClient:
             headers,
             "check_runs",
         )
-        return [{"name": c.get("name"), "status": c.get("status"), "conclusion": c.get("conclusion"),
-                 "html_url": c.get("html_url"), "completed_at": c.get("completed_at"),
-                 "started_at": c.get("started_at"), "id": c.get("id")} for c in runs]
+        normalized = []
+        for check in runs:
+            check_sha = check.get("head_sha") or head_sha
+            if check_sha != head_sha:
+                continue
+            app = check.get("app") or {}
+            identity = check.get("id")
+            normalized.append({
+                "identity": f"check_run:{identity}" if identity is not None else None,
+                "id": identity,
+                "kind": "check_run",
+                "name": check.get("name"),
+                "provider": app.get("slug") or app.get("name") or "GitHub Check Run",
+                "status": check.get("status"),
+                "conclusion": check.get("conclusion"),
+                "url": check.get("html_url"),
+                "html_url": check.get("html_url"),
+                "sha": check_sha,
+                "completed_at": check.get("completed_at"),
+                "started_at": check.get("started_at"),
+            })
+        return normalized
+
+    def get_check_suites(self, installation_id: str, owner: str, repo: str, head_sha: str) -> list[dict]:
+        headers = self._headers(installation_id)
+        suites = self._get_paginated_items(
+            f"{GITHUB_API}/repos/{owner}/{repo}/commits/{head_sha}/check-suites",
+            headers,
+            "check_suites",
+        )
+        normalized = []
+        for suite in suites:
+            suite_sha = suite.get("head_sha") or head_sha
+            if suite_sha != head_sha:
+                continue
+            app = suite.get("app") or {}
+            identity = suite.get("id")
+            normalized.append({
+                "identity": f"check_suite:{identity}" if identity is not None else None,
+                "id": identity,
+                "kind": "check_suite",
+                "name": app.get("name") or app.get("slug") or "GitHub Check Suite",
+                "provider": app.get("slug") or app.get("name") or "GitHub Check Suite",
+                "status": suite.get("status"),
+                "conclusion": suite.get("conclusion"),
+                "url": suite.get("html_url"),
+                "html_url": suite.get("html_url"),
+                "sha": suite_sha,
+                "completed_at": suite.get("completed_at"),
+                "started_at": suite.get("created_at"),
+            })
+        return normalized
 
     def get_commit_statuses(self, installation_id: str, owner: str, repo: str, head_sha: str) -> list[dict]:
         """Legacy commit-status API (used by some non-Actions CI providers).
@@ -141,19 +222,42 @@ class GitHubClient:
             headers,
             "statuses",
         )
-        out = []
+        latest_by_context = {}
         for s in statuses:
             state = s.get("state")
+            context = s.get("context")
+            creator = s.get("creator") or {}
+            provider = creator.get("login") or "Commit Status"
+            previous = latest_by_context.get((provider, context))
+            created_at = s.get("created_at") or ""
+            if previous and (previous.get("created_at") or "") >= created_at:
+                continue
             if state == "pending":
-                out.append({"name": s.get("context"), "status": "in_progress", "conclusion": None,
-                            "html_url": s.get("target_url"), "completed_at": None,
-                            "started_at": s.get("created_at"), "id": s.get("id")})
+                status = "in_progress"
+                conclusion = None
+            elif state in ("success", "failure", "error"):
+                status = "completed"
+                conclusion = "success" if state == "success" else state
             else:
-                conclusion = "success" if state == "success" else "failure"
-                out.append({"name": s.get("context"), "status": "completed", "conclusion": conclusion,
-                            "html_url": s.get("target_url"), "completed_at": s.get("updated_at") or s.get("created_at"),
-                            "started_at": s.get("created_at"), "id": s.get("id")})
-        return out
+                status = "completed"
+                conclusion = "error"
+            identity = s.get("id")
+            latest_by_context[(provider, context)] = {
+                "identity": f"commit_status:{identity}" if identity is not None else None,
+                "id": identity,
+                "kind": "commit_status",
+                "name": context,
+                "provider": provider,
+                "status": status,
+                "conclusion": conclusion,
+                "url": s.get("target_url"),
+                "html_url": s.get("target_url"),
+                "sha": head_sha,
+                "completed_at": s.get("updated_at") or s.get("created_at") if status == "completed" else None,
+                "started_at": s.get("created_at"),
+                "created_at": s.get("created_at"),
+            }
+        return list(latest_by_context.values())
 
     def post_review(self, installation_id: str, owner: str, repo: str, pr_number: int,
                      body: str, event: str) -> dict:
@@ -174,9 +278,10 @@ class GitHubClient:
 
     def get_pull_request(self, installation_id: str, owner: str, repo: str, pr_number: int) -> dict:
         """Fetch live state used immediately before an auto-merge attempt."""
-        resp = requests.get(f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}",
-                            headers=self._headers(installation_id), timeout=20)
-        resp.raise_for_status()
+        resp = self._get_with_retry(
+            f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}",
+            self._headers(installation_id),
+        )
         data = resp.json()
         return {
             "state": data.get("state"), "mergeable": data.get("mergeable"),

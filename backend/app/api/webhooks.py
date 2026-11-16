@@ -16,8 +16,10 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.db import get_db
 from app.models import models as m
-from app.services.pipeline import run_background_analysis, handle_check_event_finalization
-
+from app.services.pipeline import (
+    handle_check_event_finalization,
+    run_background_analysis,
+)
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
@@ -468,10 +470,11 @@ def _handle_check_event(
     payload: dict,
     event_name: str,
 ) -> dict:
-    """check_suite, check_run, and legacy status webhooks fire for CI transitions.
-    (queued, in_progress, completed...). A terminal event schedules a fresh
-    analysis for a tracked PR whose current head SHA matches the event. It does
-    not require the initial analysis to have persisted a waiting row yet."""
+    """Re-evaluate every CI transition for a tracked PR's current head SHA.
+
+    Non-terminal events matter too: they extend discovery stabilization and
+    prevent finalization while delayed workflows are still being created.
+    """
 
     gh_repo = payload.get("repository")
     if not isinstance(gh_repo, dict):
@@ -495,18 +498,18 @@ def _handle_check_event(
 
     action = payload.get("action")
     if event_name == "status":
-        if payload.get("state") not in ("success", "failure", "error"):
+        if payload.get("state") not in ("pending", "success", "failure", "error"):
             _log_ci_event(
                 event_name=event_name,
                 repository=repository_name,
                 pr_number=pr_number,
                 head_sha=head_sha,
                 matched_current_revision=False,
-                reason="status_not_terminal",
+                reason="status_state_unrecognized",
             )
-            return {"status": "ignored", "reason": "Commit status is not terminal."}
-    elif action != "completed":
-        reason = f"action_not_terminal:{action or 'missing'}"
+            return {"status": "ignored", "reason": "Commit status state is not recognized."}
+    elif not isinstance(action, str) or not action:
+        reason = "action_missing"
         _log_ci_event(
             event_name=event_name,
             repository=repository_name,
@@ -515,7 +518,7 @@ def _handle_check_event(
             matched_current_revision=False,
             reason=reason,
         )
-        return {"status": "ignored", "reason": f"{event_name} action '{action}' does not affect SecurePR."}
+        return {"status": "ignored", "reason": f"{event_name} action is missing."}
 
     github_repo_id = str(gh_repo.get("id", ""))
     repo = db.query(m.Repository).filter(m.Repository.github_repo_id == github_repo_id).first()
@@ -671,9 +674,8 @@ async def github_webhook(
         )
 
         # ----------------------------------------------------
-        # CI-wait fast path: a check_suite/check_run/status completion is the
-        # trigger that lets SecurePR finalize a PR it left WAITING_FOR_CI,
-        # usually within seconds instead of waiting for the next poll tick.
+        # CI events also cover non-terminal transitions so discovery stability
+        # can be reset when workflows or checks appear late.
         # ----------------------------------------------------
 
         if x_github_event in ("check_suite", "check_run", "status"):

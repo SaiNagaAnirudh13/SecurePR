@@ -132,9 +132,48 @@ function toast(msg, isError) {
 
 function badge(value) { return value ? `<span class="badge ${escapeHtml(value)}">${escapeHtml(value.replace(/_/g, ' '))}</span>` : '—'; }
 function ciBadge(ci) {
-  if (!ci || ci.label === 'unknown') return `<span class="badge unknown">No data</span>`;
-  const map = { passed: '✓ Passed', failed: '✕ Failed', pending: '… Pending' };
-  return `<span class="badge ${escapeHtml(ci.label)}">${escapeHtml(map[ci.label] || ci.label)}</span>`;
+  if (!ci) return `<span class="badge unknown">CI status unavailable</span>`;
+  const map = {
+    discovering: '… Discovering checks',
+    running: '… CI running',
+    passed: '✓ CI successful',
+    failed: '✕ CI failed',
+    neutral: '— CI neutral',
+    no_checks: 'No CI checks detected',
+    unavailable: 'CI status unavailable',
+    timed_out: 'CI timed out',
+    pending: '… CI running',
+    unknown: 'CI status unavailable',
+  };
+  const titles = {
+    NO_CI_CONFIGURED: 'No CI checks are configured for this revision.',
+    NO_CHECKS_FOUND: 'GitHub reported check suites but no check runs or statuses.',
+  };
+  return `<span class="badge ${escapeHtml(ci.label || 'unknown')}" title="${escapeHtml(titles[ci.state] || ci.state || '')}">${escapeHtml(map[ci.label] || 'CI status unavailable')}</span>`;
+}
+function ciCheckResult(check) {
+  if (check.status !== 'completed') return 'Running (' + (check.status || 'pending') + ')';
+  const labels = {
+    success: 'Successful',
+    failure: 'Failed',
+    error: 'Failed',
+    cancelled: 'Cancelled',
+    timed_out: 'Timed out',
+    startup_failure: 'Startup failure',
+    neutral: 'Neutral',
+    skipped: 'Skipped',
+    action_required: 'Action required',
+    stale: 'Stale',
+  };
+  return labels[check.conclusion] || 'Unavailable';
+}
+function safeHttpUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' ? url.href : null;
+  } catch (e) {
+    return null;
+  }
 }
 function timeAgo(iso) {
   if (!iso) return '—';
@@ -553,6 +592,19 @@ async function toggleAccordion(domId, reviewId) {
     <table style="margin:10px 0;"><tr><th>Dimension</th><th>Score</th></tr>
       ${Object.entries(d.scores).filter(([k]) => k !== 'overall').map(([k, v]) => `<tr><td>${k.replace(/_/g, ' ')}</td><td>${v}</td></tr>`).join('')}
     </table>` : ''}
+
+    ${d.ci_status ? `
+    <details style="margin:10px 0;">
+      <summary><strong>CI Verification</strong> — ${ciBadge(d.ci_status)}</summary>
+      <div class="section-sub" style="margin:8px 0;">Revision: <code>${escapeHtml(d.ci_status.sha || d.head_sha || '')}</code></div>
+      ${[...(d.ci_status.checks || []), ...(d.ci_status.check_suites || [])].length ? `
+        <table><tr><th>Check</th><th>Provider</th><th>Status</th><th></th></tr>
+          ${[...(d.ci_status.checks || []), ...(d.ci_status.check_suites || [])].map(c => {
+            const url = safeHttpUrl(c.url || c.html_url);
+            return `<tr><td>${escapeHtml(c.name || 'Unnamed check')}</td><td>${escapeHtml(c.provider || c.kind || 'GitHub')}</td><td>${escapeHtml(ciCheckResult(c))}</td><td>${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">Details</a>` : '—'}</td></tr>`;
+          }).join('')}
+        </table>` : '<div class="empty-state">No individual CI checks were discovered.</div>'}
+    </details>` : ''}
 
     ${d.findings.length ? `<p><strong>Findings (${d.findings.length})</strong></p>
       ${d.findings.map(f => `<div style="margin-bottom:6px;">${badge(f.severity)} <strong>${escapeHtml(f.title)}</strong> ${f.file_path ? '<code>' + escapeHtml(f.file_path) + '</code>' : ''}<br><span class="section-sub">${escapeHtml(f.description || '')}</span></div>`).join('')}` : ''}

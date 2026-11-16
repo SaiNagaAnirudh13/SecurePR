@@ -69,6 +69,7 @@ class Settings(BaseSettings):
     # CI wait settings
     CI_WAIT_POLL_INTERVAL_SECONDS: int = 20
     CI_WAIT_TIMEOUT_SECONDS: int = 900
+    CI_DISCOVERY_STABILIZATION_SECONDS: int = 30
     POST_CI_WAITING_COMMENT: bool = True
 
     # Auto-merge settings

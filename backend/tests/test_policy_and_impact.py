@@ -1,6 +1,17 @@
 from app.services import impact_simulator, policy_engine
 
 
+def _legacy_ci_policy():
+    policy = policy_engine.load_default_policy()
+    policy["mandatory_ci_checks"] = ["build", "unit-tests", "lint"]
+    policy["ci_check_aliases"] = {
+        "build": ["Build / Install dependencies", "build / install dependencies"],
+        "unit-tests": ["Tests / Unit tests", "tests / unit tests", "test"],
+        "lint": ["Lint / Ruff", "lint / ruff"],
+    }
+    return policy
+
+
 def test_blocked_path_detected():
     policy = policy_engine.load_default_policy()
     files = [{"file_path": "infra/secrets/db.pem", "additions": 1, "deletions": 0, "patch_excerpt": ""}]
@@ -13,7 +24,7 @@ def test_mandatory_ci_missing_is_pending_not_a_violation():
     """A mandatory check that simply hasn't reported yet should be PENDING
     (wait for CI), not a hard violation -- only a completed, non-passing
     check should ever be a violation."""
-    policy = policy_engine.load_default_policy()
+    policy = _legacy_ci_policy()
     files = [{"file_path": "app/main.py", "additions": 3, "deletions": 1, "patch_excerpt": ""}]
     ev = policy_engine.evaluate_policy(
         policy, files, ci_checks=[{"name": "build", "status": "completed", "conclusion": "success"}],
@@ -25,7 +36,7 @@ def test_mandatory_ci_missing_is_pending_not_a_violation():
 
 
 def test_mandatory_ci_failed_is_a_hard_violation():
-    policy = policy_engine.load_default_policy()
+    policy = _legacy_ci_policy()
     files = [{"file_path": "app/main.py", "additions": 3, "deletions": 1, "patch_excerpt": ""}]
     ev = policy_engine.evaluate_policy(
         policy, files,
@@ -41,7 +52,7 @@ def test_mandatory_ci_failed_is_a_hard_violation():
 
 
 def test_mandatory_ci_aliases_match_human_readable_github_names():
-    policy = policy_engine.load_default_policy()
+    policy = _legacy_ci_policy()
     files = [{"file_path": "app/main.py", "additions": 3, "deletions": 1, "patch_excerpt": ""}]
     ev = policy_engine.evaluate_policy(
         policy,
@@ -59,7 +70,7 @@ def test_mandatory_ci_aliases_match_human_readable_github_names():
 
 
 def test_production_check_names_map_only_verified_aliases():
-    policy = policy_engine.load_default_policy()
+    policy = _legacy_ci_policy()
     files = [{
         "file_path": "app/main.py",
         "additions": 1,
@@ -100,7 +111,7 @@ def test_production_check_names_map_only_verified_aliases():
 
 
 def test_failed_test_alias_does_not_satisfy_unit_tests():
-    policy = policy_engine.load_default_policy()
+    policy = _legacy_ci_policy()
     ev = policy_engine.evaluate_policy(
         policy,
         [],
@@ -131,6 +142,23 @@ def test_mandatory_ci_does_not_match_unconfigured_substrings():
     )
 
     assert ev.mandatory_checks_pending == ["build"]
+    assert ev.mandatory_checks_failed == []
+
+
+def test_default_policy_discovers_checks_without_name_requirements():
+    policy = policy_engine.load_default_policy()
+    ev = policy_engine.evaluate_policy(
+        policy,
+        [],
+        [
+            {"name": "Build and verify", "status": "completed", "conclusion": "success"},
+            {"name": "Security Scan", "status": "completed", "conclusion": "success"},
+        ],
+        author_login="alice",
+    )
+
+    assert policy["mandatory_ci_checks"] == []
+    assert ev.mandatory_checks_pending == []
     assert ev.mandatory_checks_failed == []
 
 

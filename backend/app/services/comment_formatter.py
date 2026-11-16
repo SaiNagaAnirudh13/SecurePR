@@ -8,6 +8,7 @@ Two comment shapes are produced:
     (APPROVED / BLOCKED / MANUAL_REVIEW) has been reached.
 """
 from datetime import datetime
+from urllib.parse import quote, urlsplit
 
 DECISION_META = {
     "APPROVED":       {"emoji": "✅", "label": "Approved",       "color": "🟢"},
@@ -49,8 +50,13 @@ def _score_bar(score: float) -> str:
 
 def format_waiting_comment(*, pending_checks: list[str], changed_files_count: int | None,
                             policy_name: str, policy_version: int, dashboard_url: str,
-                            changed_files_unavailable: bool = False) -> str:
-    checks_md = "\n".join(f"- ⏳ `{c}` — not yet completed" for c in pending_checks) or "- (no mandatory checks configured)"
+                            changed_files_unavailable: bool = False,
+                            ci_state: str | None = None) -> str:
+    checks_md = "\n".join(f"- ⏳ `{c}` — not yet completed" for c in pending_checks) or "- (no checks detected yet)"
+    if ci_state == "ERROR":
+        checks_md = "- GitHub CI status is unavailable; SecurePR will retry."
+    elif ci_state == "DISCOVERING":
+        checks_md = "- Waiting for GitHub checks to appear and stabilize."
     files_summary = (
         "SecurePR could not retrieve the changed-file list, so no file count is shown."
         if changed_files_unavailable
@@ -58,11 +64,11 @@ def format_waiting_comment(*, pending_checks: list[str], changed_files_count: in
     )
     return (
         f"## ⏳ SecurePR Review — **Waiting for CI**\n\n"
-        f"{files_summary} SecurePR is holding its final decision until the following "
-        f"**mandatory** check(s) report a result:\n\n"
+        f"{files_summary} SecurePR is holding its final decision until CI discovery is complete "
+        f"and all applicable checks report terminal results:\n\n"
         f"{checks_md}\n\n"
         f"No action is needed — SecurePR is watching this commit and will post the final review "
-        f"as soon as all mandatory checks finish. If checks remain pending, SecurePR will "
+        f"after all applicable checks finish and discovery stabilizes. If checks remain pending, SecurePR will "
         f"route the review to manual review after its fallback timeout.\n\n"
         f"<sub>Policy: **{policy_name} v{policy_version}** · "
         f"[Open in SecurePR dashboard]({dashboard_url}) · "
@@ -75,7 +81,8 @@ def format_comment(*, decision: str, reasons: list[str], overall_score: float, c
                     circuit_breaker_tripped: bool, circuit_breaker_reason: str | None,
                     impact_items: list, policy_name: str, policy_version: int,
                     dashboard_url: str, ci_checks: list[dict] | None = None,
-                    waited_for_ci: bool = False, analysis_error: str | None = None) -> str:
+                    waited_for_ci: bool = False, analysis_error: str | None = None,
+                    ci_state: str | None = None) -> str:
     meta = DECISION_META.get(decision, {"emoji": "", "label": decision})
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
@@ -86,7 +93,7 @@ def format_comment(*, decision: str, reasons: list[str], overall_score: float, c
         "| | |",
         "|---|---|",
         f"| **Overall Risk Score** | `{overall_score}/100` ({RISK_LABEL.get(category, category)}) |",
-        f"| **CI / Check Status** | {_ci_summary_line(ci_checks)} |",
+        f"| **CI / Check Status** | {_ci_summary_line(ci_checks, ci_state)} |",
         f"| **Circuit Breaker** | {'🔴 Active — ' + (circuit_breaker_reason or '') if circuit_breaker_tripped else '🟢 Inactive'} |",
         f"| **Reviewed** | {now}{' (after waiting for CI to complete)' if waited_for_ci else ''} |",
         "",
@@ -106,10 +113,14 @@ def format_comment(*, decision: str, reasons: list[str], overall_score: float, c
     # --------------------------------------------------------------- CI table
     if ci_checks:
         lines.append("<details>\n<summary><b>✅ CI Verification</b></summary>\n")
-        lines.append("| Check | Result |")
-        lines.append("|---|---|")
+        lines.append("| Check | Provider | Result | Details |")
+        lines.append("|---|---|---|---|")
         for c in ci_checks:
-            lines.append(f"| `{c.get('name')}` | {_ci_icon(c)} |")
+            name = _markdown_code(c.get("name") or "Unnamed check")
+            provider = _markdown_code(c.get("provider") or c.get("kind") or "GitHub")
+            url = c.get("url") or c.get("html_url")
+            details = _markdown_link(url)
+            lines.append(f"| {name} | {provider} | {_ci_icon(c)} | {details} |")
         lines.append("\n</details>\n")
 
     # ---------------------------------------------------------------- findings
@@ -174,7 +185,7 @@ def format_auto_merge_comment(*, status: str, overall_score: float, reason: str,
         commit = f"\n\nMerge commit: `{merge_commit_sha}`" if merge_commit_sha else ""
         return ("## ✅ SecurePR Review — **Approved & Automatically Merged**\n\n"
                 f"Risk Score: `{overall_score}/100` (LOW)\n\n"
-                "CI Status: All mandatory checks passed  \nCircuit Breaker: Inactive  \nPolicy: Passed\n\n"
+                "CI Status: All discovered checks passed  \nCircuit Breaker: Inactive  \nPolicy: Passed\n\n"
                 "🤖 **Auto-Merge:** This Pull Request satisfied all SecurePR safety requirements and was automatically merged."
                 f"{commit}")
     if status in ("DISABLED_GLOBAL", "DISABLED_REPOSITORY"):
@@ -196,10 +207,42 @@ def _ci_icon(check: dict) -> str:
     conclusion = check.get("conclusion")
     return {"success": "✅ Passed", "failure": "❌ Failed", "neutral": "➖ Neutral",
             "skipped": "⏭️ Skipped", "cancelled": "🚫 Cancelled",
-            "timed_out": "⌛ Timed out", "action_required": "⚠️ Action required"}.get(conclusion, f"❔ {conclusion}")
+            "timed_out": "⌛ Timed out", "action_required": "⚠️ Action required",
+            "startup_failure": "❌ Startup failure"}.get(conclusion, f"❔ {conclusion}")
 
 
-def _ci_summary_line(ci_checks: list[dict] | None) -> str:
+def _markdown_code(value) -> str:
+    safe = str(value).replace("\\", "\\\\").replace("`", "\\`").replace("|", "\\|")
+    return f"`{safe.replace(chr(10), ' ').replace(chr(13), ' ')}`"
+
+
+def _markdown_link(url) -> str:
+    if not isinstance(url, str):
+        return "—"
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return "—"
+    if parsed.scheme != "https" or not parsed.netloc:
+        return "—"
+    safe_url = quote(url, safe=":/?#@!$&'*,;=%")
+    return f"[View]({safe_url})"
+
+
+def _ci_summary_line(ci_checks: list[dict] | None, ci_state: str | None = None) -> str:
+    state_labels = {
+        "DISCOVERING": "⏳ CI discovery in progress",
+        "RUNNING": "⏳ CI running",
+        "SUCCESS": "✅ CI successful",
+        "FAILURE": "❌ CI failed",
+        "NEUTRAL": "➖ CI neutral",
+        "NO_CI_CONFIGURED": "⚪ No CI checks detected",
+        "NO_CHECKS_FOUND": "⚪ No CI checks detected",
+        "ERROR": "⚠️ CI status unavailable",
+        "TIMEOUT": "⌛ CI timed out",
+    }
+    if ci_state in state_labels:
+        return state_labels[ci_state]
     if not ci_checks:
         return "⚪ No checks reported"
     completed = [c for c in ci_checks if c.get("status") == "completed"]

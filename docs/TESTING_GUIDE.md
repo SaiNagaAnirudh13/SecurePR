@@ -43,7 +43,7 @@ git remote add origin https://github.com/<your-username>/securepr-sample-app.git
 git push -u origin main
 ```
 
-Install the SecurePR GitHub App on this repository (`docs/SETUP_GUIDE.md`, section 7, step 11). The CI workflow at `.github/workflows/ci.yml` defines three jobs — `build`, `unit-tests`, `lint` — matching the `mandatory_ci_checks` in `policies/default_policy.json` exactly; this is what lets the CI-wait scenario in section 8 below actually exercise something real.
+Install the SecurePR GitHub App on this repository (`docs/SETUP_GUIDE.md`, section 7, step 11). The default policy discovers all jobs in `.github/workflows/ci.yml` by their GitHub-reported names; no `mandatory_ci_checks` configuration is needed. A repository override can still make selected names mandatory.
 
 ## 5. Configure automatic-approval eligibility (no IDs to type)
 
@@ -74,7 +74,7 @@ git checkout -b low-risk-fix
 ```
 Edit `app/utils.py`: fix the typo in the `greet()` docstring. Commit and push, then open a PR.
 
-**Expected:** CI runs (`build`, `unit-tests`, `lint` all pass) → SecurePR's comment starts with "⏳ Waiting for CI" and is replaced within seconds of CI finishing by a final comment showing **✅ Approved** (if your user is eligible with a high-enough threshold) with a low risk score, a green CI Verification table, and "All required checks passed" among the decision reasons. The dashboard's Evidence & Replay tab should show exactly these two review rows: the placeholder, then the final — never duplicated, never stuck.
+**Expected:** SecurePR discovers the workflow jobs dynamically, waits until all discovered checks finish and the stabilization window passes, then posts a final comment showing **✅ Approved** (if your user is eligible with a high-enough threshold), a low risk score, and the discovered CI results. The dashboard's Evidence & Replay tab should show exactly the appropriate waiting/final records, without duplicate final reviews.
 
 ### Scenario B — Higher-Risk / Security Finding
 
@@ -105,8 +105,8 @@ Repeat Scenario A's change as a user you did **not** mark eligible in step 5 (a 
 This is the scenario the CI-wait feature exists for.
 
 1. Temporarily add a delay to the `unit-tests` job in `.github/workflows/ci.yml` (e.g. `- run: sleep 90` before the pytest step), push it on its own branch, and open a PR.
-2. Watch the PR immediately after opening it: SecurePR should post the **"⏳ Waiting for CI"** comment within a few seconds, naming `unit-tests` (and possibly `lint`/`build` if they haven't started) as pending — and should **not** post any approve/block verdict yet.
-3. Once the delayed job finishes, within a few seconds (the `check_run`/`check_suite` webhook fast path) a second comment should appear with the final decision, now using the completed CI results.
+2. Watch the PR immediately after opening it: SecurePR should post the **"⏳ Waiting for CI"** comment, naming the actual GitHub-reported pending jobs — and should **not** post any approve/block verdict yet.
+3. Once the delayed job finishes and the stabilization window passes, the `check_run`/`check_suite` webhook path should trigger a second comment with the final decision and the completed CI results.
 4. In the **Evidence & Replay** tab for this PR, you should see exactly two review rows: "Waiting for CI" followed by the final one — confirming no duplicate placeholder comments were posted while waiting.
 5. Optional — to see the **timeout fallback** instead of the fast path: set `CI_WAIT_TIMEOUT_SECONDS=30` in `.env` before starting the backend, and make a check run take longer than that. SecurePR should finalize as **Manual Review Required** with a reason stating it timed out waiting for CI, rather than silently approving.
 

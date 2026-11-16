@@ -2,13 +2,18 @@ import json
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
 from sqlalchemy import func
+from sqlalchemy.orm import Session
 
-from app.core.auth import require_admin, get_current_operator
+from app.core.auth import get_current_operator, require_admin
 from app.core.db import get_db
 from app.models import models as m
-from app.schemas.schemas import EligibilityUpdate, CircuitBreakerTripRequest, CircuitBreakerResumeRequest, ReevaluateRequest
+from app.schemas.schemas import (
+    CircuitBreakerResumeRequest,
+    CircuitBreakerTripRequest,
+    EligibilityUpdate,
+    ReevaluateRequest,
+)
 from app.services import circuit_breaker as cb_service
 from app.services import policy_engine
 from app.services.pipeline import run_analysis
@@ -28,28 +33,67 @@ def _ci_status_summary(db: Session, review_id: str | None) -> dict:
     """Small helper used by several endpoints to summarize CI state from the
     'ci_result' evidence row stored on a review, without re-hitting GitHub."""
     if not review_id:
-        return {"passed": 0, "failed": 0, "pending": 0, "label": "unknown"}
+        return {"passed": 0, "failed": 0, "pending": 0, "label": "unknown",
+                "state": "ERROR", "checks": [], "check_suites": []}
     review = db.query(m.Review).filter(m.Review.id == review_id).first()
-    if review and review.decision == m.DecisionStatus.WAITING_FOR_CI:
-        # Waiting rows intentionally do not contain final CI evidence. Their
-        # persisted expected-check list is authoritative until GitHub reports
-        # terminal results for the current commit.
-        return {"passed": 0, "failed": 0,
-                "pending": len(review.ci_wait_pending_checks or []), "label": "waiting"}
     ev = db.query(m.Evidence).filter(m.Evidence.review_id == review_id, m.Evidence.evidence_type == "ci_result").first()
     if not ev or not ev.content:
-        return {"passed": 0, "failed": 0, "pending": 0, "label": "unknown"}
+        if review and review.decision == m.DecisionStatus.WAITING_FOR_CI:
+            return {
+                "passed": 0,
+                "failed": 0,
+                "pending": len(review.ci_wait_pending_checks or []),
+                "label": "running",
+                "state": "RUNNING",
+                "checks": [],
+                "check_suites": [],
+            }
+        return {"passed": 0, "failed": 0, "pending": 0, "label": "unknown",
+                "state": "ERROR", "checks": [], "check_suites": []}
     try:
-        checks = json.loads(ev.content)
-        if not isinstance(checks, list):
-            raise ValueError
-    except Exception:
-        return {"passed": 0, "failed": 0, "pending": 0, "label": "unknown"}
-    passed = sum(1 for c in checks if c.get("status") == "completed" and c.get("conclusion") in ("success", "neutral", "skipped"))
+        stored = json.loads(ev.content)
+    except (TypeError, ValueError):
+        return {"passed": 0, "failed": 0, "pending": 0, "label": "unknown",
+                "state": "ERROR", "checks": [], "check_suites": []}
+    if isinstance(stored, list):
+        stored = {"checks": stored, "check_suites": []}
+    if not isinstance(stored, dict):
+        stored = {}
+    checks = stored.get("checks")
+    suites = stored.get("check_suites")
+    checks = [check for check in checks if isinstance(check, dict)] if isinstance(checks, list) else []
+    suites = [suite for suite in suites if isinstance(suite, dict)] if isinstance(suites, list) else []
+    all_checks = checks + suites
+    passed = sum(1 for c in checks if c.get("status") == "completed" and c.get("conclusion") == "success")
+    neutral = sum(1 for c in checks if c.get("status") == "completed" and c.get("conclusion") in ("neutral", "skipped"))
     failed = sum(1 for c in checks if c.get("status") == "completed" and c.get("conclusion") not in ("success", "neutral", "skipped"))
-    pending = sum(1 for c in checks if c.get("status") != "completed")
-    label = "failed" if failed else ("pending" if pending else ("passed" if passed else "unknown"))
-    return {"passed": passed, "failed": failed, "pending": pending, "label": label}
+    pending = sum(1 for c in all_checks if c.get("status") != "completed")
+    state = stored.get("state")
+    labels = {
+        "DISCOVERING": "discovering",
+        "RUNNING": "running",
+        "SUCCESS": "passed",
+        "FAILURE": "failed",
+        "NEUTRAL": "neutral",
+        "NO_CI_CONFIGURED": "no_checks",
+        "NO_CHECKS_FOUND": "no_checks",
+        "ERROR": "unavailable",
+        "TIMEOUT": "timed_out",
+    }
+    label = labels.get(state)
+    if not label:
+        label = "failed" if failed else ("pending" if pending else ("passed" if passed else "unknown"))
+    return {
+        "passed": passed,
+        "neutral": neutral,
+        "failed": failed,
+        "pending": pending,
+        "label": label,
+        "state": state or "ERROR",
+        "sha": stored.get("sha") or review.head_sha if review else stored.get("sha"),
+        "checks": checks,
+        "check_suites": suites,
+    }
 
 
 # ---------------------------------------------------------------- Overview --
@@ -264,6 +308,7 @@ def get_review(review_id: str, db: Session = Depends(get_db)):
         "is_reevaluation": review.is_reevaluation, "superseded_review_id": review.superseded_review_id,
         "is_ci_wait_placeholder": review.is_ci_wait_placeholder,
         "ci_wait_pending_checks": review.ci_wait_pending_checks,
+        "ci_status": _ci_status_summary(db, review.id),
         "pull_request": {"number": pr.github_pr_number, "title": pr.title, "author": pr.author_login} if pr else None,
         "scores": {
             "change_surface": review.score_change_surface, "reversibility": review.score_reversibility,

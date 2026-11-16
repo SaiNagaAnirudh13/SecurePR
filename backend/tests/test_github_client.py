@@ -1,12 +1,15 @@
 import pytest
+
 from app.core.config import Settings
 from app.integrations import github_client as github_module
 
 
 class FakeResponse:
-    def __init__(self, payload, error=None):
+    def __init__(self, payload, error=None, status_code=200, headers=None):
         self.payload = payload
         self.error = error
+        self.status_code = status_code
+        self.headers = headers or {}
 
     def raise_for_status(self):
         if self.error:
@@ -120,6 +123,9 @@ def test_check_runs_are_fetched_from_every_page(monkeypatch):
     assert len(result) == 101
     assert [call["page"] for call in calls] == [1, 2]
     assert all(call["per_page"] == 100 for call in calls)
+    assert result[0]["kind"] == "check_run"
+    assert result[0]["identity"] is None
+    assert result[0]["sha"] == "abc"
 
 
 def test_commit_statuses_are_fetched_from_every_page(monkeypatch):
@@ -142,6 +148,76 @@ def test_commit_statuses_are_fetched_from_every_page(monkeypatch):
     assert len(result) == 101
     assert [call["page"] for call in calls] == [1, 2]
     assert all(status["conclusion"] == "success" for status in result)
+    assert result[0]["kind"] == "commit_status"
+    assert result[0]["sha"] == "abc"
+
+
+def test_commit_statuses_keep_only_the_latest_context_result(monkeypatch):
+    client = github_module.GitHubClient()
+    monkeypatch.setattr(client, "_headers", lambda installation_id: {})
+    statuses = [
+        {"id": 2, "context": "checks/security", "state": "success", "created_at": "2026-01-02T00:00:00Z"},
+        {"id": 1, "context": "checks/security", "state": "pending", "created_at": "2026-01-01T00:00:00Z"},
+    ]
+    monkeypatch.setattr(
+        github_module.requests,
+        "get",
+        lambda *args, **kwargs: FakeResponse({"statuses": statuses}),
+    )
+
+    result = client.get_commit_statuses("42", "octo", "widgets", "abc")
+
+    assert len(result) == 1
+    assert result[0]["identity"] == "commit_status:2"
+    assert result[0]["conclusion"] == "success"
+
+
+def test_check_suites_are_normalized_and_reject_other_revisions(monkeypatch):
+    client = github_module.GitHubClient()
+    monkeypatch.setattr(client, "_headers", lambda installation_id: {})
+    suites = [
+        {
+            "id": 9,
+            "head_sha": "abc",
+            "status": "in_progress",
+            "conclusion": None,
+            "html_url": "https://github.com/octo/widgets/runs/9",
+            "app": {"name": "GitHub Actions", "slug": "github-actions"},
+        },
+        {"id": 10, "head_sha": "old-sha", "status": "completed", "conclusion": "failure"},
+    ]
+    monkeypatch.setattr(
+        github_module.requests,
+        "get",
+        lambda *args, **kwargs: FakeResponse({"check_suites": suites}),
+    )
+
+    result = client.get_check_suites("42", "octo", "widgets", "abc")
+
+    assert len(result) == 1
+    assert result[0]["identity"] == "check_suite:9"
+    assert result[0]["provider"] == "github-actions"
+    assert result[0]["sha"] == "abc"
+    assert result[0]["url"] == "https://github.com/octo/widgets/runs/9"
+
+
+def test_github_get_retries_rate_limits_with_bounded_retry_after(monkeypatch):
+    client = github_module.GitHubClient()
+    monkeypatch.setattr(client, "_headers", lambda installation_id: {})
+    responses = iter([
+        FakeResponse(
+            {"message": "rate limited"},
+            status_code=429,
+            headers={"Retry-After": "2"},
+        ),
+        FakeResponse({"statuses": []}),
+    ])
+    sleeps = []
+    monkeypatch.setattr(github_module.requests, "get", lambda *a, **kw: next(responses))
+    monkeypatch.setattr(github_module.time, "sleep", sleeps.append)
+
+    assert client.get_commit_statuses("42", "octo", "widgets", "abc") == []
+    assert sleeps == [2.0]
 
 
 def test_pr_file_response_is_paginated_and_preserves_readme_files(monkeypatch):

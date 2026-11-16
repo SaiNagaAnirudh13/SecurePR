@@ -152,8 +152,9 @@ table tr.clickable:hover { background: var(--panel-2); }
 .badge.UNRESOLVED { background: rgba(144,160,189,.15); color: var(--muted); }
 .badge.passed { background: var(--green-soft); color: var(--green); }
 .badge.failed { background: var(--red-soft); color: var(--red); }
-.badge.pending { background: var(--accent-soft); color: var(--accent); }
-.badge.unknown { background: rgba(144,160,189,.15); color: var(--muted); }
+.badge.pending, .badge.running, .badge.discovering { background: var(--accent-soft); color: var(--accent); }
+.badge.neutral, .badge.no_checks, .badge.unknown { background: rgba(144,160,189,.15); color: var(--muted); }
+.badge.unavailable, .badge.timed_out { background: rgba(246,179,60,.15); color: var(--yellow); }
 
 .avatar-chip { display: inline-flex; align-items: center; gap: 8px; }
 .avatar-circle {

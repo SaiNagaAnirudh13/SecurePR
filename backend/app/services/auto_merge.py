@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 from app.core.config import get_settings
 from app.integrations.github_client import github_client
-from app.services import circuit_breaker, policy_engine
+from app.services import ci_status, circuit_breaker, policy_engine
 
 
 @dataclass
@@ -60,13 +60,24 @@ def attempt(*, db, repo, pr, review, installation_id, policy_doc, findings, auth
         # commit statuses; auto-merge must re-validate both representations.
         live_checks = github_client.get_check_runs(installation_id, owner, repo_name, review.head_sha)
         live_checks += github_client.get_commit_statuses(installation_id, owner, repo_name, review.head_sha)
+        live_suites = github_client.get_check_suites(
+            installation_id, owner, repo_name, review.head_sha
+        )
         live_policy = policy_engine.evaluate_policy(policy_doc, [], live_checks, pr.author_login)
         if live_policy.violations or live_policy.mandatory_checks_failed:
             return AutoMergeResult("MANUAL_REQUIRED", "Mandatory CI checks are failing or policy validation failed on re-check.")
-        if live_policy.mandatory_checks_pending:
+        live_ci = ci_status.evaluate_ci_status(
+            live_checks,
+            live_suites,
+            required_checks_pending=live_policy.mandatory_checks_pending,
+            fetch_error=None,
+            quiet_seconds=getattr(settings, "CI_DISCOVERY_STABILIZATION_SECONDS", 0),
+            stabilization_seconds=0,
+        )
+        if live_ci.state not in ("SUCCESS", "NEUTRAL"):
             return AutoMergeResult(
                 "MANUAL_REQUIRED",
-                "Mandatory CI checks are not all complete and successful on re-check.",
+                f"GitHub CI is {live_ci.state.lower()} on re-check; automatic merging was not attempted.",
             )
         tripped, reason = circuit_breaker.is_tripped(db, repo.id, pr.author_login)
         if tripped:
