@@ -104,7 +104,7 @@ def test_installation_access_token_is_refreshed_after_cache_expiry(monkeypatch):
 
 def test_check_runs_are_fetched_from_every_page(monkeypatch):
     client = github_module.GitHubClient()
-    monkeypatch.setattr(client, "_headers", lambda installation_id: {})
+    monkeypatch.setattr(client, "_headers", lambda installation_id, deadline=None: {})
     checks = [
         {"name": f"check-{index}", "status": "completed", "conclusion": "success"}
         for index in range(101)
@@ -130,7 +130,7 @@ def test_check_runs_are_fetched_from_every_page(monkeypatch):
 
 def test_commit_statuses_are_fetched_from_every_page(monkeypatch):
     client = github_module.GitHubClient()
-    monkeypatch.setattr(client, "_headers", lambda installation_id: {})
+    monkeypatch.setattr(client, "_headers", lambda installation_id, deadline=None: {})
     statuses = [
         {"context": f"status-{index}", "state": "success"} for index in range(101)
     ]
@@ -154,7 +154,7 @@ def test_commit_statuses_are_fetched_from_every_page(monkeypatch):
 
 def test_commit_statuses_keep_only_the_latest_context_result(monkeypatch):
     client = github_module.GitHubClient()
-    monkeypatch.setattr(client, "_headers", lambda installation_id: {})
+    monkeypatch.setattr(client, "_headers", lambda installation_id, deadline=None: {})
     statuses = [
         {"id": 2, "context": "checks/security", "state": "success", "created_at": "2026-01-02T00:00:00Z"},
         {"id": 1, "context": "checks/security", "state": "pending", "created_at": "2026-01-01T00:00:00Z"},
@@ -174,7 +174,7 @@ def test_commit_statuses_keep_only_the_latest_context_result(monkeypatch):
 
 def test_check_suites_are_normalized_and_reject_other_revisions(monkeypatch):
     client = github_module.GitHubClient()
-    monkeypatch.setattr(client, "_headers", lambda installation_id: {})
+    monkeypatch.setattr(client, "_headers", lambda installation_id, deadline=None: {})
     suites = [
         {
             "id": 9,
@@ -203,7 +203,7 @@ def test_check_suites_are_normalized_and_reject_other_revisions(monkeypatch):
 
 def test_github_get_retries_rate_limits_with_bounded_retry_after(monkeypatch):
     client = github_module.GitHubClient()
-    monkeypatch.setattr(client, "_headers", lambda installation_id: {})
+    monkeypatch.setattr(client, "_headers", lambda installation_id, deadline=None: {})
     responses = iter([
         FakeResponse(
             {"message": "rate limited"},
@@ -222,7 +222,7 @@ def test_github_get_retries_rate_limits_with_bounded_retry_after(monkeypatch):
 
 def test_pr_file_response_is_paginated_and_preserves_readme_files(monkeypatch):
     client = github_module.GitHubClient()
-    monkeypatch.setattr(client, "_headers", lambda installation_id: {})
+    monkeypatch.setattr(client, "_headers", lambda installation_id, deadline=None: {})
     files = [
         {"filename": f"file-{index}.txt", "status": "modified"} for index in range(100)
     ]
@@ -248,7 +248,7 @@ def test_pr_file_response_is_paginated_and_preserves_readme_files(monkeypatch):
 
 def test_pr_file_api_error_is_raised_not_returned_as_empty_list(monkeypatch):
     client = github_module.GitHubClient()
-    monkeypatch.setattr(client, "_headers", lambda installation_id: {})
+    monkeypatch.setattr(client, "_headers", lambda installation_id, deadline=None: {})
     monkeypatch.setattr(
         github_module.requests,
         "get",
@@ -263,7 +263,7 @@ def test_pr_file_api_error_is_raised_not_returned_as_empty_list(monkeypatch):
 
 def test_malformed_pr_file_payload_is_rejected(monkeypatch):
     client = github_module.GitHubClient()
-    monkeypatch.setattr(client, "_headers", lambda installation_id: {})
+    monkeypatch.setattr(client, "_headers", lambda installation_id, deadline=None: {})
     monkeypatch.setattr(
         github_module.requests,
         "get",

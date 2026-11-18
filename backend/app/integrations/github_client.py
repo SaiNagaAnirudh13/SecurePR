@@ -41,18 +41,21 @@ class GitHubClient:
         payload = {"iat": now - 60, "exp": now + 9 * 60, "iss": self.settings.GITHUB_APP_ID}
         return jwt.encode(payload, self._private_key(), algorithm="RS256")
 
-    def _installation_token(self, installation_id: str) -> str:
+    def _installation_token(self, installation_id: str, deadline: float | None = None) -> str:
         with self._installation_token_lock:
             now = time.monotonic()
             cached = self._installation_tokens.get(installation_id)
             if cached and cached[1] > now:
                 return cached[0]
 
+            remaining = deadline - now if deadline is not None else 15
+            if remaining <= 0:
+                raise TimeoutError("GitHub installation-token request exceeded its deadline.")
             app_jwt = self._app_jwt()
             resp = requests.post(
                 f"{GITHUB_API}/app/installations/{installation_id}/access_tokens",
                 headers={"Authorization": f"Bearer {app_jwt}", "Accept": "application/vnd.github+json"},
-                timeout=15,
+                timeout=min(15, remaining),
             )
             resp.raise_for_status()
             token = resp.json().get("token")
@@ -64,18 +67,38 @@ class GitHubClient:
             )
             return token
 
-    def _headers(self, installation_id: str) -> dict:
-        token = self._installation_token(installation_id)
+    def _headers(self, installation_id: str, deadline: float | None = None) -> dict:
+        token = self._installation_token(installation_id, deadline)
         return {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
 
-    def _get_with_retry(self, url: str, headers: dict, params: dict | None = None):
-        for attempt in range(GITHUB_GET_MAX_ATTEMPTS):
+    def _get_with_retry(
+        self,
+        url: str,
+        headers: dict,
+        params: dict | None = None,
+        *,
+        timeout: float = 20,
+        max_attempts: int = GITHUB_GET_MAX_ATTEMPTS,
+        deadline: float | None = None,
+    ):
+        for attempt in range(max_attempts):
+            remaining = deadline - time.monotonic() if deadline is not None else timeout
+            if remaining <= 0:
+                raise TimeoutError("GitHub API request exceeded its discovery deadline.")
             try:
-                resp = requests.get(url, headers=headers, params=params, timeout=20)
+                resp = requests.get(
+                    url,
+                    headers=headers,
+                    params=params,
+                    timeout=min(timeout, remaining),
+                )
             except requests.RequestException:
-                if attempt + 1 == GITHUB_GET_MAX_ATTEMPTS:
+                if attempt + 1 == max_attempts:
                     raise
-                time.sleep(min(0.25 * (2 ** attempt), GITHUB_GET_MAX_RETRY_DELAY_SECONDS))
+                delay = min(0.25 * (2 ** attempt), GITHUB_GET_MAX_RETRY_DELAY_SECONDS)
+                if deadline is not None:
+                    delay = min(delay, max(0, deadline - time.monotonic()))
+                time.sleep(delay)
                 continue
 
             status = resp.status_code
@@ -84,7 +107,7 @@ class GitHubClient:
                 or "Retry-After" in resp.headers
             )
             retryable = status in (429, 500, 502, 503, 504) or rate_limited
-            if not retryable or attempt + 1 == GITHUB_GET_MAX_ATTEMPTS:
+            if not retryable or attempt + 1 == max_attempts:
                 resp.raise_for_status()
                 return resp
 
@@ -98,9 +121,21 @@ class GitHubClient:
                     delay = 0.25 * (2 ** attempt)
             except ValueError:
                 delay = 0.25 * (2 ** attempt)
-            time.sleep(min(max(delay, 0), GITHUB_GET_MAX_RETRY_DELAY_SECONDS))
+            delay = min(max(delay, 0), GITHUB_GET_MAX_RETRY_DELAY_SECONDS)
+            if deadline is not None:
+                delay = min(delay, max(0, deadline - time.monotonic()))
+            time.sleep(delay)
 
-    def _get_paginated_items(self, url: str, headers: dict, collection_key: str | None = None) -> list[dict]:
+    def _get_paginated_items(
+        self,
+        url: str,
+        headers: dict,
+        collection_key: str | None = None,
+        *,
+        timeout: float = 20,
+        max_attempts: int = GITHUB_GET_MAX_ATTEMPTS,
+        deadline: float | None = None,
+    ) -> list[dict]:
         items: list[dict] = []
         page = 1
         while True:
@@ -108,6 +143,9 @@ class GitHubClient:
                 url,
                 headers,
                 params={"per_page": GITHUB_PAGE_SIZE, "page": page},
+                timeout=timeout,
+                max_attempts=max_attempts,
+                deadline=deadline,
             )
             payload = resp.json()
             if collection_key is None:
@@ -152,11 +190,15 @@ class GitHubClient:
         apart from "finished and failed" -- conclusion alone cannot, since it's
         None for anything not yet completed.
         """
-        headers = self._headers(installation_id)
+        deadline = time.monotonic() + 8
+        headers = self._headers(installation_id, deadline)
         runs = self._get_paginated_items(
             f"{GITHUB_API}/repos/{owner}/{repo}/commits/{head_sha}/check-runs",
             headers,
             "check_runs",
+            timeout=3,
+            max_attempts=2,
+            deadline=deadline,
         )
         normalized = []
         for check in runs:
@@ -182,11 +224,15 @@ class GitHubClient:
         return normalized
 
     def get_check_suites(self, installation_id: str, owner: str, repo: str, head_sha: str) -> list[dict]:
-        headers = self._headers(installation_id)
+        deadline = time.monotonic() + 8
+        headers = self._headers(installation_id, deadline)
         suites = self._get_paginated_items(
             f"{GITHUB_API}/repos/{owner}/{repo}/commits/{head_sha}/check-suites",
             headers,
             "check_suites",
+            timeout=3,
+            max_attempts=2,
+            deadline=deadline,
         )
         normalized = []
         for suite in suites:
@@ -216,11 +262,15 @@ class GitHubClient:
         Normalized into the same {name, status, conclusion} shape as check runs:
         state "pending" -> status "in_progress"/conclusion None; "success"/"failure"/
         "error" map straight to both status "completed" and that conclusion."""
-        headers = self._headers(installation_id)
+        deadline = time.monotonic() + 8
+        headers = self._headers(installation_id, deadline)
         statuses = self._get_paginated_items(
             f"{GITHUB_API}/repos/{owner}/{repo}/commits/{head_sha}/status",
             headers,
             "statuses",
+            timeout=3,
+            max_attempts=2,
+            deadline=deadline,
         )
         latest_by_context = {}
         for s in statuses:
@@ -239,14 +289,15 @@ class GitHubClient:
                 status = "completed"
                 conclusion = "success" if state == "success" else state
             else:
-                status = "completed"
-                conclusion = "error"
+                status = "unknown"
+                conclusion = state
             identity = s.get("id")
             latest_by_context[(provider, context)] = {
                 "identity": f"commit_status:{identity}" if identity is not None else None,
                 "id": identity,
                 "kind": "commit_status",
                 "name": context,
+                "context": context,
                 "provider": provider,
                 "status": status,
                 "conclusion": conclusion,
@@ -259,14 +310,37 @@ class GitHubClient:
             }
         return list(latest_by_context.values())
 
-    def post_review(self, installation_id: str, owner: str, repo: str, pr_number: int,
-                     body: str, event: str) -> dict:
+    def post_review(
+        self,
+        installation_id: str,
+        owner: str,
+        repo: str,
+        pr_number: int,
+        body: str,
+        event: str,
+        *,
+        idempotency_marker: str | None = None,
+    ) -> dict:
         """
         event must be one of APPROVE | COMMENT | REQUEST_CHANGES.
         This never calls the merge endpoint.
         """
         assert event in ("APPROVE", "COMMENT", "REQUEST_CHANGES")
         headers = self._headers(installation_id)
+        if idempotency_marker:
+            existing = self._find_marked_record(
+                f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
+                headers,
+                "reviews",
+                idempotency_marker,
+            )
+            if existing:
+                return {
+                    "succeeded": True,
+                    "status_code": 200,
+                    "payload": existing,
+                    "already_exists": True,
+                }
         resp = requests.post(
             f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
             headers=headers, json={"body": body, "event": event}, timeout=20,
@@ -307,9 +381,54 @@ class GitHubClient:
         return {"succeeded": bool(resp.ok and payload.get("merged", False)),
                 "status_code": resp.status_code, "payload": payload}
 
-    def post_issue_comment(self, installation_id: str, owner: str, repo: str, pr_number: int, body: str) -> dict:
+    def _find_marked_record(
+        self,
+        url: str,
+        headers: dict,
+        collection_key: str,
+        marker: str,
+    ) -> dict | None:
+        deadline = time.monotonic() + 8
+        records = self._get_paginated_items(
+            url,
+            headers,
+            collection_key,
+            timeout=3,
+            max_attempts=2,
+            deadline=deadline,
+        )
+        return next(
+            (record for record in records if marker in (record.get("body") or "")),
+            None,
+        )
+
+    def post_issue_comment(
+        self,
+        installation_id: str,
+        owner: str,
+        repo: str,
+        pr_number: int,
+        body: str,
+        *,
+        idempotency_marker: str | None = None,
+    ) -> dict:
+        headers = self._headers(installation_id)
+        if idempotency_marker:
+            existing = self._find_marked_record(
+                f"{GITHUB_API}/repos/{owner}/{repo}/issues/{pr_number}/comments",
+                headers,
+                "comments",
+                idempotency_marker,
+            )
+            if existing:
+                return {
+                    "succeeded": True,
+                    "status_code": 200,
+                    "payload": existing,
+                    "already_exists": True,
+                }
         resp = requests.post(f"{GITHUB_API}/repos/{owner}/{repo}/issues/{pr_number}/comments",
-                             headers=self._headers(installation_id), json={"body": body}, timeout=20)
+                             headers=headers, json={"body": body}, timeout=20)
         try:
             payload = resp.json()
         except ValueError:

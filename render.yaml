@@ -19,14 +19,14 @@ services:
         value: gemini-2.0-flash
       - key: GEMINI_REQUEST_TIMEOUT_SECONDS
         value: "20"
-      - key: CI_WAIT_POLL_INTERVAL_SECONDS
-        value: "20"
-      - key: CI_WAIT_TIMEOUT_SECONDS
-        value: "900"
-      - key: CI_DISCOVERY_STABILIZATION_SECONDS
+      - key: REVIEW_RESULT_DEADLINE_SECONDS
+        value: "180"
+      - key: CI_API_MAX_RETRIES
+        value: "5"
+      - key: CI_FALLBACK_MAX_POLLS
+        value: "10"
+      - key: CI_FALLBACK_POLL_INTERVAL_SECONDS
         value: "30"
-      - key: POST_CI_WAITING_COMMENT
-        value: "true"
       - key: AUTO_MERGE_ENABLED
         value: "false"
       - key: AUTO_MERGE_LOW_RISK_ONLY

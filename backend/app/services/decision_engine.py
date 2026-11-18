@@ -13,19 +13,14 @@ Order of evaluation (first matching hard rule wins):
      reason to block outright -- there's no reason to make the contributor
      wait for CI to find that out)
   3. Policy hard violations found from data we already
-     have (blocked path, disallowed author, a mandatory
-     CI check that has COMPLETED and failed)              -> BLOCKED
-  4. Mandatory CI checks that exist but have not yet
-     completed (queued/in_progress)                       -> WAITING_FOR_CI
-     (deferred, not a verdict -- the pipeline schedules a
-     follow-up check and keeps this PR out of the approve/
-     block path until GitHub reports a final result)
-  5. Circuit breaker tripped (global/repo/user)            -> MANUAL_REVIEW (never auto-block for this reason alone)
-  6. Author not eligible for auto-approval                 -> MANUAL_REVIEW
-  7. Overall risk score > author's configured threshold    -> MANUAL_REVIEW
-  8. Policy soft warning (human_review_required_paths,
+     have (blocked path, disallowed author, or a confirmed
+     CI failure when policy enables blocking)              -> BLOCKED
+  4. Circuit breaker tripped (global/repo/user)            -> MANUAL_REVIEW (never auto-block for this reason alone)
+  5. Author not eligible for auto-approval                 -> MANUAL_REVIEW
+  6. Overall risk score > author's configured threshold    -> MANUAL_REVIEW
+  7. Policy soft warning (human_review_required_paths,
      max files exceeded)                                   -> MANUAL_REVIEW
-  9. Otherwise                                              -> APPROVED
+  8. Otherwise                                              -> APPROVED
 """
 from dataclasses import dataclass, field
 
@@ -45,7 +40,6 @@ class DecisionInput:
     author_eligible: bool
     author_risk_threshold: int | None
     analysis_complete: bool
-    mandatory_checks_pending: list = field(default_factory=list)
 
 
 @dataclass
@@ -68,13 +62,6 @@ def decide(inp: DecisionInput) -> Decision:
     if inp.policy_violations:
         reasons.extend(inp.policy_violations)
         return Decision(DecisionStatus.BLOCKED, reasons)
-
-    if inp.mandatory_checks_pending:
-        reasons.append(
-            f"Waiting for mandatory CI check(s) to complete: {', '.join(inp.mandatory_checks_pending)}. "
-            f"SecurePR will finalize its decision once GitHub reports a final result for these checks."
-        )
-        return Decision(DecisionStatus.WAITING_FOR_CI, reasons)
 
     if inp.circuit_breaker_tripped:
         reasons.append(f"Circuit breaker is active: {inp.circuit_breaker_reason}. "

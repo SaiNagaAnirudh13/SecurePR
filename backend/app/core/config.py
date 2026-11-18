@@ -66,11 +66,11 @@ class Settings(BaseSettings):
     RISK_WEIGHT_VERIFICATION: float = 0.15
     RISK_WEIGHT_POLICY_COMPLIANCE: float = 0.10
 
-    # CI wait settings
-    CI_WAIT_POLL_INTERVAL_SECONDS: int = 20
-    CI_WAIT_TIMEOUT_SECONDS: int = 900
-    CI_DISCOVERY_STABILIZATION_SECONDS: int = 30
-    POST_CI_WAITING_COMMENT: bool = True
+    # Review and independent CI-monitoring limits
+    REVIEW_RESULT_DEADLINE_SECONDS: int = 180
+    CI_API_MAX_RETRIES: int = 5
+    CI_FALLBACK_MAX_POLLS: int = 10
+    CI_FALLBACK_POLL_INTERVAL_SECONDS: int = 30
 
     # Auto-merge settings
     AUTO_MERGE_ENABLED: bool = False

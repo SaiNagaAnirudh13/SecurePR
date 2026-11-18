@@ -1,11 +1,11 @@
 import hashlib
 import hmac
+import json
 import logging
 from typing import Any
 
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     Depends,
     Header,
     HTTPException,
@@ -16,10 +16,7 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.db import get_db
 from app.models import models as m
-from app.services.pipeline import (
-    handle_check_event_finalization,
-    run_background_analysis,
-)
+from app.services.background_jobs import enqueue_job
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
@@ -466,15 +463,11 @@ def _log_ci_event(
 
 def _handle_check_event(
     db: Session,
-    background_tasks: BackgroundTasks,
     payload: dict,
     event_name: str,
+    delivery_id: str | None,
 ) -> dict:
-    """Re-evaluate every CI transition for a tracked PR's current head SHA.
-
-    Non-terminal events matter too: they extend discovery stabilization and
-    prevent finalization while delayed workflows are still being created.
-    """
+    """Queue an idempotent CI refresh without starting or blocking AI analysis."""
 
     gh_repo = payload.get("repository")
     if not isinstance(gh_repo, dict):
@@ -497,18 +490,7 @@ def _handle_check_event(
         pr_number = None
 
     action = payload.get("action")
-    if event_name == "status":
-        if payload.get("state") not in ("pending", "success", "failure", "error"):
-            _log_ci_event(
-                event_name=event_name,
-                repository=repository_name,
-                pr_number=pr_number,
-                head_sha=head_sha,
-                matched_current_revision=False,
-                reason="status_state_unrecognized",
-            )
-            return {"status": "ignored", "reason": "Commit status state is not recognized."}
-    elif not isinstance(action, str) or not action:
+    if event_name != "status" and (not isinstance(action, str) or not action):
         reason = "action_missing"
         _log_ci_event(
             event_name=event_name,
@@ -588,22 +570,43 @@ def _handle_check_event(
         )
         return {"status": "ignored", "reason": "No installation_id available for this repository."}
 
+    for pr in matching_prs:
+        revision = db.query(m.CIRevision).filter(
+            m.CIRevision.repository_id == repo.id,
+            m.CIRevision.pull_request_id == pr.id,
+            m.CIRevision.head_sha == head_sha,
+        ).first()
+        if revision is None:
+            revision = m.CIRevision(
+                repository_id=repo.id, pull_request_id=pr.id,
+                head_sha=head_sha, state="UNKNOWN",
+            )
+            db.add(revision)
+        revision.retry_count = 0
+        key_source = delivery_id or hashlib.sha256(
+            json.dumps(payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        enqueue_job(
+            db,
+            "CI_REFRESH",
+            f"ci-event:{repo.id}:{pr.id}:{head_sha}:{key_source}",
+            {
+                "repository_id": repo.id,
+                "pull_request_id": pr.id,
+                "installation_id": installation_id,
+                "head_sha": head_sha,
+                "event_name": event_name,
+                "reason": "webhook",
+            },
+        )
+    db.commit()
     logger.info(
-        "CI event finalization scheduled: trigger=webhook event_type=%s repository=%s "
-        "pr_numbers=%s head_sha=%s matched_current_revision=true",
-        event_name,
-        repo.full_name,
-        [pr.github_pr_number for pr in matching_prs],
-        head_sha,
+        "CI refresh queued independently: event_type=%s repository=%s head_sha=%s "
+        "pr_numbers=%s delivery_id=%s",
+        event_name, repo.full_name, head_sha,
+        [pr.github_pr_number for pr in matching_prs], delivery_id or "payload-hash",
     )
-    background_tasks.add_task(
-        handle_check_event_finalization,
-        repo.id,
-        head_sha,
-        installation_id,
-        event_name,
-    )
-    return {"status": "accepted", "reason": "Finalization check scheduled."}
+    return {"status": "accepted", "reason": "CI state refresh queued independently."}
 
 
 # ============================================================
@@ -613,8 +616,8 @@ def _handle_check_event(
 @router.post("/github")
 async def github_webhook(
     request: Request,
-    background_tasks: BackgroundTasks,
     x_github_event: str | None = Header(default=None),
+    x_github_delivery: str | None = Header(default=None),
     x_hub_signature_256: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
@@ -679,7 +682,7 @@ async def github_webhook(
         # ----------------------------------------------------
 
         if x_github_event in ("check_suite", "check_run", "status"):
-            return _handle_check_event(db, background_tasks, payload, x_github_event)
+            return _handle_check_event(db, payload, x_github_event, x_github_delivery)
 
         # ----------------------------------------------------
         # Ignore events that SecurePR does not process
@@ -820,13 +823,29 @@ async def github_webhook(
             },
         )
 
-        background_tasks.add_task(
-            run_background_analysis,
-            repo.id,
-            pr.id,
-            installation_id,
-            expected_head_sha,
+        revision = db.query(m.CIRevision).filter(
+            m.CIRevision.repository_id == repo.id,
+            m.CIRevision.pull_request_id == pr.id,
+            m.CIRevision.head_sha == expected_head_sha,
+        ).first()
+        if revision is None:
+            revision = m.CIRevision(
+                repository_id=repo.id, pull_request_id=pr.id,
+                head_sha=expected_head_sha, state="UNKNOWN",
+            )
+            db.add(revision)
+        enqueue_job(
+            db, "REVIEW", f"review:{repo.id}:{pr.id}:{expected_head_sha}",
+            {"repository_id": repo.id, "pull_request_id": pr.id,
+             "installation_id": installation_id, "head_sha": expected_head_sha},
         )
+        enqueue_job(
+            db, "CI_REFRESH", f"ci-initial:{repo.id}:{pr.id}:{expected_head_sha}",
+            {"repository_id": repo.id, "pull_request_id": pr.id,
+             "installation_id": installation_id, "head_sha": expected_head_sha,
+             "event_name": "pull_request", "reason": "initial"},
+        )
+        db.commit()
 
         logger.info(
             "Webhook processing completed successfully."
@@ -834,6 +853,8 @@ async def github_webhook(
 
         return {
             "status": "accepted",
+            "review_status": "QUEUED",
+            "ci_status": "UNKNOWN",
             "repository_id": str(repo.id),
             "pull_request_id": str(pr.id),
             "installation_id": installation_id,

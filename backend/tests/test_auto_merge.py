@@ -9,10 +9,10 @@ from app.core.db import Base
 from app.models import models as m
 from app.services import auto_merge
 
-POLICY = {"mandatory_ci_checks": ["build", "unit-tests", "lint"], "blocked_paths": [],
-          "human_review_required_paths": [], "max_files_for_auto_approval": 25,
+POLICY = {"blocked_paths": [], "human_review_required_paths": [], "max_files_for_auto_approval": 25,
           "disallowed_authors": []}
-CHECKS = [{"name": n, "status": "completed", "conclusion": "success"} for n in POLICY["mandatory_ci_checks"]]
+CHECKS = [{"name": n, "status": "completed", "conclusion": "success"}
+          for n in ("arbitrary-build-stage", "custom-provider-check")]
 
 
 @pytest.fixture()
@@ -131,7 +131,7 @@ def test_conflict_or_ci_pending_requires_manual_merge(db_session, monkeypatch):
     assert _attempt(db_session, repo, pr, review).status == "MANUAL_REQUIRED"
 
 
-def test_mandatory_ci_is_required_even_if_legacy_toggle_is_disabled(db_session, monkeypatch):
+def test_in_progress_ci_never_allows_auto_merge(db_session, monkeypatch):
     repo, pr, review = _objects(db_session)
     _enable(monkeypatch)
     monkeypatch.setattr(auto_merge, "get_settings", lambda: SimpleNamespace(
@@ -140,7 +140,9 @@ def test_mandatory_ci_is_required_even_if_legacy_toggle_is_disabled(db_session, 
     monkeypatch.setattr(
         auto_merge.github_client,
         "get_check_runs",
-        lambda *args: [{"name": "build", "status": "completed", "conclusion": "success"}],
+        lambda *args: [
+            {"name": "arbitrary-check", "status": "in_progress", "conclusion": None}
+        ],
     )
     merged = []
     monkeypatch.setattr(
@@ -152,7 +154,7 @@ def test_mandatory_ci_is_required_even_if_legacy_toggle_is_disabled(db_session, 
     result = _attempt(db_session, repo, pr, review)
 
     assert result.status == "MANUAL_REQUIRED"
-    assert "running" in result.reason
+    assert "in_progress" in result.reason
     assert merged == []
 
 

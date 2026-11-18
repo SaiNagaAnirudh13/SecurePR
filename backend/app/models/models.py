@@ -35,7 +35,7 @@ class DecisionStatus(str, enum.Enum):
     APPROVED = "APPROVED"
     BLOCKED = "BLOCKED"
     MANUAL_REVIEW = "MANUAL_REVIEW"
-    WAITING_FOR_CI = "WAITING_FOR_CI"  # required checks haven't completed yet; final decision deferred
+    WAITING_FOR_CI = "WAITING_FOR_CI"  # legacy persisted state; new reviews never wait for CI
     PENDING = "PENDING"
 
 
@@ -194,10 +194,8 @@ class Review(Base):
     head_sha = Column(String(64), nullable=False)
     is_reevaluation = Column(Boolean, default=False, nullable=False, server_default=false())
     superseded_review_id = Column(String(36), ForeignKey("reviews.id"), nullable=True)
-    # True for the lightweight placeholder row created while SecurePR is waiting on
-    # mandatory CI checks. The eventual final review (once checks complete) is a
-    # separate row whose superseded_review_id points back at this one, so decision
-    # replay can still show "what did we know before CI finished" if ever needed.
+    # Legacy columns remain readable for historical reviews; new executions never
+    # create CI-wait placeholders.
     is_ci_wait_placeholder = Column(Boolean, default=False, nullable=False, server_default=false())
     ci_wait_started_at = Column(DateTime, nullable=True)
     ci_wait_pending_checks = Column(JSON, nullable=True)  # list[str] snapshot at wait time
@@ -259,6 +257,70 @@ class Review(Base):
     evidence_items = relationship("Evidence", back_populates="review")
     changed_files = relationship("ChangedFile", back_populates="review")
     impacts = relationship("ImpactPrediction", back_populates="review")
+
+
+class BackgroundJob(Base):
+    """Durable work queue for review and CI tasks."""
+    __tablename__ = "background_jobs"
+    id = Column(String(36), primary_key=True, default=gen_uuid)
+    job_type = Column(String(32), nullable=False)
+    idempotency_key = Column(String(512), unique=True, nullable=False)
+    payload = Column(JSON, nullable=False)
+    state = Column(String(16), nullable=False, default="QUEUED", server_default=text("'QUEUED'"))
+    attempts = Column(Integer, nullable=False, default=0, server_default=text("0"))
+    available_at = Column(DateTime, nullable=False, default=datetime.utcnow, server_default=func.now())
+    lease_until = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow,
+                        server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_background_jobs_dispatch", "job_type", "state", "available_at"),
+    )
+
+
+class CIRevision(Base):
+    """Latest CI discovery state for one immutable PR revision."""
+    __tablename__ = "ci_revisions"
+    id = Column(String(36), primary_key=True, default=gen_uuid)
+    repository_id = Column(String(36), ForeignKey("repositories.id"), nullable=False)
+    pull_request_id = Column(String(36), ForeignKey("pull_requests.id"), nullable=False)
+    head_sha = Column(String(64), nullable=False)
+    state = Column(String(24), nullable=False, default="UNKNOWN", server_default=text("'UNKNOWN'"))
+    error = Column(Text, nullable=True)
+    retry_count = Column(Integer, nullable=False, default=0, server_default=text("0"))
+    poll_count = Column(Integer, nullable=False, default=0, server_default=text("0"))
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow,
+                        server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("repository_id", "pull_request_id", "head_sha", name="uq_ci_revision"),
+        Index("ix_ci_revision_pr_sha", "pull_request_id", "head_sha"),
+    )
+
+
+class CIExecution(Base):
+    """A discovered check, suite, or legacy commit-status record."""
+    __tablename__ = "ci_executions"
+    id = Column(String(36), primary_key=True, default=gen_uuid)
+    ci_revision_id = Column(String(36), ForeignKey("ci_revisions.id"), nullable=False)
+    identity = Column(String(255), nullable=False)
+    kind = Column(String(24), nullable=False)
+    provider = Column(String(255), nullable=True)
+    context = Column(String(512), nullable=True)
+    name = Column(String(512), nullable=True)
+    status = Column(String(32), nullable=True)
+    conclusion = Column(String(32), nullable=True)
+    external_url = Column(String(2048), nullable=True)
+    head_sha = Column(String(64), nullable=False)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow,
+                        server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("ci_revision_id", "kind", "identity", name="uq_ci_execution_identity"),
+        Index("ix_ci_execution_revision", "ci_revision_id"),
+    )
 
 
 class ChangedFile(Base):

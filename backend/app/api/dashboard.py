@@ -1,4 +1,3 @@
-import json
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -16,6 +15,7 @@ from app.schemas.schemas import (
 )
 from app.services import circuit_breaker as cb_service
 from app.services import policy_engine
+from app.services import ci_status
 from app.services.pipeline import run_analysis
 
 router = APIRouter(
@@ -29,71 +29,73 @@ def _latest_review_for_pr(db: Session, pr_id: str) -> m.Review | None:
     return db.query(m.Review).filter(m.Review.pull_request_id == pr_id).order_by(m.Review.created_at.desc()).first()
 
 
-def _ci_status_summary(db: Session, review_id: str | None) -> dict:
-    """Small helper used by several endpoints to summarize CI state from the
-    'ci_result' evidence row stored on a review, without re-hitting GitHub."""
-    if not review_id:
-        return {"passed": 0, "failed": 0, "pending": 0, "label": "unknown",
-                "state": "ERROR", "checks": [], "check_suites": []}
-    review = db.query(m.Review).filter(m.Review.id == review_id).first()
-    ev = db.query(m.Evidence).filter(m.Evidence.review_id == review_id, m.Evidence.evidence_type == "ci_result").first()
-    if not ev or not ev.content:
-        if review and review.decision == m.DecisionStatus.WAITING_FOR_CI:
-            return {
-                "passed": 0,
-                "failed": 0,
-                "pending": len(review.ci_wait_pending_checks or []),
-                "label": "running",
-                "state": "RUNNING",
-                "checks": [],
-                "check_suites": [],
-            }
-        return {"passed": 0, "failed": 0, "pending": 0, "label": "unknown",
-                "state": "ERROR", "checks": [], "check_suites": []}
-    try:
-        stored = json.loads(ev.content)
-    except (TypeError, ValueError):
-        return {"passed": 0, "failed": 0, "pending": 0, "label": "unknown",
-                "state": "ERROR", "checks": [], "check_suites": []}
-    if isinstance(stored, list):
-        stored = {"checks": stored, "check_suites": []}
-    if not isinstance(stored, dict):
-        stored = {}
-    checks = stored.get("checks")
-    suites = stored.get("check_suites")
-    checks = [check for check in checks if isinstance(check, dict)] if isinstance(checks, list) else []
-    suites = [suite for suite in suites if isinstance(suite, dict)] if isinstance(suites, list) else []
-    all_checks = checks + suites
-    passed = sum(1 for c in checks if c.get("status") == "completed" and c.get("conclusion") == "success")
-    neutral = sum(1 for c in checks if c.get("status") == "completed" and c.get("conclusion") in ("neutral", "skipped"))
-    failed = sum(1 for c in checks if c.get("status") == "completed" and c.get("conclusion") not in ("success", "neutral", "skipped"))
-    pending = sum(1 for c in all_checks if c.get("status") != "completed")
-    state = stored.get("state")
+def _ci_status_summary(db: Session, pull_request_id: str, head_sha: str) -> dict:
+    """Return independently monitored CI state for one exact PR revision."""
+    revision = db.query(m.CIRevision).filter(
+        m.CIRevision.pull_request_id == pull_request_id,
+        m.CIRevision.head_sha == head_sha,
+    ).first()
+    if not revision:
+        return {
+            "passed": 0, "failed": 0, "pending": 0, "neutral": 0,
+            "label": "unknown", "state": "UNKNOWN", "sha": head_sha,
+            "error": None, "checks": [], "check_suites": [],
+        }
+
+    executions = db.query(m.CIExecution).filter(
+        m.CIExecution.ci_revision_id == revision.id
+    ).all()
+    records = [{
+        "identity": row.identity, "kind": row.kind, "name": row.name,
+        "context": row.context, "provider": row.provider, "status": row.status,
+        "conclusion": row.conclusion, "url": row.external_url,
+        "html_url": row.external_url, "sha": row.head_sha,
+    } for row in executions]
+    summary = ci_status.evaluate_ci_status(
+        records,
+        fetch_error=revision.error if revision.state == "UNAVAILABLE" else None,
+        discovery_complete=revision.state != "UNKNOWN",
+    )
     labels = {
-        "DISCOVERING": "discovering",
-        "RUNNING": "running",
-        "SUCCESS": "passed",
-        "FAILURE": "failed",
-        "NEUTRAL": "neutral",
-        "NO_CI_CONFIGURED": "no_checks",
-        "NO_CHECKS_FOUND": "no_checks",
-        "ERROR": "unavailable",
-        "TIMEOUT": "timed_out",
+        "PASSED": "passed", "FAILED": "failed", "IN_PROGRESS": "pending",
+        "NO_CHECKS_FOUND": "no_checks", "NOT_CONFIGURED": "no_checks",
+        "UNAVAILABLE": "unavailable", "UNKNOWN": "unknown",
+        "NON_SUCCESS": "non_success",
     }
-    label = labels.get(state)
-    if not label:
-        label = "failed" if failed else ("pending" if pending else ("passed" if passed else "unknown"))
+    reported_state = "FAILED" if summary.state == "FAILED" else revision.state
     return {
-        "passed": passed,
-        "neutral": neutral,
-        "failed": failed,
-        "pending": pending,
-        "label": label,
-        "state": state or "ERROR",
-        "sha": stored.get("sha") or review.head_sha if review else stored.get("sha"),
-        "checks": checks,
-        "check_suites": suites,
+        "passed": summary.passed_count,
+        "failed": summary.failed_count,
+        "pending": summary.pending_count,
+        "neutral": summary.neutral_count,
+        "label": labels.get(reported_state, labels.get(summary.state, "unknown")),
+        "state": reported_state,
+        "sha": revision.head_sha,
+        "error": revision.error,
+        "checks": [record for record in records if record["kind"] != "check_suite"],
+        "check_suites": [record for record in records if record["kind"] == "check_suite"],
     }
+
+
+def _review_status(db: Session, pr: m.PullRequest) -> str:
+    review = db.query(m.Review).filter(
+        m.Review.pull_request_id == pr.id,
+        m.Review.head_sha == pr.head_sha,
+        m.Review.is_reevaluation == False,  # noqa: E712
+        m.Review.is_ci_wait_placeholder == False,  # noqa: E712
+    ).first()
+    if review:
+        return "COMPLETED" if review.analysis_completed_at else "PROCESSING"
+    job = db.query(m.BackgroundJob).filter(
+        m.BackgroundJob.idempotency_key
+        == f"review:{pr.repository_id}:{pr.id}:{pr.head_sha}"
+    ).first()
+    if not job:
+        return "NOT_STARTED"
+    return {
+        "QUEUED": "QUEUED", "RUNNING": "PROCESSING",
+        "COMPLETED": "COMPLETED", "FAILED": "FAILED",
+    }.get(job.state, "UNKNOWN")
 
 
 # ---------------------------------------------------------------- Overview --
@@ -105,9 +107,6 @@ def overview(db: Session = Depends(get_db)):
         .filter(m.Review.is_ci_wait_placeholder == False)  # noqa: E712
         .group_by(m.Review.decision).all()
     )
-    waiting_count = db.query(func.count(m.Review.id)).filter(
-        m.Review.is_ci_wait_placeholder == True, m.Review.decision == m.DecisionStatus.WAITING_FOR_CI,  # noqa: E712
-    ).scalar() or 0
     by_category = dict(
         db.query(m.Review.risk_category, func.count(m.Review.id))
         .filter(m.Review.is_ci_wait_placeholder == False)  # noqa: E712
@@ -129,7 +128,6 @@ def overview(db: Session = Depends(get_db)):
     return {
         "total_reviews": total,
         "by_decision": {str(k.value if hasattr(k, "value") else k): v for k, v in by_decision.items()},
-        "waiting_for_ci": waiting_count,
         "by_risk_category": by_category,
         "repositories": repo_out,
     }
@@ -207,7 +205,8 @@ def list_prs(repo_id: str, db: Session = Depends(get_db)):
             "latest_decision": latest.decision.value if latest else None,
             "latest_score": latest.overall_score if latest else None,
             "latest_risk_category": latest.risk_category if latest else None,
-            "ci_status": _ci_status_summary(db, latest.id if latest else None),
+            "review_status": _review_status(db, pr),
+            "ci_status": _ci_status_summary(db, pr.id, pr.head_sha or ""),
             "changed_files_count": files_count or 0,
             "findings_count": findings_count or 0,
             "last_analyzed_at": latest.created_at if latest else None,
@@ -230,7 +229,8 @@ def recent_pull_requests(limit: int = 10, db: Session = Depends(get_db)):
             "updated_at": pr.updated_at,
             "latest_decision": latest.decision.value if latest else None,
             "latest_score": latest.overall_score if latest else None,
-            "ci_status": _ci_status_summary(db, latest.id if latest else None),
+            "review_status": _review_status(db, pr),
+            "ci_status": _ci_status_summary(db, pr.id, pr.head_sha or ""),
         })
     return out
 
@@ -252,6 +252,9 @@ def get_pull_request(pr_id: str, db: Session = Depends(get_db)):
         "repository": {"id": repo.id, "full_name": repo.full_name} if repo else None,
         "latest_review_id": latest.id if latest else None,
         "latest_decision": latest.decision.value if latest else None,
+        "review_status": _review_status(db, pr),
+        "head_sha": pr.head_sha,
+        "ci_status": _ci_status_summary(db, pr.id, pr.head_sha or ""),
     }
 
 
@@ -308,7 +311,7 @@ def get_review(review_id: str, db: Session = Depends(get_db)):
         "is_reevaluation": review.is_reevaluation, "superseded_review_id": review.superseded_review_id,
         "is_ci_wait_placeholder": review.is_ci_wait_placeholder,
         "ci_wait_pending_checks": review.ci_wait_pending_checks,
-        "ci_status": _ci_status_summary(db, review.id),
+        "ci_status": _ci_status_summary(db, review.pull_request_id, review.head_sha),
         "pull_request": {"number": pr.github_pr_number, "title": pr.title, "author": pr.author_login} if pr else None,
         "scores": {
             "change_surface": review.score_change_surface, "reversibility": review.score_reversibility,

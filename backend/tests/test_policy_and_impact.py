@@ -1,17 +1,6 @@
 from app.services import impact_simulator, policy_engine
 
 
-def _legacy_ci_policy():
-    policy = policy_engine.load_default_policy()
-    policy["mandatory_ci_checks"] = ["build", "unit-tests", "lint"]
-    policy["ci_check_aliases"] = {
-        "build": ["Build / Install dependencies", "build / install dependencies"],
-        "unit-tests": ["Tests / Unit tests", "tests / unit tests", "test"],
-        "lint": ["Lint / Ruff", "lint / ruff"],
-    }
-    return policy
-
-
 def test_blocked_path_detected():
     policy = policy_engine.load_default_policy()
     files = [{"file_path": "infra/secrets/db.pem", "additions": 1, "deletions": 0, "patch_excerpt": ""}]
@@ -20,179 +9,33 @@ def test_blocked_path_detected():
     assert ev.violations
 
 
-def test_mandatory_ci_missing_is_pending_not_a_violation():
-    """A mandatory check that simply hasn't reported yet should be PENDING
-    (wait for CI), not a hard violation -- only a completed, non-passing
-    check should ever be a violation."""
-    policy = _legacy_ci_policy()
-    files = [{"file_path": "app/main.py", "additions": 3, "deletions": 1, "patch_excerpt": ""}]
-    ev = policy_engine.evaluate_policy(
-        policy, files, ci_checks=[{"name": "build", "status": "completed", "conclusion": "success"}],
-        author_login="alice")
-    assert "unit-tests" in ev.mandatory_checks_pending
-    assert "lint" in ev.mandatory_checks_pending
-    assert not ev.mandatory_checks_failed
-    assert not ev.violations
-
-
-def test_mandatory_ci_failed_is_a_hard_violation():
-    policy = _legacy_ci_policy()
-    files = [{"file_path": "app/main.py", "additions": 3, "deletions": 1, "patch_excerpt": ""}]
-    ev = policy_engine.evaluate_policy(
-        policy, files,
-        ci_checks=[
-            {"name": "build", "status": "completed", "conclusion": "success"},
-            {"name": "unit-tests", "status": "completed", "conclusion": "failure"},
-            {"name": "lint", "status": "in_progress", "conclusion": None},
-        ],
-        author_login="alice")
-    assert ev.mandatory_checks_failed == ["unit-tests"]
-    assert ev.mandatory_checks_pending == ["lint"]
-    assert any("unit-tests" in v for v in ev.violations)
-
-
-def test_mandatory_ci_aliases_match_human_readable_github_names():
-    policy = _legacy_ci_policy()
-    files = [{"file_path": "app/main.py", "additions": 3, "deletions": 1, "patch_excerpt": ""}]
-    ev = policy_engine.evaluate_policy(
-        policy,
-        files,
-        ci_checks=[
-            {"name": "Build / Install dependencies", "status": "completed", "conclusion": "success"},
-            {"name": "Tests / Unit tests", "status": "completed", "conclusion": "success"},
-            {"name": "Lint / Ruff", "status": "completed", "conclusion": "success"},
-        ],
-        author_login="alice",
-    )
-    assert ev.mandatory_checks_failed == []
-    assert ev.mandatory_checks_pending == []
-    assert not ev.violations
-
-
-def test_production_check_names_map_only_verified_aliases():
-    policy = _legacy_ci_policy()
-    files = [{
-        "file_path": "app/main.py",
-        "additions": 1,
-        "deletions": 0,
-        "patch_excerpt": "",
-    }]
-    ev = policy_engine.evaluate_policy(
-        policy,
-        files,
-        ci_checks=[
-            {"name": "build", "status": "completed", "conclusion": "success"},
-            {"name": "test", "status": "completed", "conclusion": "success"},
-            {"name": "dependency-audit", "status": "completed", "conclusion": "success"},
-            {"name": "secret-scan", "status": "completed", "conclusion": "success"},
-        ],
-        author_login="alice",
-    )
-
-    assert ev.mandatory_checks_pending == ["lint"]
-    assert ev.mandatory_checks_failed == []
-    assert ev.mandatory_checks_missing == ["lint"]
-    assert not ev.violations
-
-    completed = policy_engine.evaluate_policy(
-        policy,
-        files,
-        ci_checks=[
-            {"name": "build", "status": "completed", "conclusion": "success"},
-            {"name": "test", "status": "completed", "conclusion": "success"},
-            {"name": "lint", "status": "completed", "conclusion": "success"},
-            {"name": "dependency-audit", "status": "completed", "conclusion": "success"},
-            {"name": "secret-scan", "status": "completed", "conclusion": "success"},
-        ],
-        author_login="alice",
-    )
-    assert completed.mandatory_checks_pending == []
-    assert completed.mandatory_checks_failed == []
-
-
-def test_failed_test_alias_does_not_satisfy_unit_tests():
-    policy = _legacy_ci_policy()
-    ev = policy_engine.evaluate_policy(
-        policy,
-        [],
-        [
-            {"name": "build", "status": "completed", "conclusion": "success"},
-            {"name": "test", "status": "completed", "conclusion": "failure"},
-            {"name": "lint", "status": "completed", "conclusion": "success"},
-        ],
-        author_login="alice",
-    )
-
-    assert ev.mandatory_checks_failed == ["unit-tests"]
-    assert ev.mandatory_checks_pending == []
-    assert ev.violations
-
-
-def test_mandatory_ci_does_not_match_unconfigured_substrings():
-    policy = {
-        "mandatory_ci_checks": ["build"],
-        "ci_check_aliases": {},
-    }
-
-    ev = policy_engine.evaluate_policy(
-        policy,
-        [],
-        [{"name": "build-docs", "status": "completed", "conclusion": "success"}],
-        author_login="alice",
-    )
-
-    assert ev.mandatory_checks_pending == ["build"]
-    assert ev.mandatory_checks_failed == []
-
-
-def test_default_policy_discovers_checks_without_name_requirements():
+def test_review_policy_has_no_named_ci_requirements():
     policy = policy_engine.load_default_policy()
-    ev = policy_engine.evaluate_policy(
+    assert "mandatory_ci_checks" not in policy
+    assert "ci_check_aliases" not in policy
+    assert policy["block_on_ci_failure"] is True
+
+
+def test_unfamiliar_or_missing_ci_names_do_not_change_file_policy():
+    policy = policy_engine.load_default_policy()
+    files = [{"file_path": "app/main.py", "additions": 3, "deletions": 1, "patch_excerpt": ""}]
+    without_ci = policy_engine.evaluate_policy(policy, files, ci_checks=[], author_login="alice")
+    with_unknown_ci = policy_engine.evaluate_policy(
         policy,
-        [],
-        [
-            {"name": "Build and verify", "status": "completed", "conclusion": "success"},
-            {"name": "Security Scan", "status": "completed", "conclusion": "success"},
-        ],
+        files,
+        ci_checks=[{"name": "third-party-quality-gate", "status": "in_progress"}],
         author_login="alice",
     )
-
-    assert policy["mandatory_ci_checks"] == []
-    assert ev.mandatory_checks_pending == []
-    assert ev.mandatory_checks_failed == []
-
-
-def test_newest_check_run_wins_over_stale_in_progress_run():
-    policy = {"mandatory_ci_checks": ["build"]}
-    checks = [
-        {
-            "name": "build",
-            "status": "completed",
-            "conclusion": "success",
-            "started_at": "2026-01-02T00:00:00Z",
-        },
-        {
-            "name": "build",
-            "status": "in_progress",
-            "conclusion": None,
-            "started_at": "2026-01-01T00:00:00Z",
-        },
-    ]
-
-    ev = policy_engine.evaluate_policy(policy, [], checks, author_login="alice")
-
-    assert ev.mandatory_checks_pending == []
-    assert ev.mandatory_checks_failed == []
+    assert without_ci.violations == with_unknown_ci.violations == []
+    assert without_ci.requires_human_review == with_unknown_ci.requires_human_review
 
 
 def test_human_review_path():
     policy = policy_engine.load_default_policy()
     files = [{"file_path": "backend/auth/login.py", "additions": 10, "deletions": 2, "patch_excerpt": ""}]
     ev = policy_engine.evaluate_policy(
-        policy, files,
-        ci_checks=[{"name": c, "status": "completed", "conclusion": "success"}
-                   for c in ("build", "unit-tests", "lint")],
-        author_login="alice")
+        policy, files, ci_checks=[], author_login="alice"
+    )
     assert ev.requires_human_review
 
 

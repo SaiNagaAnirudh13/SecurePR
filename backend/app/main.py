@@ -13,8 +13,13 @@ from app.core.config import (
 )
 from app.core.db import Base, get_engine
 from app.models import models  # noqa: F401 ensures models are registered on Base.metadata
+from app.services.background_jobs import (
+    start_background_workers,
+    stop_background_workers,
+)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("securepr")
 
 settings = get_settings()
@@ -40,11 +45,18 @@ app.include_router(dashboard.router)
 def on_startup():
     validate_production_settings(settings)
     if not settings.GITHUB_WEBHOOK_SECRET:
-        logger.warning("GITHUB_WEBHOOK_SECRET is not configured; webhook requests will be rejected.")
+        logger.warning(
+            "GITHUB_WEBHOOK_SECRET is not configured; webhook requests will be rejected.")
     # Create missing tables from the ORM models. The SQL Server schema remains
     # available for existing local installations and is not used for PostgreSQL.
     Base.metadata.create_all(bind=get_engine())
+    start_background_workers()
     logger.info("Database tables verified/created.")
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    stop_background_workers()
 
 
 @app.get("/health")

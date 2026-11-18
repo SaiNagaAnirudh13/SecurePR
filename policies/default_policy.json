@@ -6,8 +6,7 @@
   "auto_merge_allowed_risk_categories": [
     "LOW"
   ],
-  "mandatory_ci_checks": [],
-  "ci_check_aliases": {},
+  "block_on_ci_failure": true,
   "blocked_paths": [
     "**/secrets/**",
     "**/*.pem",

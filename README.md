@@ -2,9 +2,8 @@
 
 AI-powered Pull Request risk assessment and automatic-approval platform.
 SecurePR analyzes GitHub Pull Requests, scores risk across six weighted
-dimensions, evaluates configurable policies, waits for your CI to actually
-finish before deciding, simulates change impact, and either approves,
-blocks, or routes eligible low-risk PRs for manual review. A separately
+dimensions, evaluates configurable policies, and publishes the AI review
+independently of CI. A separately
 guarded auto-merge flow is opt-in and disabled by default. A dark,
 dropdown-driven dashboard (no internal
 IDs to copy/paste) covers every stage of that pipeline end to end.
@@ -38,7 +37,8 @@ SecurePR/
 ├── database/
 │   ├── securepr_schema.sql  retained SQL Server fallback schema (run in SSMS)
 │   └── postgresql/
-│       └── 001_initial_schema.sql  Supabase PostgreSQL bootstrap schema
+│       ├── 001_initial_schema.sql  Supabase PostgreSQL bootstrap schema
+│       └── 002_independent_ci_monitoring.sql  durable review/CI workers
 ├── policies/
 │   └── default_policy.json   initial policy document (no code change needed to edit)
 ├── frontend/dashboard/        static HTML/CSS/JS dashboard + Vercel build config
@@ -67,15 +67,15 @@ SecurePR/
 - **The AI never decides.** Gemini contributes dimension-score opinions and
   rationale text; `services/decision_engine.py` is pure deterministic Python
   with no AI dependency, and it is the only thing that produces an
-  APPROVED/BLOCKED/MANUAL_REVIEW/WAITING_FOR_CI decision. AI scores can only
+  APPROVED/BLOCKED/MANUAL_REVIEW decision. AI scores can only
   raise a heuristic risk score, never lower one (`risk_engine.blend_with_ai`).
-- **SecurePR discovers CI dynamically.** It discovers check runs, commit
-  statuses, and check suites for each PR head SHA without assuming check
-  names. Webhooks and polling share a stabilization-aware evaluator; pending
-  checks, late-arriving checks, and API errors cannot be mistaken for success.
-  Repositories without CI and unavailable CI are surfaced explicitly and
-  routed to manual review. Optional repository policies can still require
-  named checks. See `docs/Policies.md` and `docs/SETUP_GUIDE.md` section 9.
+- **AI review and CI monitoring are independent.** A pull-request webhook
+  queues durable review and CI-discovery jobs. Review publication never waits
+  for CI; discovered check runs and commit statuses are stored against the
+  exact PR head SHA and updated from webhooks, with bounded polling as backup.
+  Empty results, API failures, and unfamiliar check names are never reported
+  as CI success. A late failure updates CI state and receives a separate
+  notification without rerunning the analysis. See `docs/Policies.md`.
 - **Gemini model fallback.** `gemini-3.8-flash` is configured by default, but
   `integrations/gemini_client.py` probes model availability at call time and
   falls back to `GEMINI_FALLBACK_MODEL` (default `gemini-2.0-flash`) if it
@@ -96,13 +96,12 @@ SecurePR/
     operator/admin user-ID allowlists. Set those allowlists and production
     security configuration before deployment; production startup fails when
     critical settings are missing.
-  - The CI-wait poller is an in-process Python thread (`services/pipeline.py`
-    `_ci_wait_poll_loop`), not a durable job queue — it won't survive a
-    backend restart mid-wait (the webhook fast path and the next `uvicorn
-    --reload` will generally re-trigger it if a later event arrives, but
-    there's no guaranteed resume). A production deployment should move this
-    to Celery/RQ/a scheduled job or similar.
-  - No rate limiting or retry/backoff on GitHub or Gemini calls.
+  - Review and CI tasks use a database-backed queue, so queued work survives
+    process restarts. Deployments must apply the numbered database migration
+    before enabling the new workers.
+  - CI fallback polling is bounded; GitHub webhooks remain the primary update
+    mechanism. Configure the GitHub App for Check run, Check suite, and Commit
+    status events.
   - GitHub App keys may be loaded from a local `.pem` file for development;
     production should set the backend-only `GITHUB_PRIVATE_KEY` secret.
   - Use provider secret settings for all production credentials; do not copy

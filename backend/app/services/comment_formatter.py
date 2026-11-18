@@ -1,11 +1,5 @@
 """
-Formats SecurePR's analysis into polished, GitHub-friendly Markdown.
-
-Two comment shapes are produced:
-  - format_waiting_comment(): a short placeholder posted the moment SecurePR
-    sees a PR but is still waiting on mandatory CI checks to finish.
-  - format_comment(): the full report, posted once a final decision
-    (APPROVED / BLOCKED / MANUAL_REVIEW) has been reached.
+Formats SecurePR's independent AI analysis and current CI state as Markdown.
 """
 from datetime import datetime
 from urllib.parse import quote, urlsplit
@@ -14,7 +8,6 @@ DECISION_META = {
     "APPROVED":       {"emoji": "✅", "label": "Approved",       "color": "🟢"},
     "BLOCKED":        {"emoji": "⛔", "label": "Blocked",        "color": "🔴"},
     "MANUAL_REVIEW":  {"emoji": "🟡", "label": "Manual Review Required", "color": "🟡"},
-    "WAITING_FOR_CI":  {"emoji": "⏳", "label": "Waiting for CI",  "color": "⚪"},
     "PENDING":        {"emoji": "⏳", "label": "Pending",         "color": "⚪"},
 }
 
@@ -48,40 +41,12 @@ def _score_bar(score: float) -> str:
     return "█" * filled + "░" * (10 - filled)
 
 
-def format_waiting_comment(*, pending_checks: list[str], changed_files_count: int | None,
-                            policy_name: str, policy_version: int, dashboard_url: str,
-                            changed_files_unavailable: bool = False,
-                            ci_state: str | None = None) -> str:
-    checks_md = "\n".join(f"- ⏳ `{c}` — not yet completed" for c in pending_checks) or "- (no checks detected yet)"
-    if ci_state == "ERROR":
-        checks_md = "- GitHub CI status is unavailable; SecurePR will retry."
-    elif ci_state == "DISCOVERING":
-        checks_md = "- Waiting for GitHub checks to appear and stabilize."
-    files_summary = (
-        "SecurePR could not retrieve the changed-file list, so no file count is shown."
-        if changed_files_unavailable
-        else f"SecurePR found {changed_files_count or 0} changed file(s) in this Pull Request."
-    )
-    return (
-        f"## ⏳ SecurePR Review — **Waiting for CI**\n\n"
-        f"{files_summary} SecurePR is holding its final decision until CI discovery is complete "
-        f"and all applicable checks report terminal results:\n\n"
-        f"{checks_md}\n\n"
-        f"No action is needed — SecurePR is watching this commit and will post the final review "
-        f"after all applicable checks finish and discovery stabilizes. If checks remain pending, SecurePR will "
-        f"route the review to manual review after its fallback timeout.\n\n"
-        f"<sub>Policy: **{policy_name} v{policy_version}** · "
-        f"[Open in SecurePR dashboard]({dashboard_url}) · "
-        f"Auto-merge, if enabled, is considered only after final analysis.</sub>"
-    )
-
-
 def format_comment(*, decision: str, reasons: list[str], overall_score: float, category: str,
                     dimension_scores: dict, findings: list[dict], changed_files: list[dict],
                     circuit_breaker_tripped: bool, circuit_breaker_reason: str | None,
                     impact_items: list, policy_name: str, policy_version: int,
                     dashboard_url: str, ci_checks: list[dict] | None = None,
-                    waited_for_ci: bool = False, analysis_error: str | None = None,
+                    analysis_error: str | None = None,
                     ci_state: str | None = None) -> str:
     meta = DECISION_META.get(decision, {"emoji": "", "label": decision})
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
@@ -92,10 +57,12 @@ def format_comment(*, decision: str, reasons: list[str], overall_score: float, c
         "",
         "| | |",
         "|---|---|",
+        "| **AI Analysis** | Completed |",
         f"| **Overall Risk Score** | `{overall_score}/100` ({RISK_LABEL.get(category, category)}) |",
         f"| **CI / Check Status** | {_ci_summary_line(ci_checks, ci_state)} |",
+        "| **Review Result** | Published |",
         f"| **Circuit Breaker** | {'🔴 Active — ' + (circuit_breaker_reason or '') if circuit_breaker_tripped else '🟢 Inactive'} |",
-        f"| **Reviewed** | {now}{' (after waiting for CI to complete)' if waited_for_ci else ''} |",
+        f"| **Reviewed** | {now} |",
         "",
     ]
     if analysis_error:
@@ -174,7 +141,7 @@ def format_comment(*, decision: str, reasons: list[str], overall_score: float, c
     lines.append(f"<sub>Policy: **{policy_name} v{policy_version}** · "
                   f"[Open full analysis & evidence in the SecurePR dashboard]({dashboard_url})</sub>")
     lines.append("")
-    lines.append("_Auto-merge is disabled by default and requires every configured safety check to pass._")
+    lines.append("_Auto-merge is disabled by default and requires every discovered CI execution to pass._")
     return "\n".join(lines)
 
 
@@ -231,22 +198,21 @@ def _markdown_link(url) -> str:
 
 def _ci_summary_line(ci_checks: list[dict] | None, ci_state: str | None = None) -> str:
     state_labels = {
-        "DISCOVERING": "⏳ CI discovery in progress",
-        "RUNNING": "⏳ CI running",
-        "SUCCESS": "✅ CI successful",
-        "FAILURE": "❌ CI failed",
-        "NEUTRAL": "➖ CI neutral",
-        "NO_CI_CONFIGURED": "⚪ No CI checks detected",
-        "NO_CHECKS_FOUND": "⚪ No CI checks detected",
-        "ERROR": "⚠️ CI status unavailable",
-        "TIMEOUT": "⌛ CI timed out",
+        "IN_PROGRESS": "⏳ In progress — AI review published; CI monitoring continues",
+        "PASSED": "✅ All discovered checks passed",
+        "FAILED": "❌ At least one discovered check failed",
+        "NON_SUCCESS": "⚠️ One or more checks ended without success",
+        "NOT_CONFIGURED": "⚪ No checks discovered",
+        "NO_CHECKS_FOUND": "⚪ No checks discovered",
+        "UNAVAILABLE": "⚠️ CI discovery unavailable",
+        "UNKNOWN": "❔ CI status unknown",
     }
     if ci_state in state_labels:
         return state_labels[ci_state]
     if not ci_checks:
-        return "⚪ No checks reported"
+        return "❔ CI status unknown"
     completed = [c for c in ci_checks if c.get("status") == "completed"]
-    passed = [c for c in completed if c.get("conclusion") in ("success", "neutral", "skipped")]
+    passed = [c for c in completed if c.get("conclusion") == "success"]
     failed = [c for c in completed if c not in passed]
     pending = [c for c in ci_checks if c.get("status") != "completed"]
     parts = []

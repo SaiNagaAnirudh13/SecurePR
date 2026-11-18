@@ -1,13 +1,5 @@
-from app.services.comment_formatter import format_comment, format_waiting_comment
+from app.services.comment_formatter import format_comment
 from app.services import risk_engine
-
-
-def test_waiting_comment_renders():
-    body = format_waiting_comment(pending_checks=["unit-tests", "lint"], changed_files_count=3,
-                                   policy_name="default", policy_version=1,
-                                   dashboard_url="http://localhost:5173/#/pr/x")
-    assert "Waiting for CI" in body
-    assert "unit-tests" in body and "lint" in body
 
 
 def test_full_comment_renders_all_sections():
@@ -21,11 +13,14 @@ def test_full_comment_renders_all_sections():
         decision="APPROVED", reasons=["Risk score within threshold."], overall_score=22.5, category="LOW",
         dimension_scores=scores, findings=findings, changed_files=files, circuit_breaker_tripped=False,
         circuit_breaker_reason=None, impact_items=[], policy_name="default", policy_version=1,
-        dashboard_url="http://localhost:5173", ci_checks=ci_checks, waited_for_ci=True,
+        dashboard_url="http://localhost:5173", ci_checks=ci_checks, ci_state="IN_PROGRESS",
     )
     assert "SecurePR Review" in body
     assert "Risk Breakdown" in body
     assert "CI Verification" in body
     assert "Findings" in body
     assert "Why this decision" in body
+    assert "AI Analysis" in body
+    assert "AI review published; CI monitoring continues" in body
+    assert "Waiting for CI" not in body
     assert "Auto-merge is disabled by default" in body

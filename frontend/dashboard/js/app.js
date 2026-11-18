@@ -132,24 +132,38 @@ function toast(msg, isError) {
 
 function badge(value) { return value ? `<span class="badge ${escapeHtml(value)}">${escapeHtml(value.replace(/_/g, ' '))}</span>` : '—'; }
 function ciBadge(ci) {
-  if (!ci) return `<span class="badge unknown">CI status unavailable</span>`;
+  if (!ci) return `<span class="badge unknown">CI status unknown</span>`;
   const map = {
-    discovering: '… Discovering checks',
-    running: '… CI running',
-    passed: '✓ CI successful',
-    failed: '✕ CI failed',
+    pending: '… In progress',
+    passed: '✓ Passed',
+    failed: '✕ Failed',
     neutral: '— CI neutral',
-    no_checks: 'No CI checks detected',
+    no_checks: 'No checks discovered',
     unavailable: 'CI status unavailable',
-    timed_out: 'CI timed out',
-    pending: '… CI running',
-    unknown: 'CI status unavailable',
+    non_success: 'CI needs attention',
+    unknown: 'CI status unknown',
   };
   const titles = {
-    NO_CI_CONFIGURED: 'No CI checks are configured for this revision.',
-    NO_CHECKS_FOUND: 'GitHub reported check suites but no check runs or statuses.',
+    PASSED: 'All discovered executions passed.',
+    FAILED: 'At least one discovered CI execution failed.',
+    IN_PROGRESS: 'AI review is independent and published; CI monitoring continues.',
+    NO_CHECKS_FOUND: 'No check runs or commit statuses were discovered for this revision.',
+    NOT_CONFIGURED: 'No check runs or commit statuses were discovered for this revision.',
+    UNAVAILABLE: ci.error || 'CI discovery is unavailable; bounded retries continue.',
+    UNKNOWN: 'CI discovery is pending or returned an unrecognized status.',
+    NON_SUCCESS: 'An execution ended without success (cancelled, neutral, skipped, or stale).',
   };
-  return `<span class="badge ${escapeHtml(ci.label || 'unknown')}" title="${escapeHtml(titles[ci.state] || ci.state || '')}">${escapeHtml(map[ci.label] || 'CI status unavailable')}</span>`;
+  return `<span class="badge ${escapeHtml(ci.label || 'unknown')}" title="${escapeHtml(titles[ci.state] || ci.state || '')}">${escapeHtml(map[ci.label] || 'CI status unknown')}</span>`;
+}
+function reviewStatusBadge(status) {
+  const labels = {
+    COMPLETED: 'AI review completed',
+    PROCESSING: 'AI review processing',
+    QUEUED: 'AI review queued',
+    FAILED: 'AI review failed',
+    NOT_STARTED: 'AI review not started',
+  };
+  return `<span class="badge">${escapeHtml(labels[status] || 'AI review status unknown')}</span>`;
 }
 function ciCheckResult(check) {
   if (check.status !== 'completed') return 'Running (' + (check.status || 'pending') + ')';
@@ -207,7 +221,7 @@ function switchTab(tabName) {
 document.querySelectorAll('.nav-link').forEach(btn => btn.addEventListener('click', () => switchTab(btn.dataset.tab)));
 
 // ------------------------------------------------------------- Donut chart -
-const PALETTE = { APPROVED: '#2fd480', BLOCKED: '#ff5c72', MANUAL_REVIEW: '#f6b33c', WAITING_FOR_CI: '#4f8dfd',
+const PALETTE = { APPROVED: '#2fd480', BLOCKED: '#ff5c72', MANUAL_REVIEW: '#f6b33c',
                   PENDING: '#6d7891', LOW: '#2fd480', MEDIUM: '#f6b33c', HIGH: '#ff5c72', NOT_EVALUATED: '#6d7891' };
 
 function renderDonut(containerId, data, centerLabel) {
@@ -302,8 +316,6 @@ async function loadOverview() {
     const approved = data.by_decision.APPROVED || 0;
     const blocked = data.by_decision.BLOCKED || 0;
     const manual = data.by_decision.MANUAL_REVIEW || 0;
-    const waiting = data.waiting_for_ci || 0;
-
     document.getElementById('overviewCards').innerHTML = `
       <div class="kpi-card">
         <div class="kpi-top"><div class="kpi-icon" style="background:var(--accent-soft);color:var(--accent);">
@@ -333,17 +345,9 @@ async function loadOverview() {
         <div class="kpi-value">${manual}</div>
         <div class="kpi-label">Pending Review</div>
       </div>
-      ${waiting ? `
-      <div class="kpi-card">
-        <div class="kpi-top"><div class="kpi-icon" style="background:var(--accent-soft);color:var(--accent);">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
-        </div></div>
-        <div class="kpi-value">${waiting}</div>
-        <div class="kpi-label">Waiting for CI</div>
-      </div>` : ''}
     `;
 
-    renderDonut('decisionDonut', { APPROVED: approved, BLOCKED: blocked, MANUAL_REVIEW: manual, WAITING_FOR_CI: waiting }, 'PRs');
+    renderDonut('decisionDonut', { APPROVED: approved, BLOCKED: blocked, MANUAL_REVIEW: manual }, 'PRs');
     renderDonut('riskDonut', {
       LOW: data.by_risk_category.LOW || 0, MEDIUM: data.by_risk_category.MEDIUM || 0,
       HIGH: data.by_risk_category.HIGH || 0,
@@ -368,13 +372,14 @@ async function loadOverview() {
   try {
     const recent = await api('/api/pull-requests/recent?limit=8');
     document.getElementById('recentPrTableWrap').innerHTML = recent.length ? `
-      <table><tr><th>#</th><th>Title</th><th>Repository</th><th>Author</th><th>Risk Score</th><th>Decision</th><th>CI Status</th><th>Updated</th><th></th></tr>
+      <table><tr><th>#</th><th>Title</th><th>Repository</th><th>Author</th><th>Risk Score</th><th>AI Review</th><th>Decision</th><th>CI Status</th><th>Updated</th><th></th></tr>
         ${recent.map(p => `<tr class="clickable" onclick="jumpToPrFromOverview('${p.repository_id}','${p.id}')">
           <td>#${p.number}</td>
           <td>${escapeHtml(p.title || '')}</td>
           <td><span class="avatar-chip"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--muted)"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="9" r="2.5"/></svg>${escapeHtml(p.repository_full_name || '')}</span></td>
           <td><span class="avatar-chip"><span class="avatar-circle">${initials(p.author)}</span>${escapeHtml(p.author || '')}</span></td>
           <td>${p.latest_score != null ? '<span class="badge ' + (p.latest_score < 40 ? 'LOW' : p.latest_score < 70 ? 'MEDIUM' : 'HIGH') + '">' + p.latest_score.toFixed(2) + '</span>' : '—'}</td>
+          <td>${reviewStatusBadge(p.review_status)}</td>
           <td>${badge(p.latest_decision)}</td>
           <td>${ciBadge(p.ci_status)}</td>
           <td>${timeAgo(p.updated_at)}</td>
@@ -403,12 +408,13 @@ async function onPrRepoChange() {
   document.getElementById('prListPanel').innerHTML = '<div class="empty-state">Loading…</div>';
   const prs = await api(`/api/repositories/${repoId}/pull-requests`);
   document.getElementById('prListPanel').innerHTML = prs.length ? `
-    <table><tr><th>#</th><th>Title</th><th>Author</th><th>Branch</th><th>Risk</th><th>Decision</th><th>CI</th><th>Files</th><th>Findings</th><th>Updated</th></tr>
+    <table><tr><th>#</th><th>Title</th><th>Author</th><th>Branch</th><th>Risk</th><th>AI Review</th><th>Decision</th><th>CI</th><th>Files</th><th>Findings</th><th>Updated</th></tr>
       ${prs.map(p => `<tr class="clickable" onclick="showPrDetail('${p.id}')">
         <td>#${p.number}</td><td>${escapeHtml(p.title || '')}</td>
         <td><span class="avatar-chip"><span class="avatar-circle">${initials(p.author)}</span>${escapeHtml(p.author || '')}</span></td>
         <td><code>${escapeHtml(p.head_branch || '')} → ${escapeHtml(p.base_branch || '')}</code></td>
         <td>${p.latest_score != null ? p.latest_score.toFixed(1) : '—'}</td>
+        <td>${reviewStatusBadge(p.review_status)}</td>
         <td>${badge(p.latest_decision)}</td>
         <td>${ciBadge(p.ci_status)}</td>
         <td>${p.changed_files_count}</td>
@@ -431,7 +437,7 @@ async function showPrDetail(prId) {
         <h2 class="section-title">#${pr.number} — ${escapeHtml(pr.title || '')}</h2>
         <p class="section-sub">${escapeHtml(pr.repository ? pr.repository.full_name : '')} · opened by ${escapeHtml(pr.author || '')} · ${reviews.length} review(s) on record</p>
       </div>
-      ${badge(pr.latest_decision)}
+      ${reviewStatusBadge(pr.review_status)}
     </div>
     ${latest ? `
       <p>Latest risk score: <strong>${latest.overall_score}</strong> (${escapeHtml(latest.risk_category)}) — ${badge(latest.decision)}</p>
@@ -559,7 +565,7 @@ async function renderReviewHistory(prId) {
     <div class="accordion-item">
       <div class="accordion-head" onclick="toggleAccordion('rev-${r.id}', '${r.id}')">
         <div>
-          <strong>${r.is_ci_wait_placeholder ? '⏳ Waiting for CI' : (r.is_reevaluation ? 'Re-evaluation' : 'Initial Review')}</strong>
+          <strong>${r.is_reevaluation ? 'Re-evaluation' : 'Initial Review'}</strong>
           <span class="section-sub">&nbsp;·&nbsp;${new Date(r.created_at).toLocaleString()}</span>
         </div>
         <div style="display:flex;align-items:center;gap:10px;">

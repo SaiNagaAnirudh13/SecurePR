@@ -1,113 +1,97 @@
-"""Classify dynamically discovered GitHub CI checks for one commit revision."""
-import json
+"""Classify actual CI executions without coupling them to AI review decisions."""
 from dataclasses import dataclass
 
-_PENDING_STATUSES = {"queued", "in_progress", "pending", "requested", "waiting"}
-_SUCCESS_CONCLUSIONS = {"success"}
-_NEUTRAL_CONCLUSIONS = {"neutral", "skipped"}
-_FAILURE_CONCLUSIONS = {
-    "action_required",
-    "cancelled",
-    "error",
-    "failure",
-    "stale",
-    "startup_failure",
-    "timed_out",
+
+_PENDING_STATUSES = {
+    "queued",
+    "requested",
+    "waiting",
+    "pending",
+    "in_progress",
 }
+_FAILED_CONCLUSIONS = {"failure", "error", "timed_out", "startup_failure", "action_required"}
+_NON_SUCCESS_TERMINAL = {"cancelled", "neutral", "skipped", "stale"}
 
 
 @dataclass(frozen=True)
 class CIStatus:
     state: str
-    finalized: bool
-    pending_checks: tuple[str, ...] = ()
+    pending_count: int = 0
+    passed_count: int = 0
+    failed_count: int = 0
+    neutral_count: int = 0
+    unknown_count: int = 0
     error: str | None = None
 
 
-def snapshot_signature(checks: list[dict], suites: list[dict]) -> str:
-    """Return a stable identity/state signature, ignoring poll timestamps."""
-    snapshot = []
-    for kind, items in (("check", checks), ("suite", suites)):
-        for item in items:
-            snapshot.append({
-                "kind": kind,
-                "identity": item.get("identity"),
-                "name": item.get("name"),
-                "provider": item.get("provider"),
-                "status": item.get("status"),
-                "conclusion": item.get("conclusion"),
-                "sha": item.get("sha"),
-            })
-    snapshot.sort(key=lambda item: (
-        str(item["kind"]),
-        str(item["identity"]),
-        str(item["provider"]),
-        str(item["name"]),
-    ))
-    return json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+def classify_execution(status: str | None, conclusion: str | None) -> str:
+    """Return passed, failed, pending, non_success, or unknown for a real record."""
+    normalized_status = (status or "").casefold()
+    normalized_conclusion = (conclusion or "").casefold()
 
-
-def _item_state(item: dict) -> tuple[str, str | None]:
-    status = str(item.get("status") or "").casefold()
-    if status in _PENDING_STATUSES:
-        return "pending", str(item.get("name") or item.get("identity") or "Unnamed check")
-    if status != "completed":
-        return "error", str(item.get("name") or item.get("identity") or "Unnamed check")
-
-    conclusion = str(item.get("conclusion") or "").casefold()
-    if conclusion in _SUCCESS_CONCLUSIONS:
-        return "success", None
-    if conclusion in _NEUTRAL_CONCLUSIONS:
-        return "neutral", None
-    if conclusion in _FAILURE_CONCLUSIONS:
-        return "failure", None
-    return "error", str(item.get("name") or item.get("identity") or "Unnamed check")
+    if normalized_status in _PENDING_STATUSES:
+        return "pending"
+    if normalized_status != "completed":
+        return "unknown"
+    if normalized_conclusion == "success":
+        return "passed"
+    if normalized_conclusion in _FAILED_CONCLUSIONS:
+        return "failed"
+    if normalized_conclusion in _NON_SUCCESS_TERMINAL:
+        return "non_success"
+    return "unknown"
 
 
 def evaluate_ci_status(
-    checks: list[dict],
-    suites: list[dict],
+    executions: list[dict],
     *,
-    required_checks_pending: list[str],
-    fetch_error: str | None,
-    quiet_seconds: float,
-    stabilization_seconds: int,
-    timed_out: bool = False,
+    fetch_error: str | None = None,
+    discovery_complete: bool = True,
 ) -> CIStatus:
-    """Evaluate provider results without conflating them with SecurePR policy."""
-    if fetch_error and not timed_out:
-        return CIStatus("ERROR", False, ("GitHub CI status unavailable",), fetch_error)
-    if timed_out:
-        return CIStatus("TIMEOUT", True, error=fetch_error)
+    """Summarize discovered executions; suites alone never imply active work."""
+    if not executions:
+        if fetch_error:
+            return CIStatus("UNAVAILABLE", error=fetch_error)
+        return CIStatus("NOT_CONFIGURED" if discovery_complete else "UNKNOWN")
 
-    pending = []
-    has_failure = False
-    has_neutral = False
-    has_error = False
-    for item in checks + suites:
-        state, name = _item_state(item)
-        if state == "pending" and name:
-            pending.append(name)
-        elif state == "failure":
-            has_failure = True
-        elif state == "neutral":
-            has_neutral = True
-        elif state == "error":
-            has_error = True
+    states = [
+        classify_execution(item.get("status"), item.get("conclusion"))
+        for item in executions
+        if item.get("kind") != "check_suite"
+    ]
+    if not states:
+        return CIStatus(
+            "UNAVAILABLE" if fetch_error else "NOT_CONFIGURED",
+            error=fetch_error,
+        )
 
-    pending = sorted(set(pending))
-    if has_error:
-        return CIStatus("ERROR", False, ("GitHub returned an unrecognized CI state",))
-    if pending:
-        return CIStatus("RUNNING", False, tuple(pending))
-    if quiet_seconds < stabilization_seconds:
-        return CIStatus("DISCOVERING", False, ("Waiting for CI checks to stabilize",))
-    if not checks:
-        return CIStatus("NO_CHECKS_FOUND" if suites else "NO_CI_CONFIGURED", True)
-    if required_checks_pending:
-        return CIStatus("RUNNING", False, tuple(sorted(set(required_checks_pending))))
-    if has_failure:
-        return CIStatus("FAILURE", True)
-    if has_neutral:
-        return CIStatus("NEUTRAL", True)
-    return CIStatus("SUCCESS", True)
+    pending_count = states.count("pending")
+    passed_count = states.count("passed")
+    failed_count = states.count("failed")
+    neutral_count = states.count("non_success")
+    unknown_count = states.count("unknown")
+
+    if failed_count:
+        state = "FAILED"
+    elif fetch_error:
+        state = "UNAVAILABLE"
+    elif unknown_count:
+        state = "UNKNOWN"
+    elif pending_count:
+        state = "IN_PROGRESS"
+    elif neutral_count:
+        state = "NON_SUCCESS"
+    elif passed_count:
+        state = "PASSED"
+    else:
+        state = "NOT_CONFIGURED"
+
+    return CIStatus(
+        state,
+        pending_count=pending_count,
+        passed_count=passed_count,
+        failed_count=failed_count,
+        neutral_count=neutral_count,
+        unknown_count=unknown_count,
+        error=fetch_error,
+    )

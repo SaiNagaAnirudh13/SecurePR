@@ -1,16 +1,16 @@
 # SecurePR — Complete Testing Guide
 
-This walks through testing SecurePR end-to-end: starting the full application,
-verifying GitHub/webhook integration, and running the major decision
-scenarios (clean PR, risky/policy-violating PR, Circuit Breaker, and a PR
-whose CI takes a while to finish). It uses the `sample-repo/` folder included
-in this project.
+This walks through testing SecurePR end to end, including the independent AI
+review and CI-monitoring lifecycles. It uses the `sample-repo/` folder
+included in this project.
 
 ## 1. Start the complete application
 
 Follow `docs/SETUP_GUIDE.md` end to end first. In short, in this order:
 
-1. `DATABASE_URL` points to the Supabase PostgreSQL project; the backend creates any missing ORM tables on startup.
+1. `DATABASE_URL` points to the Supabase PostgreSQL project; apply
+   `database/postgresql/002_independent_ci_monitoring.sql` before deploying
+   the workers to an existing database.
 2. Backend: `cd backend && venv\Scripts\activate && uvicorn app.main:app --reload --port 8000`
 3. Frontend: `cd frontend\dashboard && python -m http.server 5173`
 4. If testing against real GitHub (not just unit tests), a tunnel to your backend: `ngrok http 8000`, with that URL set as the GitHub App's webhook URL.
@@ -43,7 +43,7 @@ git remote add origin https://github.com/<your-username>/securepr-sample-app.git
 git push -u origin main
 ```
 
-Install the SecurePR GitHub App on this repository (`docs/SETUP_GUIDE.md`, section 7, step 11). The default policy discovers all jobs in `.github/workflows/ci.yml` by their GitHub-reported names; no `mandatory_ci_checks` configuration is needed. A repository override can still make selected names mandatory.
+Install the SecurePR GitHub App on this repository (`docs/SETUP_GUIDE.md`, section 7, step 11). SecurePR discovers actual GitHub check runs and commit statuses for each head SHA; it does not require configured names or aliases.
 
 ## 5. Configure automatic-approval eligibility (no IDs to type)
 
@@ -55,11 +55,11 @@ Install the SecurePR GitHub App on this repository (`docs/SETUP_GUIDE.md`, secti
 
 ## 6. Verify the dashboard's data (general)
 
-- **Repositories & PRs** tab: pick a repository from the dropdown, click any PR row to see its latest decision and a link into **Evidence & Replay**.
+- **Repositories & PRs** tab: pick a repository from the dropdown, click any PR row to see separate AI-review and CI states and a link into **Evidence & Replay**.
 - **Evidence & Replay** tab: pick a repository, then a PR; each past review appears as an expandable row — click one to see its full findings, evidence, changed files, GitHub actions, and decision reasons, exactly as they were at the time (re-evaluating never overwrites this).
 - **Change Impact** tab: pick a recent review from the dropdown to see its CONFIRMED/INFERRED/UNRESOLVED component predictions.
 - **Circuit Breaker** tab: shows every breaker as a card with its scope, status, and a one-click Resume button.
-- **Policies** tab: shows the policy document(s) SecurePR has actually evaluated PRs against, including the mandatory checks, blocked paths, and thresholds.
+- **Policies** tab: shows the policy documents SecurePR has evaluated, including CI failure behavior, blocked paths, and thresholds.
 
 None of these pages should ever ask you to paste a Repository ID, PR ID, or Review ID — if one does, something upstream failed to load; check the browser console.
 
@@ -74,7 +74,7 @@ git checkout -b low-risk-fix
 ```
 Edit `app/utils.py`: fix the typo in the `greet()` docstring. Commit and push, then open a PR.
 
-**Expected:** SecurePR discovers the workflow jobs dynamically, waits until all discovered checks finish and the stabilization window passes, then posts a final comment showing **✅ Approved** (if your user is eligible with a high-enough threshold), a low risk score, and the discovered CI results. The dashboard's Evidence & Replay tab should show exactly the appropriate waiting/final records, without duplicate final reviews.
+**Expected:** SecurePR publishes the AI review as soon as analysis completes, regardless of CI timing. The comment shows the actual CI state known at publication; the dashboard updates independently as check webhooks arrive. There is one AI review for the revision.
 
 ### Scenario B — Higher-Risk / Security Finding
 
@@ -100,15 +100,15 @@ Repeat Scenario A's change as a user you did **not** mark eligible in step 5 (a 
 
 **Expected:** CI passes, risk is LOW, but the decision is 🟡 **Manual Review Required** — "Author is not currently configured as eligible for automatic approval" is the stated reason. This demonstrates eligibility is enforced independently of risk score.
 
-### Scenario E — CI Pending / Slow Checks ("Waiting for CI")
+### Scenario E — CI Pending / Slow Checks
 
-This is the scenario the CI-wait feature exists for.
+This verifies that the AI review does not wait for CI.
 
 1. Temporarily add a delay to the `unit-tests` job in `.github/workflows/ci.yml` (e.g. `- run: sleep 90` before the pytest step), push it on its own branch, and open a PR.
-2. Watch the PR immediately after opening it: SecurePR should post the **"⏳ Waiting for CI"** comment, naming the actual GitHub-reported pending jobs — and should **not** post any approve/block verdict yet.
-3. Once the delayed job finishes and the stabilization window passes, the `check_run`/`check_suite` webhook path should trigger a second comment with the final decision and the completed CI results.
-4. In the **Evidence & Replay** tab for this PR, you should see exactly two review rows: "Waiting for CI" followed by the final one — confirming no duplicate placeholder comments were posted while waiting.
-5. Optional — to see the **timeout fallback** instead of the fast path: set `CI_WAIT_TIMEOUT_SECONDS=30` in `.env` before starting the backend, and make a check run take longer than that. SecurePR should finalize as **Manual Review Required** with a reason stating it timed out waiting for CI, rather than silently approving.
+2. The AI review should publish while that job remains in progress; SecurePR should not post a placeholder or wait for the job.
+3. Confirm the review says CI is in progress and that monitoring continues. The dashboard should show AI review completed and CI in progress.
+4. When the delayed job finishes, its webhook should update CI state and the dashboard without rerunning the AI analysis or duplicating the review.
+5. Also test a PR with no CI workflow and one where check discovery returns an API error. The AI review should still publish; the dashboard must show no checks discovered or unavailable, never CI passed.
 
 ### Scenario F — Circuit Breaker
 
@@ -137,7 +137,7 @@ For at least one PR from the scenarios above, open the actual comment on GitHub 
 
 Enable `AUTO_MERGE_ENABLED=true`, restart the backend, and set `is_auto_merge_enabled=1` for only the test repository as documented in the setup guide.
 
-- A: low risk + passed CI: expect Waiting for CI, Approved, then Approved & Automatically Merged.
+- A: low risk + passed CI: expect Approved, then Approved & Automatically Merged.
 - B: disable the global or repository flag: expect Approved but no merge.
 - C: medium risk: expect Manual Review and no merge.
 - D: high/critical finding: expect Blocked and no merge.
@@ -151,8 +151,8 @@ Run automated tests with `cd backend; venv\Scripts\python -m pytest`.
 - [ ] Backend and frontend both start without errors.
 - [ ] Dashboard successfully calls the backend (no CORS/API-error toasts).
 - [ ] A real GitHub webhook reaches the backend and is processed.
-- [ ] SecurePR correctly waits for mandatory CI checks before deciding (Scenario E), and never silently approves on a timeout.
-- [ ] The final SecurePR comment uses the completed CI results, not a snapshot taken before CI finished.
+- [ ] A slow or absent CI result never prevents the AI review from publishing (Scenario E).
+- [ ] CI transitions update separately and never turn missing, unknown, or failed CI into a passed result.
 - [ ] Circuit Breaker trip/resume visibly changes PR decisions without disabling analysis or comments.
 - [ ] Every dashboard page can be used end-to-end via dropdowns and clicks, with no Repository/PR/Review ID typed anywhere.
 - [ ] No console errors in the browser dev tools while navigating all seven dashboard tabs.

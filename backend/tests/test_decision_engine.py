@@ -6,7 +6,7 @@ def _base_input(**overrides):
     defaults = dict(
         overall_score=10, risk_category="LOW", findings=[], policy_violations=[], policy_warnings=[],
         requires_human_review_by_policy=False, circuit_breaker_tripped=False, circuit_breaker_reason=None,
-        author_eligible=True, author_risk_threshold=39, analysis_complete=True, mandatory_checks_pending=[],
+        author_eligible=True, author_risk_threshold=39, analysis_complete=True,
     )
     defaults.update(overrides)
     return DecisionInput(**defaults)
@@ -52,26 +52,16 @@ def test_eligibility_cannot_override_critical_finding():
     assert d.status == DecisionStatus.BLOCKED
 
 
-def test_waits_for_ci_when_mandatory_checks_still_running():
-    d = decide(_base_input(mandatory_checks_pending=["unit-tests", "lint"]))
-    assert d.status == DecisionStatus.WAITING_FOR_CI
-    assert "unit-tests" in d.reasons[0]
-
-
-def test_critical_finding_blocks_without_waiting_for_ci():
-    """A confirmed secret/destructive-SQL finding should block immediately --
-    there's no reason to keep a contributor waiting on CI for that."""
-    d = decide(_base_input(findings=[{"severity": "CRITICAL"}], mandatory_checks_pending=["unit-tests"]))
+def test_critical_finding_blocks_independently_of_ci():
+    d = decide(_base_input(findings=[{"severity": "CRITICAL"}]))
     assert d.status == DecisionStatus.BLOCKED
 
 
-def test_failed_mandatory_check_blocks_even_if_others_still_pending():
-    d = decide(_base_input(policy_violations=["Mandatory CI checks failed: unit-tests"],
-                            mandatory_checks_pending=["lint"]))
+def test_confirmed_ci_failure_can_block_through_policy_violation():
+    d = decide(_base_input(policy_violations=["A discovered CI execution failed."]))
     assert d.status == DecisionStatus.BLOCKED
 
 
-def test_waiting_for_ci_takes_priority_over_circuit_breaker_and_eligibility():
-    d = decide(_base_input(mandatory_checks_pending=["build"], circuit_breaker_tripped=True,
-                            author_eligible=False))
-    assert d.status == DecisionStatus.WAITING_FOR_CI
+def test_pending_ci_does_not_change_review_decision():
+    d = decide(_base_input(circuit_breaker_tripped=True, author_eligible=False))
+    assert d.status == DecisionStatus.MANUAL_REVIEW

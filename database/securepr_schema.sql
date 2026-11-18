@@ -420,5 +420,70 @@ BEGIN
 END
 GO
 
+/* ----------------------------------------------- independent review and CI */
+IF OBJECT_ID('dbo.background_jobs', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.background_jobs (
+        id                 UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_jobs_id DEFAULT NEWID() PRIMARY KEY,
+        job_type           NVARCHAR(32) NOT NULL,
+        idempotency_key    NVARCHAR(512) NOT NULL,
+        payload            NVARCHAR(MAX) NOT NULL,
+        state              NVARCHAR(16) NOT NULL CONSTRAINT DF_jobs_state DEFAULT 'QUEUED',
+        attempts           INT NOT NULL CONSTRAINT DF_jobs_attempts DEFAULT 0,
+        available_at       DATETIME2 NOT NULL CONSTRAINT DF_jobs_available DEFAULT SYSUTCDATETIME(),
+        lease_until        DATETIME2 NULL,
+        last_error         NVARCHAR(MAX) NULL,
+        created_at         DATETIME2 NOT NULL CONSTRAINT DF_jobs_created DEFAULT SYSUTCDATETIME(),
+        updated_at         DATETIME2 NOT NULL CONSTRAINT DF_jobs_updated DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT UQ_background_jobs_idempotency UNIQUE (idempotency_key),
+        CONSTRAINT CK_background_jobs_payload CHECK (ISJSON(payload) = 1)
+    );
+    CREATE INDEX IX_background_jobs_dispatch
+        ON dbo.background_jobs(job_type, state, available_at);
+END
+GO
+
+IF OBJECT_ID('dbo.ci_revisions', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.ci_revisions (
+        id                 UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_ci_revisions_id DEFAULT NEWID() PRIMARY KEY,
+        repository_id      UNIQUEIDENTIFIER NOT NULL,
+        pull_request_id    UNIQUEIDENTIFIER NOT NULL,
+        head_sha           NVARCHAR(64) NOT NULL,
+        state              NVARCHAR(24) NOT NULL CONSTRAINT DF_ci_revisions_state DEFAULT 'UNKNOWN',
+        error              NVARCHAR(MAX) NULL,
+        retry_count        INT NOT NULL CONSTRAINT DF_ci_revisions_retry DEFAULT 0,
+        poll_count         INT NOT NULL CONSTRAINT DF_ci_revisions_poll DEFAULT 0,
+        updated_at         DATETIME2 NOT NULL CONSTRAINT DF_ci_revisions_updated DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT UQ_ci_revision UNIQUE (repository_id, pull_request_id, head_sha),
+        CONSTRAINT FK_ci_revision_repository FOREIGN KEY (repository_id) REFERENCES dbo.repositories(id),
+        CONSTRAINT FK_ci_revision_pull_request FOREIGN KEY (pull_request_id) REFERENCES dbo.pull_requests(id)
+    );
+    CREATE INDEX IX_ci_revision_pr_sha ON dbo.ci_revisions(pull_request_id, head_sha);
+END
+GO
+
+IF OBJECT_ID('dbo.ci_executions', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.ci_executions (
+        id                 UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_ci_executions_id DEFAULT NEWID() PRIMARY KEY,
+        ci_revision_id     UNIQUEIDENTIFIER NOT NULL,
+        identity           NVARCHAR(255) NOT NULL,
+        kind               NVARCHAR(24) NOT NULL,
+        provider           NVARCHAR(255) NULL,
+        context            NVARCHAR(512) NULL,
+        name               NVARCHAR(512) NULL,
+        status             NVARCHAR(32) NULL,
+        conclusion         NVARCHAR(32) NULL,
+        external_url       NVARCHAR(2048) NULL,
+        head_sha           NVARCHAR(64) NOT NULL,
+        updated_at         DATETIME2 NOT NULL CONSTRAINT DF_ci_executions_updated DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT UQ_ci_execution_identity UNIQUE (ci_revision_id, kind, identity),
+        CONSTRAINT FK_ci_execution_revision FOREIGN KEY (ci_revision_id) REFERENCES dbo.ci_revisions(id)
+    );
+    CREATE INDEX IX_ci_execution_revision ON dbo.ci_executions(ci_revision_id);
+END
+GO
+
 PRINT 'SecurePR schema verified/created successfully.';
 GO

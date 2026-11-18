@@ -85,7 +85,7 @@ Set the connection string in `backend/.env` using the database password from the
 DATABASE_URL=postgresql://postgres:[PASSWORD]@db.haxqjifflpwzxowevzvz.supabase.co:5432/postgres?sslmode=require
 ```
 
-URL-encode special characters in the password. `sslmode=require` enables TLS for the Supabase connection. On first startup, SQLAlchemy creates missing tables, constraints, and indexes from `backend/app/models/models.py`. The versioned reference schema is also available as `database/postgresql/001_initial_schema.sql` for Supabase SQL Editor. It is safe to rerun and does not drop data; it does not alter columns in tables that already exist. For later schema changes, add a new numbered migration and update the ORM models. The existing `database/securepr_schema.sql` remains the SQL Server fallback and must not be run against PostgreSQL.
+URL-encode special characters in the password. `sslmode=require` enables TLS for the Supabase connection. On first startup, SQLAlchemy creates missing tables, constraints, and indexes from `backend/app/models/models.py`. For existing PostgreSQL databases, apply `database/postgresql/002_independent_ci_monitoring.sql` before deploying the independent workers; it creates durable job, CI revision, and CI execution tables without dropping data. The reference schema `database/postgresql/001_initial_schema.sql` also includes those tables for new installations. The existing `database/securepr_schema.sql` remains the SQL Server fallback and must not be run against PostgreSQL.
 
 The app does not copy existing SQL Server rows automatically. Before migrating any local data, ensure the source SQL Server is available and take a backup; the current local database was not reachable during this setup.
 
@@ -125,9 +125,8 @@ service-role key formats and requires HTTPS origins.
    - Metadata: **Read-only** (mandatory)
    - Do not grant any broader permissions than those listed. Contents write is used only by SecurePR's guarded merge flow; branch protection is never bypassed.
 7. **Subscribe to events:** `Pull request`, `Check run`, `Check suite`, and `Commit status`.
-   The last two are what let SecurePR notice the moment your CI finishes and finalize
-   its CI discovery promptly, instead of waiting for the next poll; final
-   review still waits for the configured stabilization window.
+   CI events update the separate background monitor; the AI review is published
+   independently and never waits for these events.
 8. **Where can this GitHub App be installed:** "Only on this account" is fine for testing.
 9. Click **Create GitHub App**. Note the **App ID** shown at the top → put it in `GITHUB_APP_ID`.
 10. Scroll down → **Generate a private key** → a `.pem` file downloads. For local development, create a `backend/secrets/` folder, store the key there, and set `GITHUB_PRIVATE_KEY_PATH=./secrets/github-app-private-key.pem`. For Render, enter the PEM contents in the backend-only `GITHUB_PRIVATE_KEY` secret setting. Literal `\n` sequences are also normalized by the backend. Do not commit the key or put it in `GITHUB_PRIVATE_KEY_PATH` as a public URL.
@@ -146,67 +145,69 @@ service-role key formats and requires HTTPS origins.
    since AI scoring is only one input into the deterministic decision engine,
    never a requirement for it to run.
 
-## 9. Dynamic GitHub CI discovery and stabilization
+## 9. Independent AI review and GitHub CI monitoring
 
-The default policy does not require names such as `build`, `unit-tests`, or
-`lint`. For each revision SecurePR refreshes the PR head SHA, retrieves Check
-Runs, legacy commit statuses, and Check Suites for that exact SHA, then
-persists each check's identity, provider, name, status, conclusion, URL, and
-SHA as review evidence.
+The PR webhook validates and stores the current head SHA, then enqueues two
+independent database-backed jobs: an AI review and an initial CI refresh. The
+review worker fetches the PR changes, analyzes risk, applies review policy,
+and publishes as soon as the analysis is complete. It never waits for CI
+discovery or completion. A queued or in-progress check, no configured CI, an
+unfamiliar check name, and a GitHub CI API error cannot hold the AI review.
+The dashboard reports AI review lifecycle separately from CI state.
 
-1. Pending/queued checks keep the PR in **CI running**. SecurePR listens to
-   every `check_run`, `check_suite`, and `status` transition, including
-   non-terminal events, and re-fetches authoritative state.
-2. Once discovered results become terminal, SecurePR waits for
-   `CI_DISCOVERY_STABILIZATION_SECONDS` (default 30s) without new or changed
-   checks before normal finalization. A late check resets the window. Webhook
-   and polling paths use the same evaluator.
-3. If no checks or suites are discovered after stabilization, SecurePR records
-   `NO_CI_CONFIGURED`; if suites exist but no check runs or statuses appear,
-   it records `NO_CHECKS_FOUND`. Neither state is reported as successful CI;
-   the review is routed to manual review.
-4. GitHub API failures stay unavailable/error and are retried. The bounded
-   poller checks every `CI_WAIT_POLL_INTERVAL_SECONDS` (default 20s) until
-   `CI_WAIT_TIMEOUT_SECONDS` (default 900s / 15 minutes), then records
-   `TIMEOUT` and routes to manual review. All three values are configurable in
-   the backend environment.
-5. Explicit `mandatory_ci_checks` in a repository-specific policy remain a
-   separate policy gate. Missing required checks are never treated as passed.
+CI discovery is associated with the exact repository, PR, and head SHA.
+SecurePR reads actual Check Runs, Check Suites, and legacy commit statuses;
+it stores provider, name/context, status, conclusion, URL, and SHA for each
+record. Check suites alone do not count as active check executions.
+`check_run`, `check_suite`, and `status` webhooks enqueue idempotent CI refresh
+jobs. Polling is only a bounded fallback when actual executions remain in
+progress.
 
-All review creation and publication for one repository/PR is serialized with
-a PostgreSQL session advisory lock (or a SQL Server application lock when
-using the fallback), held across database commits and GitHub publication. The
-reviews table's unique revision/phase constraint is
-an additional database guard. Duplicate webhook deliveries and concurrent
-polls therefore reuse the existing waiting/final review rather than posting
-again. CI lifecycle logs include the event type, repository, PR number, event
-SHA, current-revision match, finalization trigger, and an ignore reason when
-the event does not match an open PR's current head.
+| CI state | Meaning |
+|---|---|
+| `UNKNOWN` | Initial discovery has not completed or returned an unrecognized result. |
+| `UNAVAILABLE` | Discovery API failed; the error is preserved and bounded retries continue. |
+| `NOT_CONFIGURED` | Successful discovery found no check runs or commit statuses. This is not a pass. |
+| `IN_PROGRESS` | At least one real execution is queued or running; the AI review can already be published. |
+| `PASSED` | Every discovered execution passed. |
+| `FAILED` | A discovered execution ended with failure, error, timeout, startup failure, or action required. |
+| `NON_SUCCESS` | All checks are terminal, but one or more were cancelled, neutral, skipped, or stale. This is not a pass. |
 
-This means a webhook delivery for `check_suite`/`check_run`/`status` must reach your
-backend the same way the `pull_request` webhook does (step 7, same `ngrok`
-tunnel). If you only subscribed to `Pull request` events on an existing
-GitHub App, edit the App's webhook event subscriptions to add `Check run`,
-`Check suite`, and `Commit status`, then reinstall/update permissions if
-GitHub asks you to.
+CI API discovery has a 10-second aggregate deadline. Failures are retried
+asynchronously with bounded exponential backoff; background polling is
+limited by `CI_FALLBACK_MAX_POLLS`. `REVIEW_RESULT_DEADLINE_SECONDS` defaults
+to 180 seconds and is used as the operational review target, not as a wait for
+CI. If analysis is still executing, the persistent review job remains
+`PROCESSING`; CI state remains separately visible.
 
-The optional waiting comment is controlled by `POST_CI_WAITING_COMMENT`
-(default `true`). `CI_DISCOVERY_STABILIZATION_SECONDS` controls the quiet
-window after the last discovered/changed result. `CI_WAIT_POLL_INTERVAL_SECONDS`
-and `CI_WAIT_TIMEOUT_SECONDS` configure the fallback monitor; they do not
-replace checking GitHub's actual terminal CI results.
+The default policy has no named mandatory-check list or aliases.
+`block_on_ci_failure` controls whether a genuine failure already discovered
+at analysis time blocks the review. A later failure updates the CI state and
+posts a separate failure notification with a link to the actual execution;
+it never reruns or duplicates the AI review. Missing, unknown, and unavailable
+CI are not treated as either pass or failure.
+
+Database-backed jobs survive backend process restarts. Apply
+`database/postgresql/002_independent_ci_monitoring.sql` before deploying to an
+existing PostgreSQL database. The SQL Server fallback schema is safe to rerun
+and creates the same new tables. Configure `GITHUB_WEBHOOK_SECRET` and
+subscribe the GitHub App to `Pull request`, `Check run`, `Check suite`, and
+`Commit status` events. Webhook delivery IDs and revision-specific database
+keys make duplicate events idempotent. Review publication includes a
+revision-specific marker and rechecks GitHub before posting so a worker retry
+after a crash does not duplicate the review.
 
 ## 10. Safe auto-merge
 
-Auto-merge is off by default and runs only after the existing final analysis produces `APPROVED`; the CI-wait placeholder never merges anything.
+Auto-merge is off by default and runs only after the AI analysis produces `APPROVED`.
 
 The repository policy's `auto_merge_allowed_risk_categories` defaults to
 `["LOW"]`; MEDIUM/HIGH categories require explicit inclusion in that
 repository's policy. `AUTO_MERGE_LOW_RISK_ONLY=true` remains a global cap
-that a repository policy cannot override. All discovered CI checks must be
-available, terminal, and non-failing before auto-merge; no-check and API-error
-states are not mergeable. Explicit mandatory checks remain separately
-enforced. `AUTO_MERGE_REQUIRE_ALL_CI` cannot disable these safety gates.
+that a repository policy cannot override. At least one discovered CI
+execution must exist and every discovered execution must be `PASSED` before
+auto-merge; no-check, pending, failed, non-success, unknown, and unavailable
+states fail closed. No check names or aliases are hardcoded.
 
 For local testing, set the following in `backend/.env` and restart the backend:
 
@@ -275,7 +276,9 @@ Render. For Vercel, set the project root to `frontend/dashboard`; the
 configured build creates `dist/`.
 
 Render starts the backend with `python run.py`, uses Python 3.12.4 (matching
-the repository's Python 3.12 target), and checks `/health`. Set the
+the repository's Python 3.12 target), and checks `/health`. Apply the database
+migration described in section 5 before deploying the independent workers.
+Set the
 required backend environment values in Render; its `PORT` value is consumed
 automatically. Set the following backend **public configuration**:
 
@@ -284,8 +287,9 @@ automatically. Set the following backend **public configuration**:
 - `SUPABASE_JWT_ALGORITHM`
 - `GEMINI_MODEL`, `GEMINI_FALLBACK_MODEL`, and
   `GEMINI_REQUEST_TIMEOUT_SECONDS`
-- `CI_WAIT_POLL_INTERVAL_SECONDS`, `CI_WAIT_TIMEOUT_SECONDS`,
-  `CI_DISCOVERY_STABILIZATION_SECONDS`, `POST_CI_WAITING_COMMENT`
+- `REVIEW_RESULT_DEADLINE_SECONDS`
+- `CI_API_MAX_RETRIES`, `CI_FALLBACK_MAX_POLLS`,
+  `CI_FALLBACK_POLL_INTERVAL_SECONDS`
 - `AUTO_MERGE_ENABLED`, `AUTO_MERGE_LOW_RISK_ONLY`,
   `AUTO_MERGE_REQUIRE_ALL_CI`
 - `SECUREPR_BASE_URL` — the Render HTTPS origin
@@ -334,8 +338,9 @@ processing; a sleeping instance can delay webhook responses.
 | Webhook never fires                                                   | Confirm the GitHub App's webhook URL is reachable from the internet (`ngrok` for local tests, permanent HTTPS backend URL for production), and that the App is installed on the repository.                                                                                                                                                           |
 | Gemini calls fail silently                                            | Check `GEMINI_API_KEY` is set; SecurePR falls back to heuristic-only scoring automatically and logs a warning — this is expected behavior, not a crash.                                                                                                                                                                                               |
 | GitHub review/comment doesn't post                                    | Check the App's permissions include Pull requests: Read & write, and that the installation ID stored for the repo matches an active installation.                                                                                                                                                                                                     |
-| A PR is stuck showing "Waiting for CI"                                | Confirm your GitHub App is subscribed to `Check run`/`Check suite`/`Status` events (section 7), inspect the CI lifecycle log fields (`event_type`, `repository`, `pr_number`, `head_sha`, `matched_current_revision`, `ignore_reason`), and check GitHub API availability. Polling is a fallback; the 15-minute timeout is the final manual-review path. |
-| A configured mandatory check is still pending                         | Confirm the check name or explicit `ci_check_aliases` in the repository policy, then verify GitHub reports that check on the current PR head SHA. Missing mandatory checks are never treated as successful.                                                                                                                                       |
+| AI review remains queued or processing                                 | Check the `background_jobs` row for the revision, `last_error`, attempt count, and worker logs. The CI monitor is a separate job and cannot block this review.                                                                                                         |
+| CI state is unavailable                                                | Check the stored `ci_revisions.error`, GitHub App Check/Status permissions, rate-limit responses, and webhook delivery history. Bounded retries continue independently of the AI review.                                                                                |
+| CI state remains unknown                                               | Verify the CI refresh job is queued and that its repository, PR number, and head SHA match the current revision. An unknown or empty result is never displayed as passed.                                                                                                  |
 | Dashboard page asks you to type an ID                                 | Shouldn't happen — every page loads its own dropdown data from the backend. Check the browser console and backend log for the underlying failed request.                                                                                                                                                                                              |
 | Dashboard shows "API error" toasts on every page                      | Usually CORS or a wrong API base URL — confirm the sidebar's "API base URL" field matches where `uvicorn` is running, and that `DASHBOARD_ORIGIN` in `.env` matches where you're serving the dashboard from.                                                                                                                                          |
 | Port `8000` or `5173` already in use                                  | Start on another port, e.g. `uvicorn app.main:app --reload --port 8001` (update the dashboard's API base URL field to match), or `python -m http.server 5174`.                                                                                                                                                                                        |
