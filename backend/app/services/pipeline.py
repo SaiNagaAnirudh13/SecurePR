@@ -181,6 +181,51 @@ def _ci_records(db: Session, revision: m.CIRevision) -> list[dict]:
     ]
 
 
+def _publication(
+    db: Session,
+    repo: m.Repository,
+    pr: m.PullRequest,
+    head_sha: str,
+    message_type: str,
+    marker: str,
+) -> m.ReviewPublication:
+    record = db.query(m.ReviewPublication).filter(
+        m.ReviewPublication.repository_id == repo.id,
+        m.ReviewPublication.pull_request_id == pr.id,
+        m.ReviewPublication.head_sha == head_sha,
+        m.ReviewPublication.message_type == message_type,
+    ).first()
+    if record:
+        return record
+    record = m.ReviewPublication(
+        repository_id=repo.id,
+        pull_request_id=pr.id,
+        head_sha=head_sha,
+        message_type=message_type,
+        state="PENDING",
+        marker=marker,
+    )
+    db.add(record)
+    db.flush()
+    return record
+
+
+def _mark_publication_published(
+    db: Session,
+    record: m.ReviewPublication,
+    result: dict,
+) -> None:
+    if not result.get("succeeded", False):
+        return
+    payload = result.get("payload")
+    github_id = None
+    if isinstance(payload, dict):
+        github_id = payload.get("id")
+    record.state = "PUBLISHED"
+    record.github_message_id = str(github_id) if github_id is not None else None
+    record.published_at = datetime.utcnow()
+
+
 def _queue_review_status_update(
     db: Session, repo: m.Repository, pr: m.PullRequest, head_sha: str
 ) -> None:
@@ -239,35 +284,8 @@ def _queue_late_ci_failures(
 def _queue_ci_notifications(
     db: Session, repo: m.Repository, pr: m.PullRequest, revision: m.CIRevision
 ) -> None:
-    published_review = db.query(m.Review).filter(
-        m.Review.pull_request_id == pr.id,
-        m.Review.head_sha == revision.head_sha,
-        m.Review.is_ci_wait_placeholder == False,  # noqa: E712
-        m.Review.github_action_confirmed == True,  # noqa: E712
-    ).first()
-    if not published_review:
-        return
-    for record in _ci_records(db, revision):
-        if (
-            record["kind"] != "check_suite"
-            and ci_status.classify_execution(
-                record.get("status"), record.get("conclusion")
-            ) == "failed"
-        ):
-            identity = record.get("identity") or record.get("name") or "unknown"
-            enqueue_job(
-                db,
-                "CI_NOTIFY",
-                f"ci-failure:{revision.id}:{identity}",
-                {
-                    "repository_id": repo.id,
-                    "pull_request_id": pr.id,
-                    "head_sha": revision.head_sha,
-                    "ci_revision_id": revision.id,
-                    "identity": identity,
-                },
-            )
-    db.commit()
+    """CI failure details are included in the authoritative review, not extra comments."""
+    return
 
 
 def _publish_existing_review(
@@ -289,6 +307,11 @@ def _publish_existing_review(
 
     marker = f"<!-- securepr-review:{pr.id}:{review.head_sha} -->"
     owner, repo_name = repo.full_name.split("/", 1)
+    publication = _publication(
+        db, repo, pr, review.head_sha, "FINAL", marker
+    )
+    if publication.state == "PUBLISHED":
+        return
     try:
         result = github_client.post_review(
             installation_id, owner, repo_name, pr.github_pr_number,
@@ -304,6 +327,7 @@ def _publish_existing_review(
             succeeded=result.get("succeeded", False),
         ))
         review.github_action_confirmed = result.get("succeeded", False)
+        _mark_publication_published(db, publication, result)
         db.commit()
         if not review.github_action_confirmed:
             raise RuntimeError(
@@ -655,6 +679,9 @@ def _run_analysis_locked(
     marker = f"<!-- securepr-review:{pr.id}:{review.head_sha} -->"
     body = f"{body}\n\n{marker}"
     review.github_review_state = github_event
+    final_publication = _publication(
+        db, repo, pr, review.head_sha, "FINAL", marker
+    )
     db.add(m.Evidence(
         review_id=review.id,
         evidence_type="github_review_body",
@@ -663,35 +690,40 @@ def _run_analysis_locked(
     ))
     db.commit()
     db.refresh(review)
-    try:
-        result = github_client.post_review(
-            installation_id, owner, repo_name, pr.github_pr_number, body, github_event,
-            idempotency_marker=marker,
-        )
-        db.add(m.GithubAction(
-            review_id=review.id, action_type="submit_review",
-            request_payload={"event": github_event},
-            response_status=result.get("status_code"),
-            response_payload=result.get("payload")
-            if isinstance(result.get("payload"), dict) else None,
-            succeeded=result.get("succeeded", False),
-        ))
-        review.github_action_confirmed = result.get("succeeded", False)
-        review.github_review_state = github_event
+    if final_publication.state == "PUBLISHED":
+        review.github_action_confirmed = True
         db.commit()
-        if not review.github_action_confirmed:
-            raise RuntimeError(
-                f"GitHub rejected review publication for review {review.id}."
+    else:
+        try:
+            result = github_client.post_review(
+                installation_id, owner, repo_name, pr.github_pr_number, body, github_event,
+                idempotency_marker=marker,
             )
-        if review.github_action_confirmed:
-            _queue_late_ci_failures(db, repo, pr, review)
-    except Exception:
-        logger.exception("Failed to publish AI review: review_id=%s", review.id)
-        db.add(m.GithubAction(
-            review_id=review.id, action_type="submit_review", succeeded=False
-        ))
-        db.commit()
-        raise
+            db.add(m.GithubAction(
+                review_id=review.id, action_type="submit_review",
+                request_payload={"event": github_event},
+                response_status=result.get("status_code"),
+                response_payload=result.get("payload")
+                if isinstance(result.get("payload"), dict) else None,
+                succeeded=result.get("succeeded", False),
+            ))
+            review.github_action_confirmed = result.get("succeeded", False)
+            review.github_review_state = github_event
+            _mark_publication_published(db, final_publication, result)
+            db.commit()
+            if not review.github_action_confirmed:
+                raise RuntimeError(
+                    f"GitHub rejected review publication for review {review.id}."
+                )
+            if review.github_action_confirmed:
+                _queue_late_ci_failures(db, repo, pr, review)
+        except Exception:
+            logger.exception("Failed to publish AI review: review_id=%s", review.id)
+            db.add(m.GithubAction(
+                review_id=review.id, action_type="submit_review", succeeded=False
+            ))
+            db.commit()
+            raise
 
     if decision.status == m.DecisionStatus.APPROVED:
         merge_result = auto_merge.attempt(
@@ -734,20 +766,48 @@ def _run_analysis_locked(
         except Exception:
             logger.exception("Failed to post auto-merge outcome: review_id=%s", review.id)
 
-    try:
-        github_client.notify_owner(
-            installation_id, owner, repo_name, pr.github_pr_number,
-            f"SecurePR review complete for PR #{pr.github_pr_number}: **{decision.status.value}** "
-            f"(risk {assessment.overall_score}/100, {assessment.category}).",
+    completion_marker = f"<!-- securepr-complete:{pr.id}:{review.head_sha} -->"
+    completion_publication = _publication(
+        db, repo, pr, review.head_sha, "COMPLETION", completion_marker
+    )
+    if completion_publication.state != "PUBLISHED":
+        completion_message = (
+            f"### SecurePR Review Complete\n\n"
+            f"SecurePR review complete for PR #{pr.github_pr_number}: "
+            f"**{decision.status.value}** "
+            f"(risk {assessment.overall_score}/100, {assessment.category}). "
+            f"[View detailed review]({settings.DASHBOARD_ORIGIN}/#/pr/{pr.id}) "
+            f"\n\n{completion_marker}"
         )
-        db.add(m.Notification(
-            review_id=review.id, recipient=owner, channel="github",
-            subject=f"PR #{pr.github_pr_number} {decision.status.value}",
-            body=body[:2000], delivered=True,
-        ))
-        db.commit()
-    except Exception:
-        logger.exception("Failed to notify repository owner: review_id=%s", review.id)
+        try:
+            result = github_client.post_issue_comment(
+                installation_id, owner, repo_name, pr.github_pr_number,
+                completion_message,
+                idempotency_marker=completion_marker,
+            )
+            db.add(m.GithubAction(
+                review_id=review.id, action_type="post_completion_notification",
+                request_payload={"marker": completion_marker},
+                response_status=result.get("status_code"),
+                response_payload=result.get("payload")
+                if isinstance(result.get("payload"), dict) else None,
+                succeeded=result.get("succeeded", False),
+            ))
+            _mark_publication_published(db, completion_publication, result)
+            db.add(m.Notification(
+                review_id=review.id, recipient=owner, channel="github",
+                subject=f"PR #{pr.github_pr_number} {decision.status.value}",
+                body=completion_message,
+                delivered=result.get("succeeded", False),
+            ))
+            db.commit()
+            if not result.get("succeeded", False):
+                raise RuntimeError(
+                    f"GitHub rejected completion notification for review {review.id}."
+                )
+        except Exception:
+            logger.exception("Failed to notify repository owner: review_id=%s", review.id)
+            raise
 
     elapsed = time.perf_counter() - started_clock
     _queue_review_status_update(db, repo, pr, review.head_sha)
@@ -1026,6 +1086,9 @@ def _publish_review_status_comment(
         marker=marker,
     )
     owner, repo_name = repo.full_name.split("/", 1)
+    waiting_publication = _publication(
+        db, repo, pr, payload["head_sha"], "WAITING", marker
+    )
     result = github_client.post_issue_comment(
         payload["installation_id"],
         owner,
@@ -1034,6 +1097,7 @@ def _publish_review_status_comment(
         body,
         idempotency_marker=marker,
     )
+    _mark_publication_published(db, waiting_publication, result)
     db.add(m.GithubAction(
         review_id=review.id if review else None,
         action_type="update_review_status_comment",
@@ -1051,11 +1115,8 @@ def _publish_review_status_comment(
 
 
 def process_ci_notification_job(db: Session, payload: dict) -> None:
-    pr = db.query(m.PullRequest).filter(m.PullRequest.id == payload["pull_request_id"]).first()
-    repo = db.query(m.Repository).filter(m.Repository.id == payload["repository_id"]).first()
-    revision = db.query(m.CIRevision).filter(m.CIRevision.id == payload["ci_revision_id"]).first()
-    if not pr or not repo or not revision or pr.head_sha != payload["head_sha"]:
-        return
+    # Kept as a compatibility no-op: CI failure updates are not separate bot messages.
+    return
     execution = db.query(m.CIExecution).filter(
         m.CIExecution.ci_revision_id == revision.id,
         m.CIExecution.identity == payload["identity"],

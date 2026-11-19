@@ -461,12 +461,27 @@ class GitHubClient:
             payload = {"message": resp.text}
         return {"succeeded": resp.ok, "status_code": resp.status_code, "payload": payload}
 
-    def notify_owner(self, installation_id: str, owner: str, repo: str, pr_number: int, message: str) -> dict:
+    def notify_owner(
+        self,
+        installation_id: str,
+        owner: str,
+        repo: str,
+        pr_number: int,
+        message: str,
+        *,
+        idempotency_marker: str | None = None,
+    ) -> dict:
         """Lightweight notification via an issue comment mentioning the owner."""
+        body = f"@{owner} {message}"
+        if idempotency_marker:
+            return self.post_issue_comment(
+                installation_id, owner, repo, pr_number, body,
+                idempotency_marker=idempotency_marker,
+            )
         headers = self._headers(installation_id)
         resp = requests.post(
             f"{GITHUB_API}/repos/{owner}/{repo}/issues/{pr_number}/comments",
-            headers=headers, json={"body": f"@{owner} {message}"}, timeout=20,
+            headers=headers, json={"body": body}, timeout=20,
         )
         return {"succeeded": resp.ok, "status_code": resp.status_code}
 

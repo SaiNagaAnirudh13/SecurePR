@@ -387,6 +387,29 @@ BEGIN
 END
 GO
 
+/* -------------------------------------------------- review_publications */
+IF OBJECT_ID('dbo.review_publications', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.review_publications (
+        id                 UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_rpub_id DEFAULT NEWID() PRIMARY KEY,
+        repository_id      UNIQUEIDENTIFIER NOT NULL,
+        pull_request_id    UNIQUEIDENTIFIER NOT NULL,
+        head_sha           NVARCHAR(64) NOT NULL,
+        message_type       NVARCHAR(32) NOT NULL,
+        state              NVARCHAR(16) NOT NULL CONSTRAINT DF_rpub_state DEFAULT 'PENDING',
+        github_message_id  NVARCHAR(64) NULL,
+        marker             NVARCHAR(255) NULL,
+        published_at       DATETIME2 NULL,
+        created_at         DATETIME2 NOT NULL CONSTRAINT DF_rpub_created DEFAULT SYSUTCDATETIME(),
+        updated_at         DATETIME2 NOT NULL CONSTRAINT DF_rpub_updated DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT UQ_rpub_revision_type UNIQUE (repository_id, pull_request_id, head_sha, message_type),
+        CONSTRAINT FK_rpub_repository FOREIGN KEY (repository_id) REFERENCES dbo.repositories(id),
+        CONSTRAINT FK_rpub_pull_request FOREIGN KEY (pull_request_id) REFERENCES dbo.pull_requests(id)
+    );
+    CREATE INDEX IX_review_publications_pr_sha ON dbo.review_publications(pull_request_id, head_sha);
+END
+GO
+
 /* ------------------------------------------------------------ notifications */
 IF OBJECT_ID('dbo.notifications', 'U') IS NULL
 BEGIN

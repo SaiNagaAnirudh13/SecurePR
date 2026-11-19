@@ -49,15 +49,15 @@ def test_waiting_status_comment_announces_analysis_and_only_lists_discovered_che
 
     assert "SecurePR Review — Waiting for CI" in body
     assert "SecurePR has received PR #7" in body
-    assert "AI review processing has started." in body
+    assert "AI analysis and CI verification are being processed." in body
     assert "build" in body
     assert "GitHub Actions" in body
     assert "Vercel" not in body
     assert "CI checks are being monitored" in body
-    assert "update this comment as CI results become available" in body
+    assert "Final results will be published" in body
 
 
-def test_terminal_status_comment_includes_risk_findings_ci_and_merge_status():
+def test_terminal_status_comment_remains_waiting_and_does_not_repeat_final_report():
     review = SimpleNamespace(
         analysis_completed_at=datetime.utcnow(),
         decision=SimpleNamespace(value="MANUAL_REVIEW"),
@@ -95,17 +95,11 @@ def test_terminal_status_comment_includes_risk_findings_ci_and_merge_status():
         marker="<!-- securepr-status:pr:abc123 -->",
     )
 
-    assert "SecurePR Review — Final Results" in body
-    assert "68.5/100" in body
-    assert "Data security | `70/100`" in body
-    assert "HIGH: Unsafe operation" in body
-    assert "`src/app.py 42`" in body
-    assert "| Passed | 1 |" in body
-    assert "| Failed | 1 |" in body
-    assert "| Skipped | 1 |" in body
-    assert "A human reviewer is required." in body
-    assert "COMMENT" in body
-    assert "DISABLED_GLOBAL" in body
+    assert "SecurePR Review — Waiting for CI" in body
+    assert "Final results will be published" in body
+    assert "68.5/100" not in body
+    assert "Unsafe operation" not in body
+    assert "**CI status:** Failed" in body
     assert "Vercel" not in body
 
 
@@ -137,5 +131,4 @@ def test_unavailable_ci_is_reported_as_unavailable_not_passed():
     )
 
     assert "CI discovery error" in body
-    assert "| Discovery unavailable | Yes |" in body
-    assert "| Passed | 0 |" in body
+    assert "retry and will not report CI as passing" in body

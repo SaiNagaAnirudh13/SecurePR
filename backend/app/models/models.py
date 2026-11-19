@@ -417,6 +417,33 @@ class GithubAction(Base):
     __table_args__ = (Index("ix_github_actions_review", "review_id"),)
 
 
+class ReviewPublication(Base):
+    """Durable, revision-scoped idempotency record for visible GitHub messages."""
+    __tablename__ = "review_publications"
+    id = Column(String(36), primary_key=True, default=gen_uuid)
+    repository_id = Column(String(36), ForeignKey("repositories.id"), nullable=False)
+    pull_request_id = Column(String(36), ForeignKey("pull_requests.id"), nullable=False)
+    head_sha = Column(String(64), nullable=False)
+    message_type = Column(String(32), nullable=False)
+    state = Column(String(16), nullable=False, default="PENDING",
+                   server_default=text("'PENDING'"))
+    github_message_id = Column(String(64), nullable=True)
+    marker = Column(String(255), nullable=True)
+    published_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False,
+                         server_default=func.now())
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow,
+                        nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "repository_id", "pull_request_id", "head_sha", "message_type",
+            name="uq_review_publication_revision_type",
+        ),
+        Index("ix_review_publications_pr_sha", "pull_request_id", "head_sha"),
+    )
+
+
 class Notification(Base):
     __tablename__ = "notifications"
     id = Column(String(36), primary_key=True, default=gen_uuid)

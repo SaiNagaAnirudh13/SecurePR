@@ -66,6 +66,10 @@ def _patch_review_dependencies(monkeypatch, *, expected_head="abc123"):
 
     monkeypatch.setattr(github_module.github_client, "post_review", post_review)
     monkeypatch.setattr(
+        github_module.github_client, "post_issue_comment",
+        lambda *args, **kwargs: {"succeeded": True, "status_code": 201, "payload": {"id": 1}},
+    )
+    monkeypatch.setattr(
         github_module.github_client, "notify_owner",
         lambda *args, **kwargs: {"succeeded": True, "status_code": 200},
     )
@@ -263,13 +267,10 @@ def test_review_status_job_publishes_final_ci_and_analysis_results(
 
     assert len(published) == 1
     body = published[0][0][4]
-    assert "SecurePR Review — Final Results" in body
-    assert "64.0/100" in body
+    assert "SecurePR Review — Waiting for CI" in body
+    assert "64.0/100" not in body
     assert "**CI status:** Failed" in body
     assert "unit-tests" in body
-    assert "app/secrets.py 42" in body
-    assert "A human reviewer is required." in body
-    assert "DISABLED_GLOBAL" in body
     assert db_session.query(m.GithubAction).filter(
         m.GithubAction.action_type == "update_review_status_comment"
     ).one().succeeded is True
@@ -302,7 +303,7 @@ def test_duplicate_ci_webhook_delivery_enqueues_one_refresh_job(
     ).count()
 
 
-def test_late_ci_failure_updates_state_and_queues_separate_notification(
+def test_late_ci_failure_updates_state_without_separate_notification(
     db_session, repo_and_pr, monkeypatch
 ):
     repo, pr = repo_and_pr
@@ -333,8 +334,7 @@ def test_late_ci_failure_updates_state_and_queues_separate_notification(
         m.BackgroundJob.job_type == "CI_NOTIFY"
     ).all()
     assert revision.state == "FAILED"
-    assert len(notify_jobs) == 1
-    assert "ci-failure" in notify_jobs[0].idempotency_key
+    assert len(notify_jobs) == 0
 
 
 def test_partial_ci_api_failure_preserves_previously_discovered_executions(
