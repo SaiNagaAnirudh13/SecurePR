@@ -22,10 +22,10 @@ Supabase, and Render services were not exercised.
 
 - The complete local backend suite passes, and the dashboard production build,
   scoped Ruff/Mypy checks, and dependency audit pass.
-- Full-project Ruff and Mypy still report pre-existing baseline debt (108 Ruff
-  findings, 31 files needing formatting, and 117 Mypy errors); the stabilization
-  workflow gates fatal Ruff classes and the changed critical Mypy modules
-  rather than silently suppressing or mass-reformatting that debt.
+- Full-project Ruff and Mypy remain non-green (108 Ruff findings, 31 files
+  needing formatting, and 117 Mypy errors across 7 files). This broader
+  codebase debt was not mass-fixed as part of stabilization; the workflow gates
+  fatal Ruff classes and the changed critical Mypy modules instead.
 - The production PostgreSQL migrations were not applied to a live Supabase
   database. Local model-backed SQLite tests do not establish production
   migration correctness.
