@@ -1,4 +1,8 @@
+from datetime import datetime
+from types import SimpleNamespace
+
 from app.services.comment_formatter import format_comment
+from app.services.comment_formatter import format_review_status_comment
 from app.services import risk_engine
 
 
@@ -24,3 +28,114 @@ def test_full_comment_renders_all_sections():
     assert "AI review published; CI monitoring continues" in body
     assert "Waiting for CI" not in body
     assert "Auto-merge is disabled by default" in body
+
+
+def test_waiting_status_comment_announces_analysis_and_only_lists_discovered_checks():
+    body = format_review_status_comment(
+        pr_number=7,
+        head_sha="abc123",
+        ci_state="IN_PROGRESS",
+        ci_checks=[{
+            "name": "build",
+            "provider": "GitHub Actions",
+            "status": "in_progress",
+            "conclusion": None,
+        }],
+        ci_error=None,
+        review=None,
+        findings=[],
+        marker="<!-- securepr-status:pr:abc123 -->",
+    )
+
+    assert "SecurePR Review — Waiting for CI" in body
+    assert "SecurePR has received PR #7" in body
+    assert "AI review processing has started." in body
+    assert "build" in body
+    assert "GitHub Actions" in body
+    assert "Vercel" not in body
+    assert "CI checks are being monitored" in body
+    assert "update this comment as CI results become available" in body
+
+
+def test_terminal_status_comment_includes_risk_findings_ci_and_merge_status():
+    review = SimpleNamespace(
+        analysis_completed_at=datetime.utcnow(),
+        decision=SimpleNamespace(value="MANUAL_REVIEW"),
+        overall_score=68.5,
+        risk_category="MEDIUM",
+        score_change_surface=20,
+        score_reversibility=30,
+        score_data_security=70,
+        score_operational=40,
+        score_verification=60,
+        score_policy_compliance=5,
+        github_action_confirmed=True,
+        github_review_state="COMMENT",
+        auto_merge_status="DISABLED_GLOBAL",
+        decision_reasons=["A human reviewer is required."],
+    )
+    body = format_review_status_comment(
+        pr_number=7,
+        head_sha="abc123",
+        ci_state="FAILED",
+        ci_checks=[
+            {"name": "build", "provider": "Actions", "status": "completed", "conclusion": "success"},
+            {"name": "tests", "provider": "Actions", "status": "completed", "conclusion": "failure"},
+            {"name": "docs", "provider": "Actions", "status": "completed", "conclusion": "skipped"},
+        ],
+        ci_error=None,
+        review=review,
+        findings=[{
+            "severity": "HIGH",
+            "title": "Unsafe operation",
+            "description": "Review this change.",
+            "file_path": "src/app.py",
+            "line_reference": "42",
+        }],
+        marker="<!-- securepr-status:pr:abc123 -->",
+    )
+
+    assert "SecurePR Review — Final Results" in body
+    assert "68.5/100" in body
+    assert "Data security | `70/100`" in body
+    assert "HIGH: Unsafe operation" in body
+    assert "`src/app.py 42`" in body
+    assert "| Passed | 1 |" in body
+    assert "| Failed | 1 |" in body
+    assert "| Skipped | 1 |" in body
+    assert "A human reviewer is required." in body
+    assert "COMMENT" in body
+    assert "DISABLED_GLOBAL" in body
+    assert "Vercel" not in body
+
+
+def test_unavailable_ci_is_reported_as_unavailable_not_passed():
+    body = format_review_status_comment(
+        pr_number=7,
+        head_sha="abc123",
+        ci_state="UNAVAILABLE",
+        ci_checks=[],
+        ci_error="check_runs: GitHub returned 503",
+        review=SimpleNamespace(
+            analysis_completed_at=datetime.utcnow(),
+            decision=SimpleNamespace(value="MANUAL_REVIEW"),
+            overall_score=64,
+            risk_category="MEDIUM",
+            score_change_surface=20,
+            score_reversibility=30,
+            score_data_security=70,
+            score_operational=40,
+            score_verification=60,
+            score_policy_compliance=5,
+            github_action_confirmed=False,
+            github_review_state=None,
+            auto_merge_status=None,
+            decision_reasons=["A human reviewer is required."],
+        ),
+        findings=[],
+        marker="<!-- securepr-status:pr:abc123 -->",
+    )
+
+    assert "CI discovery error" in body
+    assert "| Discovery unavailable | Yes |" in body
+    assert "| Passed | 0 |" in body

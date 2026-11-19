@@ -1,8 +1,9 @@
 import logging
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.api import dashboard, webhooks
 from app.core.config import (
@@ -61,6 +62,15 @@ def on_shutdown():
 
 @app.get("/health")
 def health():
+    try:
+        with get_engine().connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except (SQLAlchemyError, RuntimeError) as exc:
+        logger.exception("Health check failed because the database is unavailable.")
+        raise HTTPException(
+            status_code=503,
+            detail="Database is unavailable.",
+        ) from exc
     return {"status": "ok", "service": "SecurePR", "env": settings.SECUREPR_ENV}
 
 

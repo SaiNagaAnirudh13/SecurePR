@@ -409,6 +409,9 @@ def _get_or_create_pr(
             pr.head_sha,
         )
         pr.title = gh_pr.get("title", pr.title)
+        pr.author_login = gh_pr.get("user", {}).get("login", pr.author_login)
+        pr.base_branch = gh_pr.get("base", {}).get("ref", pr.base_branch)
+        pr.head_branch = gh_pr.get("head", {}).get("ref", pr.head_branch)
         pr.state = gh_pr.get("state", pr.state)
 
     db.flush()
@@ -704,6 +707,7 @@ async def github_webhook(
             "synchronize",
             "reopened",
             "ready_for_review",
+            "closed",
         )
 
         if action not in allowed_actions:
@@ -807,6 +811,16 @@ async def github_webhook(
         # ----------------------------------------------------
 
         expected_head_sha = pr.head_sha
+        if action == "closed":
+            db.commit()
+            return {
+                "status": "accepted",
+                "review_status": "UNCHANGED",
+                "ci_status": "UNCHANGED",
+                "repository_id": str(repo.id),
+                "pull_request_id": str(pr.id),
+            }
+
         logger.info(
             "PR analysis queued: event_type=%s repository=%s pr_number=%s "
             "head_sha=%s matched_current_revision=true",
@@ -836,6 +850,12 @@ async def github_webhook(
             db.add(revision)
         enqueue_job(
             db, "REVIEW", f"review:{repo.id}:{pr.id}:{expected_head_sha}",
+            {"repository_id": repo.id, "pull_request_id": pr.id,
+             "installation_id": installation_id, "head_sha": expected_head_sha},
+        )
+        enqueue_job(
+            db, "REVIEW_STATUS",
+            f"review-status-initial:{pr.id}:{expected_head_sha}",
             {"repository_id": repo.id, "pull_request_id": pr.id,
              "installation_id": installation_id, "head_sha": expected_head_sha},
         )

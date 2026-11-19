@@ -94,9 +94,15 @@ def format_comment(*, decision: str, reasons: list[str], overall_score: float, c
     if findings:
         lines.append(f"<details open>\n<summary><b>🔎 Findings ({len(findings)})</b></summary>\n")
         for f in findings[:20]:
-            sev = SEVERITY_META.get(f.get("severity"), {"emoji": "⚪", "label": f.get("severity") or "Info"})
-            loc = f" — `{f.get('file_path')}`" if f.get("file_path") else ""
-            action = RECOMMENDED_ACTION.get(f.get("dimension"))
+            sev = SEVERITY_META.get(
+                f.get("severity") or "",
+                {"emoji": "⚪", "label": f.get("severity") or "Info"},
+            )
+            location = " ".join(
+                value for value in (f.get("file_path"), f.get("line_reference")) if value
+            )
+            loc = f" — `{location}`" if location else ""
+            action = RECOMMENDED_ACTION.get(f.get("dimension") or "")
             lines.append(f"**{sev['emoji']} {sev['label']} — {f.get('title')}**{loc}")
             lines.append(f"> {f.get('description')}")
             if action:
@@ -145,6 +151,154 @@ def format_comment(*, decision: str, reasons: list[str], overall_score: float, c
     return "\n".join(lines)
 
 
+def format_review_status_comment(
+    *,
+    pr_number: int,
+    head_sha: str,
+    ci_state: str,
+    ci_checks: list[dict],
+    ci_error: str | None,
+    review,
+    findings: list[dict],
+    marker: str,
+) -> str:
+    """Render the durable progress comment, then update it with final results."""
+    analysis_complete = review is not None and review.analysis_completed_at is not None
+    final_ci_states = {"PASSED", "FAILED", "NON_SUCCESS", "NOT_CONFIGURED", "UNAVAILABLE"}
+    final = analysis_complete and ci_state in final_ci_states
+    title = "Final Results" if final else "Waiting for CI"
+    lines = [
+        f"## SecurePR Review — {title}",
+        "",
+        f"SecurePR has received PR #{pr_number} at revision `{head_sha}`.",
+    ]
+    if analysis_complete:
+        lines.extend([
+            "AI review analysis is complete; the detailed GitHub review has been published.",
+            f"- **Decision:** {review.decision.value}",
+            f"- **Overall risk:** `{review.overall_score}/100` ({review.risk_category})",
+        ])
+    else:
+        lines.append("AI review processing has started.")
+
+    lines.extend(["", f"- **CI status:** {ci_state.replace('_', ' ').title()}"])
+    if ci_error:
+        lines.append(f"- **CI discovery error:** {ci_error}")
+    if ci_checks:
+        lines.extend([
+            "",
+            "| Check | Provider | Result | Details |",
+            "|---|---|---|---|",
+        ])
+        for check in ci_checks[:100]:
+            lines.append(
+                f"| {_markdown_code(check.get('name') or check.get('context') or 'Unnamed check')} "
+                f"| {_markdown_code(check.get('provider') or 'Unknown provider')} "
+                f"| {_ci_icon(check)} "
+                f"| {_markdown_link(check.get('url') or check.get('html_url'))} |"
+            )
+        if len(ci_checks) > 100:
+            lines.append(f"\n_{len(ci_checks) - 100} additional checks are summarized in the counts above._")
+    elif ci_state == "NOT_CONFIGURED":
+        lines.append("No executable checks were discovered for this revision.")
+    elif ci_state in {"UNKNOWN", "UNAVAILABLE"}:
+        lines.append("Executable CI checks have not been confirmed yet.")
+
+    if final:
+        lines.extend([
+            "",
+            "| CI result | Count |",
+            "|---|---:|",
+        ])
+        counts = {
+            "Passed": sum(
+                check.get("status") == "completed" and check.get("conclusion") == "success"
+                for check in ci_checks
+            ),
+            "Failed": sum(
+                check.get("status") == "completed"
+                and check.get("conclusion") in {
+                    "failure", "error", "timed_out", "startup_failure", "action_required",
+                }
+                for check in ci_checks
+            ),
+            "Skipped": sum(
+                check.get("status") == "completed" and check.get("conclusion") == "skipped"
+                for check in ci_checks
+            ),
+            "Other non-success": sum(
+                check.get("status") == "completed"
+                and check.get("conclusion") in {"neutral", "cancelled", "stale"}
+                for check in ci_checks
+            ),
+            "In progress": sum(check.get("status") != "completed" for check in ci_checks),
+            "Unknown": sum(
+                check.get("status") == "completed"
+                and check.get("conclusion") not in {
+                    "success", "failure", "error", "timed_out", "startup_failure",
+                    "action_required", "skipped", "neutral", "cancelled", "stale",
+                }
+                for check in ci_checks
+            ),
+        }
+        lines.extend(f"| {label} | {count} |" for label, count in counts.items())
+        if len(ci_checks) > 100:
+            lines.append(f"\n_{len(ci_checks) - 100} additional checks are summarized in the counts above._")
+        lines.extend([
+            f"| Discovery unavailable | {'Yes' if ci_state == 'UNAVAILABLE' else 'No'} |",
+            "",
+            "### Risk breakdown",
+            "",
+            "| Dimension | Score |",
+            "|---|---:|",
+        ])
+        for dimension, field in (
+            ("Change surface", "score_change_surface"),
+            ("Reversibility", "score_reversibility"),
+            ("Data security", "score_data_security"),
+            ("Operational", "score_operational"),
+            ("Verification", "score_verification"),
+            ("Policy compliance", "score_policy_compliance"),
+        ):
+            lines.append(f"| {dimension} | `{getattr(review, field)}/100` |")
+        if findings:
+            lines.extend(["", "### Important findings", ""])
+            for finding in findings[:20]:
+                location = " ".join(
+                    value for value in (finding.get("file_path"), finding.get("line_reference"))
+                    if value
+                )
+                suffix = f" — `{location}`" if location else ""
+                lines.append(
+                    f"- **{finding.get('severity') or 'INFO'}: {finding.get('title')}**{suffix}"
+                    f" — {finding.get('description') or ''}"
+                )
+        else:
+            lines.extend(["", "No persisted findings were recorded for this review."])
+        lines.extend(["", "### Decision and merge status", ""])
+        lines.extend(f"- {reason}" for reason in (review.decision_reasons or []))
+        if review.decision.value == "MANUAL_REVIEW":
+            lines.append("- Manual review is recommended before merging.")
+        if review.github_action_confirmed:
+            lines.append(f"- GitHub review action: **{review.github_review_state or 'submitted'}**")
+        else:
+            lines.append("- GitHub approval action: **not confirmed**")
+        lines.append(f"- Auto-merge status: **{review.auto_merge_status or 'not attempted'}**")
+    else:
+        if ci_state == "UNKNOWN":
+            lines.append("CI checks are being discovered; SecurePR will monitor actual Check Runs and Commit Statuses as they appear.")
+        elif ci_state == "IN_PROGRESS":
+            lines.append("CI checks are being monitored; their current actual states are listed above.")
+        elif ci_state == "UNAVAILABLE":
+            lines.append("GitHub CI discovery is unavailable; SecurePR will retry and will not report CI as passing.")
+        lines.extend([
+            "",
+            "SecurePR will publish the detailed AI review when analysis is ready and update this comment as CI results become available.",
+        ])
+    lines.extend(["", marker])
+    return "\n".join(lines)
+
+
 def format_auto_merge_comment(*, status: str, overall_score: float, reason: str,
                               merge_commit_sha: str | None = None) -> str:
     """Short, explicit follow-up after the final review/merge outcome."""
@@ -169,13 +323,15 @@ def _get(obj, attr):
 
 
 def _ci_icon(check: dict) -> str:
+    if check.get("status") in {"queued", "requested", "waiting", "pending", "in_progress"}:
+        return "⏳ In progress"
     if check.get("status") != "completed":
-        return "⏳ Running"
+        return "❔ Unknown status"
     conclusion = check.get("conclusion")
     return {"success": "✅ Passed", "failure": "❌ Failed", "neutral": "➖ Neutral",
             "skipped": "⏭️ Skipped", "cancelled": "🚫 Cancelled",
             "timed_out": "⌛ Timed out", "action_required": "⚠️ Action required",
-            "startup_failure": "❌ Startup failure"}.get(conclusion, f"❔ {conclusion}")
+            "startup_failure": "❌ Startup failure"            }.get(conclusion or "", f"❔ {conclusion}")
 
 
 def _markdown_code(value) -> str:
@@ -207,7 +363,7 @@ def _ci_summary_line(ci_checks: list[dict] | None, ci_state: str | None = None) 
         "UNAVAILABLE": "⚠️ CI discovery unavailable",
         "UNKNOWN": "❔ CI status unknown",
     }
-    if ci_state in state_labels:
+    if ci_state and ci_state in state_labels:
         return state_labels[ci_state]
     if not ci_checks:
         return "❔ CI status unknown"

@@ -180,7 +180,7 @@ def test_confirmed_ci_failure_blocks_without_reporting_passed(
     assert "All discovered checks passed" not in posted[0][0][4]
 
 
-def test_new_head_supersedes_stale_review_job_without_publication(
+def test_stale_review_job_reconciles_to_live_head_before_publication(
     db_session, repo_and_pr, monkeypatch
 ):
     repo, pr = repo_and_pr
@@ -191,8 +191,88 @@ def test_new_head_supersedes_stale_review_job_without_publication(
         "installation_id": repo.installation_id, "head_sha": "abc123",
     })
 
-    assert posted == []
-    assert db_session.query(m.Review).filter(m.Review.pull_request_id == pr.id).count() == 0
+    review = db_session.query(m.Review).filter(m.Review.pull_request_id == pr.id).one()
+    assert pr.head_sha == "new-sha"
+    assert review.head_sha == "new-sha"
+    assert len(posted) == 1
+
+
+def test_review_status_job_publishes_final_ci_and_analysis_results(
+    db_session, repo_and_pr, monkeypatch
+):
+    repo, pr = repo_and_pr
+    review = m.Review(
+        pull_request_id=pr.id,
+        head_sha=pr.head_sha,
+        decision=m.DecisionStatus.MANUAL_REVIEW,
+        decision_reasons=["A human reviewer is required."],
+        overall_score=64,
+        risk_category="MEDIUM",
+        score_data_security=75,
+        github_review_state="COMMENT",
+        github_action_confirmed=True,
+        auto_merge_status="DISABLED_GLOBAL",
+        analysis_completed_at=datetime.utcnow(),
+    )
+    db_session.add(review)
+    db_session.flush()
+    db_session.add(m.Finding(
+        review_id=review.id,
+        dimension="data_security",
+        severity="HIGH",
+        title="Review secret handling",
+        description="Sensitive data path changed.",
+        file_path="app/secrets.py",
+        line_reference="42",
+    ))
+    revision = m.CIRevision(
+        repository_id=repo.id,
+        pull_request_id=pr.id,
+        head_sha=pr.head_sha,
+        state="FAILED",
+    )
+    db_session.add(revision)
+    db_session.flush()
+    db_session.add(m.CIExecution(
+        ci_revision_id=revision.id,
+        identity="check_run:10",
+        kind="check_run",
+        provider="GitHub Actions",
+        name="unit-tests",
+        status="completed",
+        conclusion="failure",
+        head_sha=pr.head_sha,
+    ))
+    db_session.commit()
+    published = []
+    monkeypatch.setattr(
+        github_module.github_client,
+        "post_issue_comment",
+        lambda *args, **kwargs: (
+            published.append((args, kwargs))
+            or {"succeeded": True, "status_code": 201, "payload": {"id": 5}}
+        ),
+    )
+
+    pipeline.process_review_status_job(db_session, {
+        "repository_id": repo.id,
+        "pull_request_id": pr.id,
+        "installation_id": repo.installation_id,
+        "head_sha": pr.head_sha,
+    })
+
+    assert len(published) == 1
+    body = published[0][0][4]
+    assert "SecurePR Review — Final Results" in body
+    assert "64.0/100" in body
+    assert "**CI status:** Failed" in body
+    assert "unit-tests" in body
+    assert "app/secrets.py 42" in body
+    assert "A human reviewer is required." in body
+    assert "DISABLED_GLOBAL" in body
+    assert db_session.query(m.GithubAction).filter(
+        m.GithubAction.action_type == "update_review_status_comment"
+    ).one().succeeded is True
 
 
 def test_duplicate_ci_webhook_delivery_enqueues_one_refresh_job(
@@ -255,3 +335,47 @@ def test_late_ci_failure_updates_state_and_queues_separate_notification(
     assert revision.state == "FAILED"
     assert len(notify_jobs) == 1
     assert "ci-failure" in notify_jobs[0].idempotency_key
+
+
+def test_partial_ci_api_failure_preserves_previously_discovered_executions(
+    db_session, repo_and_pr, monkeypatch
+):
+    repo, pr = repo_and_pr
+    revision = m.CIRevision(
+        repository_id=repo.id,
+        pull_request_id=pr.id,
+        head_sha=pr.head_sha,
+        state="IN_PROGRESS",
+    )
+    db_session.add(revision)
+    db_session.flush()
+    existing = m.CIExecution(
+        ci_revision_id=revision.id,
+        identity="check_run:existing",
+        kind="check_run",
+        name="build",
+        status="in_progress",
+        head_sha=pr.head_sha,
+    )
+    db_session.add(existing)
+    db_session.commit()
+    monkeypatch.setattr(
+        pipeline,
+        "_fetch_ci_checks",
+        lambda *args, **kwargs: ([], [], ["check_runs: GitHub returned 503"]),
+    )
+
+    pipeline.process_ci_refresh_job(db_session, {
+        "repository_id": repo.id,
+        "pull_request_id": pr.id,
+        "installation_id": repo.installation_id,
+        "head_sha": pr.head_sha,
+        "reason": "webhook",
+    })
+
+    db_session.refresh(revision)
+    assert revision.state == "UNAVAILABLE"
+    assert db_session.query(m.CIExecution).filter(
+        m.CIExecution.ci_revision_id == revision.id,
+        m.CIExecution.identity == "check_run:existing",
+    ).one().status == "in_progress"

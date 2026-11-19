@@ -147,13 +147,17 @@ service-role key formats and requires HTTPS origins.
 
 ## 9. Independent AI review and GitHub CI monitoring
 
-The PR webhook validates and stores the current head SHA, then enqueues two
-independent database-backed jobs: an AI review and an initial CI refresh. The
+The PR webhook validates and stores the current head SHA, then enqueues
+database-backed AI-review, initial-status-comment, and CI-refresh jobs. The
+status worker promptly posts `SecurePR Review — Waiting for CI` without
+waiting for a CI timeout. It reports only actual checks already discovered and
+updates the same comment as new CI or analysis results become available. The
 review worker fetches the PR changes, analyzes risk, applies review policy,
-and publishes as soon as the analysis is complete. It never waits for CI
+and publishes findings as soon as analysis completes. It never waits for CI
 discovery or completion. A queued or in-progress check, no configured CI, an
 unfamiliar check name, and a GitHub CI API error cannot hold the AI review.
-The dashboard reports AI review lifecycle separately from CI state.
+CI webhooks and polling update CI state and the status comment without rerunning
+AI analysis. The dashboard reports AI review lifecycle separately from CI.
 
 CI discovery is associated with the exact repository, PR, and head SHA.
 SecurePR reads actual Check Runs, Check Suites, and legacy commit statuses;
@@ -182,10 +186,10 @@ CI. If analysis is still executing, the persistent review job remains
 
 The default policy has no named mandatory-check list or aliases.
 `block_on_ci_failure` controls whether a genuine failure already discovered
-at analysis time blocks the review. A later failure updates the CI state and
-posts a separate failure notification with a link to the actual execution;
-it never reruns or duplicates the AI review. Missing, unknown, and unavailable
-CI are not treated as either pass or failure.
+at analysis time blocks the review. A later failure updates the status comment
+and CI state and posts a separate failure notification with a link to the
+actual execution; it never reruns or duplicates the AI review. Missing,
+unknown, and unavailable CI are not treated as either pass or failure.
 
 Database-backed jobs survive backend process restarts. Apply
 `database/postgresql/002_independent_ci_monitoring.sql` before deploying to an

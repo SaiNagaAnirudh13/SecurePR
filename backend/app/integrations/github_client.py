@@ -148,13 +148,17 @@ class GitHubClient:
                 deadline=deadline,
             )
             payload = resp.json()
-            if collection_key is None:
-                batch = payload
-            elif isinstance(payload, dict):
-                batch = payload.get(collection_key)
+            if isinstance(payload, list):
+                raw_batch = payload
+            elif collection_key is not None and isinstance(payload, dict):
+                raw_batch = payload.get(collection_key)
             else:
-                batch = None
-            if not isinstance(batch, list) or any(not isinstance(item, dict) for item in batch):
+                raw_batch = None
+            if not isinstance(raw_batch, list):
+                field = collection_key or "response"
+                raise ValueError(f"GitHub API response must contain a list of objects in '{field}'.")
+            batch = [item for item in raw_batch if isinstance(item, dict)]
+            if len(batch) != len(raw_batch):
                 field = collection_key or "response"
                 raise ValueError(f"GitHub API response must contain a list of objects in '{field}'.")
             items.extend(batch)
@@ -421,11 +425,33 @@ class GitHubClient:
                 idempotency_marker,
             )
             if existing:
+                if existing.get("body") == body:
+                    return {
+                        "succeeded": True,
+                        "status_code": 200,
+                        "payload": existing,
+                        "already_exists": True,
+                    }
+                comment_id = existing.get("id")
+                if not isinstance(comment_id, (int, str)) or not str(comment_id):
+                    raise ValueError(
+                        "GitHub issue comment with the idempotency marker has no valid ID."
+                    )
+                resp = requests.patch(
+                    f"{GITHUB_API}/repos/{owner}/{repo}/issues/comments/{comment_id}",
+                    headers=headers,
+                    json={"body": body},
+                    timeout=20,
+                )
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    payload = {"message": resp.text}
                 return {
-                    "succeeded": True,
-                    "status_code": 200,
-                    "payload": existing,
-                    "already_exists": True,
+                    "succeeded": resp.ok,
+                    "status_code": resp.status_code,
+                    "payload": payload,
+                    "updated": resp.ok,
                 }
         resp = requests.post(f"{GITHUB_API}/repos/{owner}/{repo}/issues/{pr_number}/comments",
                              headers=headers, json={"body": body}, timeout=20)

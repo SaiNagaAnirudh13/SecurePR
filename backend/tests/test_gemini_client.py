@@ -1,16 +1,34 @@
+import json
 from types import SimpleNamespace
+
+import pytest
 
 from app.integrations.gemini_client import GeminiClient
 
 
+def valid_output():
+    return {
+        dimension: {"score": 20, "rationale": "test rationale"}
+        for dimension in (
+            "change_surface",
+            "reversibility",
+            "data_security",
+            "operational",
+            "verification",
+            "policy_compliance",
+        )
+    } | {"summary": "test summary"}
+
+
 def test_gemini_generation_uses_configured_timeout():
     calls = {}
+    expected = valid_output()
 
     class FakeModel:
         def generate_content(self, prompt, request_options):
             calls["prompt"] = prompt
             calls["request_options"] = request_options
-            return SimpleNamespace(text="{}")
+            return SimpleNamespace(text=json.dumps(expected))
 
     client = GeminiClient()
     client.settings = SimpleNamespace(GEMINI_REQUEST_TIMEOUT_SECONDS=17)
@@ -18,7 +36,7 @@ def test_gemini_generation_uses_configured_timeout():
     client._model_name = "test-model"
     client._genai = SimpleNamespace(GenerativeModel=lambda name: FakeModel())
 
-    assert client.score_dimensions([]) == {}
+    assert client.score_dimensions([]) == expected
     assert calls["request_options"] == {"timeout": 17}
 
 
@@ -26,6 +44,36 @@ def test_gemini_timeout_returns_to_deterministic_fallback():
     class FakeModel:
         def generate_content(self, prompt, request_options):
             raise TimeoutError("test timeout")
+
+    client = GeminiClient()
+    client.settings = SimpleNamespace(GEMINI_REQUEST_TIMEOUT_SECONDS=17)
+    client._configured = True
+    client._model_name = "test-model"
+    client._genai = SimpleNamespace(GenerativeModel=lambda name: FakeModel())
+
+    assert client.score_dimensions([]) is None
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "[]",
+        "{}",
+        json.dumps(valid_output() | {
+            "data_security": {"score": 101, "rationale": "out of range"},
+        }),
+        json.dumps(valid_output() | {
+            "data_security": {"score": float("nan"), "rationale": "not finite"},
+        }),
+        json.dumps(valid_output() | {
+            "data_security": {"score": "high", "rationale": "wrong type"},
+        }),
+    ],
+)
+def test_gemini_malformed_output_uses_deterministic_fallback(response):
+    class FakeModel:
+        def generate_content(self, prompt, request_options):
+            return SimpleNamespace(text=response)
 
     client = GeminiClient()
     client.settings = SimpleNamespace(GEMINI_REQUEST_TIMEOUT_SECONDS=17)

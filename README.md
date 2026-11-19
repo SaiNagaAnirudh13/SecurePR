@@ -33,6 +33,7 @@ SecurePR/
 │   ├── tests/                 pytest unit tests
 │   ├── run.py                  cloud-platform entry point (uses PORT)
 │   ├── requirements.txt
+│   ├── requirements-dev.txt   QA tools
 │   └── .env.example
 ├── database/
 │   ├── securepr_schema.sql  retained SQL Server fallback schema (run in SSMS)
@@ -42,6 +43,7 @@ SecurePR/
 ├── policies/
 │   └── default_policy.json   initial policy document (no code change needed to edit)
 ├── frontend/dashboard/        static HTML/CSS/JS dashboard + Vercel build config
+├── .github/workflows/         backend, dashboard, dependency and secret checks
 ├── sample-repo/                minimal app + CI workflow for real-world testing
 └── docs/
     ├── SETUP_GUIDE.md
@@ -70,12 +72,13 @@ SecurePR/
   APPROVED/BLOCKED/MANUAL_REVIEW decision. AI scores can only
   raise a heuristic risk score, never lower one (`risk_engine.blend_with_ai`).
 - **AI review and CI monitoring are independent.** A pull-request webhook
-  queues durable review and CI-discovery jobs. Review publication never waits
-  for CI; discovered check runs and commit statuses are stored against the
+  queues durable review, status-comment, and CI-discovery jobs. SecurePR
+  promptly posts `SecurePR Review — Waiting for CI`, then updates that same
+  comment as analysis and actual checks become available. Review publication
+  never waits for CI; check runs and commit statuses are stored against the
   exact PR head SHA and updated from webhooks, with bounded polling as backup.
-  Empty results, API failures, and unfamiliar check names are never reported
-  as CI success. A late failure updates CI state and receives a separate
-  notification without rerunning the analysis. See `docs/Policies.md`.
+  Empty results, API failures, and unknown check names are never reported as
+  CI success. CI updates do not rerun AI analysis.
 - **Gemini model fallback.** `gemini-3.8-flash` is configured by default, but
   `integrations/gemini_client.py` probes model availability at call time and
   falls back to `GEMINI_FALLBACK_MODEL` (default `gemini-2.0-flash`) if it
@@ -123,7 +126,11 @@ webhook URL format.
 ```powershell
 cd backend
 venv\Scripts\activate
-pytest
+pip install -r requirements-dev.txt
+pytest -q
+ruff check --select E9,F63,F7,F82 app tests
+mypy --ignore-missing-imports --follow-imports=skip app/services/ci_status.py app/services/comment_formatter.py app/integrations/gemini_client.py
+pip-audit -r requirements.txt
 ```
 
 ## License

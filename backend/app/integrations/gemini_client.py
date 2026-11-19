@@ -15,6 +15,7 @@ decision -- see services/decision_engine.py.
 """
 import json
 import logging
+import math
 
 from app.core.config import get_settings
 
@@ -30,6 +31,15 @@ this shape:
  "verification": {"score": 0, "rationale": "..."}, "policy_compliance": {"score": 0, "rationale": "..."},
  "summary": "one paragraph overall summary"}
 """
+
+_RISK_DIMENSIONS = (
+    "change_surface",
+    "reversibility",
+    "data_security",
+    "operational",
+    "verification",
+    "policy_compliance",
+)
 
 
 class GeminiUnavailable(Exception):
@@ -106,7 +116,30 @@ class GeminiClient:
             if text.startswith("```"):
                 text = text.strip("`")
                 text = text.split("\n", 1)[-1] if "\n" in text else text
-            return json.loads(text)
+            result = json.loads(text)
+            if not isinstance(result, dict):
+                raise ValueError("Gemini response must be a JSON object.")
+            validated: dict[str, object] = {}
+            for dimension in _RISK_DIMENSIONS:
+                item = result.get(dimension)
+                if not isinstance(item, dict):
+                    raise ValueError(f"Gemini response is missing '{dimension}'.")
+                score = item.get("score")
+                rationale = item.get("rationale")
+                if (
+                    isinstance(score, bool)
+                    or not isinstance(score, (int, float))
+                    or not math.isfinite(score)
+                    or not 0 <= score <= 100
+                    or not isinstance(rationale, str)
+                ):
+                    raise ValueError(f"Gemini response has an invalid '{dimension}' score.")
+                validated[dimension] = {"score": float(score), "rationale": rationale}
+            summary = result.get("summary")
+            if not isinstance(summary, str):
+                raise ValueError("Gemini response is missing a valid summary.")
+            validated["summary"] = summary
+            return validated
         except Exception as exc:
             logger.warning("Gemini scoring call failed or returned malformed output: %s", exc)
             return None

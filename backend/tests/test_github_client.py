@@ -10,6 +10,8 @@ class FakeResponse:
         self.error = error
         self.status_code = status_code
         self.headers = headers or {}
+        self.ok = status_code < 400
+        self.text = str(payload)
 
     def raise_for_status(self):
         if self.error:
@@ -272,3 +274,145 @@ def test_malformed_pr_file_payload_is_rejected(monkeypatch):
 
     with pytest.raises(ValueError, match="list of objects"):
         client.get_pr_files("42", "octo", "widgets", 7)
+
+
+def test_review_and_comment_collection_endpoints_accept_raw_arrays(monkeypatch):
+    client = github_module.GitHubClient()
+    pages = iter([
+        FakeResponse([{"id": index, "body": "review"} for index in range(100)]),
+        FakeResponse([]),
+    ])
+    calls = []
+
+    def fake_get(url, headers, params, timeout):
+        calls.append(params)
+        return next(pages)
+
+    monkeypatch.setattr(client, "_headers", lambda installation_id, deadline=None: {})
+    monkeypatch.setattr(github_module.requests, "get", fake_get)
+
+    reviews = client._get_paginated_items(
+        "https://api.github.com/repos/octo/widgets/pulls/7/reviews", {}, "reviews"
+    )
+
+    assert len(reviews) == 100
+    assert [call["page"] for call in calls] == [1, 2]
+
+
+def test_wrapped_collections_and_empty_raw_arrays_are_valid(monkeypatch):
+    client = github_module.GitHubClient()
+
+    monkeypatch.setattr(
+        client,
+        "_get_with_retry",
+        lambda *args, **kwargs: FakeResponse({"reviews": []}),
+    )
+    assert client._get_paginated_items("url", {}, "reviews") == []
+
+    monkeypatch.setattr(
+        client,
+        "_get_with_retry",
+        lambda *args, **kwargs: FakeResponse([]),
+    )
+    assert client._get_paginated_items("url", {}, "reviews") == []
+
+
+def test_marked_review_retries_after_ambiguous_post_without_duplicate(monkeypatch):
+    client = github_module.GitHubClient()
+    marker = "<!-- securepr-review:pr:sha -->"
+    get_responses = iter([
+        FakeResponse([]),
+        FakeResponse([{"id": 9, "body": f"review {marker}"}]),
+    ])
+    post_calls = []
+    monkeypatch.setattr(client, "_headers", lambda installation_id, deadline=None: {})
+    monkeypatch.setattr(
+        github_module.requests,
+        "get",
+        lambda *args, **kwargs: next(get_responses),
+    )
+    monkeypatch.setattr(
+        github_module.requests,
+        "post",
+        lambda *args, **kwargs: (
+            post_calls.append((args, kwargs))
+            or FakeResponse({"message": "request outcome unknown"}, status_code=503)
+        ),
+    )
+
+    first = client.post_review(
+        "42", "octo", "widgets", 7, f"review {marker}", "COMMENT",
+        idempotency_marker=marker,
+    )
+    retry = client.post_review(
+        "42", "octo", "widgets", 7, f"review {marker}", "COMMENT",
+        idempotency_marker=marker,
+    )
+
+    assert first["succeeded"] is False
+    assert retry["already_exists"] is True
+    assert len(post_calls) == 1
+
+
+def test_review_lookup_api_error_is_not_treated_as_an_empty_list(monkeypatch):
+    client = github_module.GitHubClient()
+    post_calls = []
+    monkeypatch.setattr(client, "_headers", lambda installation_id, deadline=None: {})
+    monkeypatch.setattr(
+        github_module.requests,
+        "get",
+        lambda *args, **kwargs: FakeResponse(
+            {"message": "forbidden"},
+            github_module.requests.HTTPError("forbidden"),
+            status_code=403,
+        ),
+    )
+    monkeypatch.setattr(
+        github_module.requests, "post",
+        lambda *args, **kwargs: post_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(github_module.requests.HTTPError):
+        client.post_review(
+            "42", "octo", "widgets", 7, "body <!-- marker -->", "COMMENT",
+            idempotency_marker="<!-- marker -->",
+        )
+    assert post_calls == []
+
+
+def test_marked_issue_comment_is_updated_in_place(monkeypatch):
+    client = github_module.GitHubClient()
+    marker = "<!-- securepr-status:pr:sha -->"
+    patch_calls = []
+    get_responses = iter([
+        FakeResponse([{"id": 19, "body": f"Waiting {marker}"}]),
+        FakeResponse([{"id": 19, "body": f"Final {marker}"}]),
+    ])
+    monkeypatch.setattr(client, "_headers", lambda installation_id, deadline=None: {})
+    monkeypatch.setattr(
+        github_module.requests,
+        "get",
+        lambda *args, **kwargs: next(get_responses),
+    )
+    monkeypatch.setattr(
+        github_module.requests,
+        "patch",
+        lambda *args, **kwargs: (
+            patch_calls.append((args, kwargs))
+            or FakeResponse({"id": 19, "body": f"Final {marker}"})
+        ),
+    )
+
+    updated = client.post_issue_comment(
+        "42", "octo", "widgets", 7, f"Final {marker}",
+        idempotency_marker=marker,
+    )
+    unchanged = client.post_issue_comment(
+        "42", "octo", "widgets", 7, f"Final {marker}",
+        idempotency_marker=marker,
+    )
+
+    assert updated["updated"] is True
+    assert patch_calls[0][0][0].endswith("/issues/comments/19")
+    assert unchanged["already_exists"] is True
+    assert len(patch_calls) == 1

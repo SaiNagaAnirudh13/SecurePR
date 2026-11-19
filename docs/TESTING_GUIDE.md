@@ -18,7 +18,7 @@ Follow `docs/SETUP_GUIDE.md` end to end first. In short, in this order:
 
 ## 2. Verify backend and frontend are healthy
 
-- `http://localhost:8000/health` → `{"status":"ok", ...}`
+- `http://localhost:8000/health` → `{"status":"ok", ...}` when the database is reachable; HTTP 503 indicates the database is unavailable.
 - `http://localhost:8000/docs` → Swagger UI lists every endpoint
 - Dashboard **Overview** tab loads with no "API error" toasts (it will show all-zero counts until your first PR is analyzed — that's expected)
 
@@ -74,7 +74,7 @@ git checkout -b low-risk-fix
 ```
 Edit `app/utils.py`: fix the typo in the `greet()` docstring. Commit and push, then open a PR.
 
-**Expected:** SecurePR publishes the AI review as soon as analysis completes, regardless of CI timing. The comment shows the actual CI state known at publication; the dashboard updates independently as check webhooks arrive. There is one AI review for the revision.
+**Expected:** SecurePR promptly posts `SecurePR Review — Waiting for CI`, then publishes the detailed AI review as soon as analysis completes, regardless of CI timing. The status comment is updated with actual CI results as they arrive; duplicate webhooks do not create duplicate reviews or status comments.
 
 ### Scenario B — Higher-Risk / Security Finding
 
@@ -105,9 +105,9 @@ Repeat Scenario A's change as a user you did **not** mark eligible in step 5 (a 
 This verifies that the AI review does not wait for CI.
 
 1. Temporarily add a delay to the `unit-tests` job in `.github/workflows/ci.yml` (e.g. `- run: sleep 90` before the pytest step), push it on its own branch, and open a PR.
-2. The AI review should publish while that job remains in progress; SecurePR should not post a placeholder or wait for the job.
-3. Confirm the review says CI is in progress and that monitoring continues. The dashboard should show AI review completed and CI in progress.
-4. When the delayed job finishes, its webhook should update CI state and the dashboard without rerunning the AI analysis or duplicating the review.
+2. The waiting-for-CI status comment should appear promptly while the job remains in progress; it must not wait for the job.
+3. Confirm the AI review publishes as soon as analysis completes and reports actual CI progress when discovered. The dashboard should show AI review completed and CI in progress.
+4. When the delayed job finishes, its webhook should update the same status comment and dashboard without rerunning AI analysis or duplicating the review.
 5. Also test a PR with no CI workflow and one where check discovery returns an API error. The AI review should still publish; the dashboard must show no checks discovered or unavailable, never CI passed.
 
 ### Scenario F — Circuit Breaker

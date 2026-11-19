@@ -25,7 +25,11 @@ from app.services import (
     risk_engine,
 )
 from app.services.background_jobs import enqueue_job
-from app.services.comment_formatter import format_auto_merge_comment, format_comment
+from app.services.comment_formatter import (
+    format_auto_merge_comment,
+    format_comment,
+    format_review_status_comment,
+)
 
 logger = logging.getLogger("securepr.pipeline")
 settings = get_settings()
@@ -175,6 +179,48 @@ def _ci_records(db: Session, revision: m.CIRevision) -> list[dict]:
         }
         for row in rows
     ]
+
+
+def _queue_review_status_update(
+    db: Session, repo: m.Repository, pr: m.PullRequest, head_sha: str
+) -> None:
+    revision = db.query(m.CIRevision).filter(
+        m.CIRevision.repository_id == repo.id,
+        m.CIRevision.pull_request_id == pr.id,
+        m.CIRevision.head_sha == head_sha,
+    ).first()
+    records = _ci_records(db, revision) if revision else []
+    review = db.query(m.Review).filter(
+        m.Review.pull_request_id == pr.id,
+        m.Review.head_sha == head_sha,
+        m.Review.is_reevaluation == False,  # noqa: E712
+        m.Review.is_ci_wait_placeholder == False,  # noqa: E712
+    ).first()
+    fingerprint = hashlib.sha256(json.dumps({
+        "state": revision.state if revision else "UNKNOWN",
+        "error": revision.error if revision else None,
+        "records": records,
+        "review": (
+            {
+                "id": review.id,
+                "decision": review.decision.value,
+                "github_action_confirmed": review.github_action_confirmed,
+                "auto_merge_status": review.auto_merge_status,
+            }
+            if review else None
+        ),
+    }, sort_keys=True).encode("utf-8")).hexdigest()
+    enqueue_job(
+        db,
+        "REVIEW_STATUS",
+        f"review-status:{pr.id}:{head_sha}:{fingerprint}",
+        {
+            "repository_id": repo.id,
+            "pull_request_id": pr.id,
+            "installation_id": repo.installation_id,
+            "head_sha": head_sha,
+        },
+    )
 
 
 def _queue_late_ci_failures(
@@ -479,6 +525,33 @@ def _run_analysis_locked(
         if isinstance(latest_sha, str) and latest_sha:
             pr.head_sha = latest_sha
             db.commit()
+            _ci_revision(db, repo, pr, latest_sha)
+            enqueue_job(
+                db,
+                "REVIEW",
+                f"review:{repo.id}:{pr.id}:{latest_sha}",
+                {
+                    "repository_id": repo.id,
+                    "pull_request_id": pr.id,
+                    "installation_id": installation_id,
+                    "head_sha": latest_sha,
+                },
+            )
+            enqueue_job(
+                db,
+                "CI_REFRESH",
+                f"ci-initial:{repo.id}:{pr.id}:{latest_sha}",
+                {
+                    "repository_id": repo.id,
+                    "pull_request_id": pr.id,
+                    "installation_id": installation_id,
+                    "head_sha": latest_sha,
+                    "event_name": "pull_request",
+                    "reason": "initial",
+                },
+            )
+            _queue_review_status_update(db, repo, pr, latest_sha)
+            db.commit()
         logger.info("Superseding in-flight analysis: repository=%s pr=%s reviewed_sha=%s current_sha=%s",
                     repo.full_name, pr.github_pr_number, live_sha, latest_sha)
         return None
@@ -677,6 +750,8 @@ def _run_analysis_locked(
         logger.exception("Failed to notify repository owner: review_id=%s", review.id)
 
     elapsed = time.perf_counter() - started_clock
+    _queue_review_status_update(db, repo, pr, review.head_sha)
+    db.commit()
     if elapsed >= settings.REVIEW_RESULT_DEADLINE_SECONDS:
         logger.warning(
             "AI review exceeded configured result deadline: elapsed_seconds=%.2f deadline_seconds=%s "
@@ -693,9 +768,54 @@ def process_review_job(db: Session, payload: dict) -> None:
     pr = db.query(m.PullRequest).filter(m.PullRequest.id == payload["pull_request_id"]).first()
     if not repo or not pr:
         raise ValueError("Review job references a missing repository or pull request.")
+    owner, repo_name = repo.full_name.split("/", 1)
+    live_pr = github_client.get_pull_request(
+        payload["installation_id"], owner, repo_name, pr.github_pr_number
+    )
+    if live_pr.get("state") != "open":
+        pr.state = live_pr.get("state") or pr.state
+        db.commit()
+        return
+    live_sha = live_pr.get("head_sha")
+    if not isinstance(live_sha, str) or not live_sha:
+        raise ValueError("GitHub pull-request response is missing its head SHA.")
+    if pr.head_sha != live_sha:
+        logger.info(
+            "Reconciling PR head before review job: repository=%s pr=%s stored_sha=%s live_sha=%s",
+            repo.full_name, pr.github_pr_number, pr.head_sha, live_sha,
+        )
+        pr.head_sha = live_sha
+        pr.state = "open"
+        _ci_revision(db, repo, pr, live_sha)
+        db.commit()
+        enqueue_job(
+            db,
+            "CI_REFRESH",
+            f"ci-initial:{repo.id}:{pr.id}:{live_sha}",
+            {
+                "repository_id": repo.id,
+                "pull_request_id": pr.id,
+                "installation_id": payload["installation_id"],
+                "head_sha": live_sha,
+                "event_name": "pull_request",
+                "reason": "reconciled",
+            },
+        )
+        enqueue_job(
+            db,
+            "REVIEW_STATUS",
+            f"review-status-initial:{pr.id}:{live_sha}",
+            {
+                "repository_id": repo.id,
+                "pull_request_id": pr.id,
+                "installation_id": payload["installation_id"],
+                "head_sha": live_sha,
+            },
+        )
+        db.commit()
     run_analysis(
         db, repo, pr, payload["installation_id"],
-        expected_head_sha=payload["head_sha"], trigger="durable_review_job",
+        expected_head_sha=live_sha, trigger="durable_review_job",
     )
 
 
@@ -730,7 +850,12 @@ def _fetch_ci_checks(installation_id: str, owner: str, repo_name: str, head_sha:
 
 
 def _upsert_ci_execution_records(
-    db: Session, revision: m.CIRevision, discovered: list[dict], head_sha: str
+    db: Session,
+    revision: m.CIRevision,
+    discovered: list[dict],
+    head_sha: str,
+    *,
+    remove_missing: bool = True,
 ) -> None:
     discovered_keys = set()
     for item in discovered:
@@ -762,12 +887,13 @@ def _upsert_ci_execution_records(
         row.status = item.get("status")
         row.conclusion = item.get("conclusion")
         row.external_url = item.get("url") or item.get("html_url")
-    existing = db.query(m.CIExecution).filter(
-        m.CIExecution.ci_revision_id == revision.id
-    ).all()
-    for row in existing:
-        if (row.kind, row.identity) not in discovered_keys:
-            db.delete(row)
+    if remove_missing:
+        existing = db.query(m.CIExecution).filter(
+            m.CIExecution.ci_revision_id == revision.id
+        ).all()
+        for row in existing:
+            if (row.kind, row.identity) not in discovered_keys:
+                db.delete(row)
 
 
 def process_ci_refresh_job(db: Session, payload: dict) -> None:
@@ -790,11 +916,13 @@ def process_ci_refresh_job(db: Session, payload: dict) -> None:
 
     if errors:
         _upsert_ci_execution_records(
-            db, revision, checks + suites, payload["head_sha"]
+            db, revision, checks + suites, payload["head_sha"], remove_missing=False
         )
         revision.error = "; ".join(errors)[:4000]
         revision.retry_count += 1
         revision.state = "UNAVAILABLE"
+        db.commit()
+        _queue_review_status_update(db, repo, pr, payload["head_sha"])
         db.commit()
         _queue_ci_notifications(db, repo, pr, revision)
         if revision.retry_count < settings.CI_API_MAX_RETRIES:
@@ -818,6 +946,8 @@ def process_ci_refresh_job(db: Session, payload: dict) -> None:
     revision.state = evaluated.state
     revision.updated_at = datetime.utcnow()
     db.commit()
+    _queue_review_status_update(db, repo, pr, payload["head_sha"])
+    db.commit()
 
     if evaluated.state == "IN_PROGRESS" and revision.poll_count < settings.CI_FALLBACK_MAX_POLLS:
         revision.poll_count += 1
@@ -831,6 +961,93 @@ def process_ci_refresh_job(db: Session, payload: dict) -> None:
         db.commit()
 
     _queue_ci_notifications(db, repo, pr, revision)
+
+
+def process_review_status_job(db: Session, payload: dict) -> None:
+    repo = db.query(m.Repository).filter(m.Repository.id == payload["repository_id"]).first()
+    pr = db.query(m.PullRequest).filter(m.PullRequest.id == payload["pull_request_id"]).first()
+    if not repo or not pr:
+        raise ValueError("Review status job references a missing repository or pull request.")
+    with _revision_finalization_lock(db, repo.id, pr.github_pr_number):
+        db.expire_all()
+        repo = db.query(m.Repository).filter(m.Repository.id == payload["repository_id"]).first()
+        pr = db.query(m.PullRequest).filter(m.PullRequest.id == payload["pull_request_id"]).first()
+        if not repo or not pr:
+            return
+        _publish_review_status_comment(db, payload, repo, pr)
+
+
+def _publish_review_status_comment(
+    db: Session, payload: dict, repo: m.Repository, pr: m.PullRequest
+) -> None:
+    if pr.head_sha != payload["head_sha"] or pr.state != "open":
+        return
+    revision = db.query(m.CIRevision).filter(
+        m.CIRevision.repository_id == repo.id,
+        m.CIRevision.pull_request_id == pr.id,
+        m.CIRevision.head_sha == payload["head_sha"],
+    ).first()
+    records = _ci_records(db, revision) if revision else []
+    ci_summary = ci_status.evaluate_ci_status(
+        records,
+        fetch_error=revision.error
+        if revision and revision.state == "UNAVAILABLE" else None,
+        discovery_complete=bool(revision and revision.state != "UNKNOWN"),
+    )
+    executions = [record for record in records if record["kind"] != "check_suite"]
+    review = db.query(m.Review).filter(
+        m.Review.pull_request_id == pr.id,
+        m.Review.head_sha == payload["head_sha"],
+        m.Review.is_reevaluation == False,  # noqa: E712
+        m.Review.is_ci_wait_placeholder == False,  # noqa: E712
+    ).first()
+    findings = (
+        [
+            {
+                "severity": finding.severity,
+                "title": finding.title,
+                "description": finding.description,
+                "file_path": finding.file_path,
+                "line_reference": finding.line_reference,
+            }
+            for finding in db.query(m.Finding).filter(m.Finding.review_id == review.id).all()
+        ]
+        if review else []
+    )
+    marker = f"<!-- securepr-status:{pr.id}:{payload['head_sha']} -->"
+    body = format_review_status_comment(
+        pr_number=pr.github_pr_number,
+        head_sha=payload["head_sha"],
+        ci_state=ci_summary.state,
+        ci_checks=executions,
+        ci_error=ci_summary.error,
+        review=review,
+        findings=findings,
+        marker=marker,
+    )
+    owner, repo_name = repo.full_name.split("/", 1)
+    result = github_client.post_issue_comment(
+        payload["installation_id"],
+        owner,
+        repo_name,
+        pr.github_pr_number,
+        body,
+        idempotency_marker=marker,
+    )
+    db.add(m.GithubAction(
+        review_id=review.id if review else None,
+        action_type="update_review_status_comment",
+        request_payload={"head_sha": payload["head_sha"], "marker": marker},
+        response_status=result.get("status_code"),
+        response_payload=result.get("payload")
+        if isinstance(result.get("payload"), dict) else None,
+        succeeded=result.get("succeeded", False),
+    ))
+    db.commit()
+    if not result.get("succeeded", False):
+        raise RuntimeError(
+            f"GitHub rejected review status publication for PR #{pr.github_pr_number}."
+        )
 
 
 def process_ci_notification_job(db: Session, payload: dict) -> None:

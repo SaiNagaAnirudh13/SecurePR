@@ -613,7 +613,7 @@ async function toggleAccordion(domId, reviewId) {
     </details>` : ''}
 
     ${d.findings.length ? `<p><strong>Findings (${d.findings.length})</strong></p>
-      ${d.findings.map(f => `<div style="margin-bottom:6px;">${badge(f.severity)} <strong>${escapeHtml(f.title)}</strong> ${f.file_path ? '<code>' + escapeHtml(f.file_path) + '</code>' : ''}<br><span class="section-sub">${escapeHtml(f.description || '')}</span></div>`).join('')}` : ''}
+      ${d.findings.map(f => `<div style="margin-bottom:6px;">${badge(f.severity)} <strong>${escapeHtml(f.title)}</strong> ${f.file_path ? '<code>' + escapeHtml(f.file_path + (f.line_reference ? ':' + f.line_reference : '')) + '</code>' : ''}<br><span class="section-sub">${escapeHtml(f.description || '')}</span></div>`).join('')}` : ''}
 
     ${d.changed_files.length ? `<p><strong>Changed Files (${d.changed_files.length})</strong></p>
       <div style="max-height:160px;overflow-y:auto;">${d.changed_files.map(f => `<div class="section-sub">${f.is_blocked_path ? '🚫 ' : ''}<code>${escapeHtml(f.path)}</code> (+${f.additions}/-${f.deletions})</div>`).join('')}</div>` : ''}

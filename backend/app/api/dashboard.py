@@ -84,12 +84,18 @@ def _review_status(db: Session, pr: m.PullRequest) -> str:
         m.Review.is_reevaluation == False,  # noqa: E712
         m.Review.is_ci_wait_placeholder == False,  # noqa: E712
     ).first()
-    if review:
-        return "COMPLETED" if review.analysis_completed_at else "PROCESSING"
     job = db.query(m.BackgroundJob).filter(
         m.BackgroundJob.idempotency_key
         == f"review:{pr.repository_id}:{pr.id}:{pr.head_sha}"
     ).first()
+    if review:
+        if not review.analysis_completed_at:
+            return "PROCESSING"
+        if review.github_action_confirmed:
+            return "COMPLETED"
+        if not job or job.state in {"FAILED", "COMPLETED"}:
+            return "FAILED"
+        return "QUEUED" if job.state == "QUEUED" else "PROCESSING"
     if not job:
         return "NOT_STARTED"
     return {
@@ -325,6 +331,7 @@ def get_review(review_id: str, db: Session = Depends(get_db)):
         "policy": {"name": policy.name, "version": policy.version} if policy else None,
         "findings": [{"dimension": f.dimension, "severity": f.severity, "title": f.title,
                       "description": f.description, "file_path": f.file_path,
+                      "line_reference": f.line_reference,
                       "is_mandatory_blocker": f.is_mandatory_blocker} for f in findings],
         "evidence": [{"type": e.evidence_type, "source": e.source, "content": e.content} for e in evidence],
         "changed_files": [{"path": c.file_path, "type": c.change_type, "additions": c.additions,
@@ -344,9 +351,15 @@ def reevaluate(req: ReevaluateRequest, db: Session = Depends(get_db)):
     if not pr:
         raise HTTPException(404, "Pull request not found")
     repo = db.query(m.Repository).filter(m.Repository.id == pr.repository_id).first()
+    if not repo:
+        raise HTTPException(404, "Repository not found")
+    if not repo.installation_id:
+        raise HTTPException(409, "Repository GitHub App installation is unavailable")
     latest = _latest_review_for_pr(db, pr.id)
     review = run_analysis(db, repo, pr, repo.installation_id, is_reevaluation=True,
                            previous_review_id=latest.id if latest else None)
+    if not review:
+        raise HTTPException(409, "Pull request changed or is no longer available for review")
     return {"review_id": review.id, "decision": review.decision.value}
 
 

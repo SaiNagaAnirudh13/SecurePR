@@ -12,7 +12,7 @@ from app.models import models as m
 
 logger = logging.getLogger("securepr.jobs")
 
-JOB_TYPES = ("REVIEW", "CI_REFRESH", "CI_NOTIFY")
+JOB_TYPES = ("REVIEW", "CI_REFRESH", "CI_NOTIFY", "REVIEW_STATUS")
 MAX_ATTEMPTS = 5
 LEASE_SECONDS = 300
 POLL_SECONDS = 1
@@ -138,6 +138,8 @@ class _Worker:
             pipeline.process_ci_refresh_job(db, job.payload)
         elif self.job_type == "CI_NOTIFY":
             pipeline.process_ci_notification_job(db, job.payload)
+        elif self.job_type == "REVIEW_STATUS":
+            pipeline.process_review_status_job(db, job.payload)
 
     def _run(self):
         session_factory = get_session_factory()

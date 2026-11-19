@@ -1,0 +1,66 @@
+name: SecurePR CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+      - name: Install backend and QA dependencies
+        run: python -m pip install -r backend/requirements-dev.txt
+      - name: Run backend tests
+        working-directory: backend
+        run: python -m pytest -q
+      - name: Run Ruff lint
+        run: python -m ruff check --select E9,F63,F7,F82 app tests
+        working-directory: backend
+      - name: Check formatting on new workflow regression tests
+        run: >-
+          python -m ruff format --check tests/test_webhook_lifecycle.py
+          tests/test_health.py tests/test_dashboard_contract.py
+        working-directory: backend
+      - name: Run Mypy
+        run: >-
+          python -m mypy --ignore-missing-imports --follow-imports=skip
+          app/services/ci_status.py app/services/comment_formatter.py
+          app/integrations/gemini_client.py
+        working-directory: backend
+      - name: Audit production dependencies
+        run: python -m pip_audit -r backend/requirements.txt
+
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Build dashboard
+        working-directory: frontend/dashboard
+        env:
+          VITE_SUPABASE_URL: https://securepr-ci.supabase.co
+          VITE_SECUREPR_API_URL: https://securepr-ci.example.com
+          VITE_SUPABASE_ANON_KEY: securepr-ci-public-placeholder
+        run: npm run build
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
