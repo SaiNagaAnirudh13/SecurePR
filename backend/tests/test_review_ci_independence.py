@@ -1,10 +1,12 @@
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.exc import DataError
 from sqlalchemy.orm import sessionmaker
 
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
@@ -243,6 +245,7 @@ def test_passed_ci_and_eligible_low_risk_publish_approval(
     assert review.lifecycle_state == "APPROVED"
     assert review.ai_state == pr.ai_state == "AI_COMPLETED"
     assert review.ci_verified_at is not None
+    assert review.analysis_completed_at is not None
     assert len(posted) == 1
     assert posted[0][0][5] == "APPROVE"
     assert posted[0][1]["commit_id"] == pr.head_sha
@@ -279,6 +282,7 @@ def test_gemini_timeout_is_unavailable_without_fallback_risk_or_approval(
     assert review.decision == m.DecisionStatus.REVIEW_UNAVAILABLE
     assert review.lifecycle_state == "REVIEW_UNAVAILABLE"
     assert review.ai_state == pr.ai_state == "AI_FAILED"
+    assert review.analysis_completed_at is None
     assert review.risk_category == "NOT_EVALUATED"
     assert review.overall_score == 0
     assert review.github_review_state == "COMMENT"
@@ -298,6 +302,127 @@ def test_gemini_timeout_is_unavailable_without_fallback_risk_or_approval(
     )
     assert "GEMINI_ANALYSIS_FAILED" in evidence.content
     assert "504 Deadline expired" not in evidence.content
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_state", "expected_error_code", "has_retry_time"),
+    [
+        (
+            "quota",
+            "AI_UNAVAILABLE",
+            "GEMINI_QUOTA_EXCEEDED",
+            True,
+        ),
+        (
+            "malformed",
+            "AI_INVALID_RESPONSE",
+            "GEMINI_INVALID_RESPONSE",
+            False,
+        ),
+    ],
+)
+def test_ai_failures_persist_diagnostics_without_completion_or_approval(
+    db_session,
+    repo_and_pr,
+    monkeypatch,
+    failure_kind,
+    expected_state,
+    expected_error_code,
+    has_retry_time,
+):
+    repo, pr = repo_and_pr
+    posted, _ = _patch_review_dependencies(monkeypatch)
+    retryable_at = datetime.utcnow() + timedelta(minutes=5)
+
+    def fail_analysis(*args, **kwargs):
+        if failure_kind == "quota":
+            raise gemini_module.GeminiUnavailable(
+                "Gemini quota exhausted.",
+                error_code="GEMINI_QUOTA_EXCEEDED",
+                retryable_at=retryable_at,
+            )
+        raise gemini_module.GeminiInvalidResponse("Gemini response was malformed.")
+
+    monkeypatch.setattr(gemini_module.gemini_client, "score_dimensions", fail_analysis)
+    _add_ci_revision(
+        db_session,
+        repo,
+        pr,
+        "PASSED",
+        [
+            {
+                "name": "unit-tests",
+                "status": "completed",
+                "conclusion": "success",
+            }
+        ],
+    )
+
+    review = _run(db_session, repo, pr)
+
+    assert review.decision == m.DecisionStatus.REVIEW_UNAVAILABLE
+    assert review.lifecycle_state == "REVIEW_UNAVAILABLE"
+    assert review.ai_state == pr.ai_state == expected_state
+    assert review.ai_error_code == pr.ai_error_code == expected_error_code
+    assert review.ai_attempt_id and review.ai_attempt_id == pr.ai_attempt_id
+    assert (review.ai_retryable_at == retryable_at) is has_retry_time
+    assert review.analysis_completed_at is None
+    assert review.risk_category == "NOT_EVALUATED"
+    assert review.auto_merge_status is None
+    assert review.github_review_state == "COMMENT"
+    assert len(posted) == 1
+    assert posted[0][0][5] == "COMMENT"
+    assert "Not Evaluated" in posted[0][0][4]
+    assert "APPROVE" not in posted[0][0][4]
+
+
+def test_database_persistence_failure_rolls_back_without_github_decision(
+    db_session, repo_and_pr, monkeypatch, caplog
+):
+    repo, pr = repo_and_pr
+    posted, _ = _patch_review_dependencies(monkeypatch)
+
+    def unavailable(*args, **kwargs):
+        raise gemini_module.GeminiUnavailable(
+            "Gemini is unavailable.",
+            error_code="GEMINI_UNAVAILABLE",
+        )
+
+    monkeypatch.setattr(gemini_module.gemini_client, "score_dimensions", unavailable)
+    _add_ci_revision(
+        db_session,
+        repo,
+        pr,
+        "PASSED",
+        [{"name": "unit-tests", "status": "completed", "conclusion": "success"}],
+    )
+    original_flush = db_session.flush
+
+    def fail_review_flush(objects=None):
+        if any(isinstance(item, m.Review) for item in db_session.new):
+            raise DataError(
+                "INSERT INTO reviews",
+                {},
+                Exception("value too long for type character varying"),
+            )
+        return original_flush(objects)
+
+    monkeypatch.setattr(db_session, "flush", fail_review_flush)
+
+    with pytest.raises(DataError, match="value too long"):
+        _run(db_session, repo, pr)
+
+    db_session.rollback()
+    db_session.refresh(pr)
+    assert pr.ai_state == "AI_UNAVAILABLE"
+    assert pr.ai_error_code == "GEMINI_UNAVAILABLE"
+    assert pr.ai_attempt_id
+    assert db_session.query(m.Review).count() == 0
+    assert not posted
+    assert (
+        "Review persistence failed; refusing to publish a GitHub decision"
+        in caplog.text
+    )
 
 
 def test_failed_final_review_publication_retries_with_same_marker(

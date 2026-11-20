@@ -89,3 +89,12 @@ being treated as an empty successful result.
 Apply `database/postgresql/004_ci_gated_decisions.sql` to existing PostgreSQL
 installations before deploying this version. SQL Server installations should
 rerun `database/securepr_schema.sql`, which contains idempotent upgrade steps.
+
+On Render, the build command installs `backend/requirements.txt`, including
+Alembic. The service start wrapper then upgrades PostgreSQL before starting
+Uvicorn, verifies the resulting head revision, and exits without serving
+traffic if migration or verification fails. It uses a PostgreSQL advisory lock
+so simultaneously starting service instances cannot race to apply migrations.
+This runtime migration approach is used instead of a Render pre-deploy command;
+it also keeps database credentials out of the build phase. FastAPI verifies the
+current revision again during application startup.

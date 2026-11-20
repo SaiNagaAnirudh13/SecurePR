@@ -1,10 +1,11 @@
 """Database-backed workers for durable review and CI jobs."""
+
 import logging
 import threading
 from datetime import datetime, timedelta
 
 from sqlalchemy import and_, or_, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DataError, IntegrityError, ProgrammingError
 
 from app.core.db import get_session_factory
 from app.models import models as m
@@ -15,14 +16,33 @@ JOB_TYPES = ("REVIEW", "CI_REFRESH", "CI_NOTIFY", "REVIEW_STATUS")
 MAX_ATTEMPTS = 5
 LEASE_SECONDS = 300
 POLL_SECONDS = 1
+NON_RETRYABLE_DATABASE_ERRORS = (DataError, IntegrityError, ProgrammingError)
 
 
-def enqueue_job(db, job_type: str, idempotency_key: str, payload: dict, available_at=None) -> m.BackgroundJob:
+def _record_job_failure(db, job, exc: Exception) -> None:
+    non_retryable_database_error = isinstance(exc, NON_RETRYABLE_DATABASE_ERRORS)
+    job.last_error = str(exc)[:4000]
+    job.lease_until = None
+    job.updated_at = datetime.utcnow()
+    if job.attempts >= MAX_ATTEMPTS or non_retryable_database_error:
+        job.state = "FAILED"
+    else:
+        job.state = "QUEUED"
+        delay = min(2**job.attempts, 60)
+        job.available_at = datetime.utcnow() + timedelta(seconds=delay)
+    db.commit()
+
+
+def enqueue_job(
+    db, job_type: str, idempotency_key: str, payload: dict, available_at=None
+) -> m.BackgroundJob:
     if job_type not in JOB_TYPES:
         raise ValueError(f"Unsupported background job type: {job_type}")
-    existing = db.query(m.BackgroundJob).filter(
-        m.BackgroundJob.idempotency_key == idempotency_key
-    ).first()
+    existing = (
+        db.query(m.BackgroundJob)
+        .filter(m.BackgroundJob.idempotency_key == idempotency_key)
+        .first()
+    )
     if existing:
         if existing.state == "FAILED":
             existing.state = "QUEUED"
@@ -45,9 +65,11 @@ def enqueue_job(db, job_type: str, idempotency_key: str, payload: dict, availabl
             db.flush()
         return job
     except IntegrityError:
-        existing = db.query(m.BackgroundJob).filter(
-            m.BackgroundJob.idempotency_key == idempotency_key
-        ).first()
+        existing = (
+            db.query(m.BackgroundJob)
+            .filter(m.BackgroundJob.idempotency_key == idempotency_key)
+            .first()
+        )
         if existing:
             return existing
         raise
@@ -232,7 +254,11 @@ class _Worker:
             )
             .first()
         )
-        return evidence.content if evidence else "AI analysis failed; manual review required."
+        return (
+            evidence.content
+            if evidence
+            else "AI analysis failed; manual review required."
+        )
 
     def _run(self):
         session_factory = get_session_factory()
@@ -256,20 +282,18 @@ class _Worker:
                     self._log_job(db, job, "COMPLETED", failure_reason)
                 except Exception as exc:
                     db.rollback()
-                    job = db.query(m.BackgroundJob).filter(m.BackgroundJob.id == job.id).first()
+                    job = (
+                        db.query(m.BackgroundJob)
+                        .filter(m.BackgroundJob.id == job.id)
+                        .first()
+                    )
                     if job:
-                        job.last_error = str(exc)[:4000]
-                        job.lease_until = None
-                        job.updated_at = datetime.utcnow()
-                        if job.attempts >= MAX_ATTEMPTS:
-                            job.state = "FAILED"
-                        else:
-                            job.state = "QUEUED"
-                            delay = min(2 ** job.attempts, 60)
-                            job.available_at = datetime.utcnow() + timedelta(seconds=delay)
-                        db.commit()
+                        _record_job_failure(db, job, exc)
                     logger.exception(
-                        "Background job failed",
+                        "Background job failed%s",
+                        " with a non-retryable database error"
+                        if isinstance(exc, NON_RETRYABLE_DATABASE_ERRORS)
+                        else "",
                         extra={
                             "job_id": job.id if job else "unknown",
                             "job_type": self.job_type,
@@ -292,7 +316,9 @@ class _Worker:
                         )
             except Exception:
                 db.rollback()
-                logger.exception("Background worker iteration failed: type=%s", self.job_type)
+                logger.exception(
+                    "Background worker iteration failed: type=%s", self.job_type
+                )
                 self._stop.wait(POLL_SECONDS)
             finally:
                 db.close()
