@@ -307,18 +307,8 @@ def test_gemini_timeout_is_unavailable_without_fallback_risk_or_approval(
 @pytest.mark.parametrize(
     ("failure_kind", "expected_state", "expected_error_code", "has_retry_time"),
     [
-        (
-            "quota",
-            "AI_UNAVAILABLE",
-            "GEMINI_QUOTA_EXCEEDED",
-            True,
-        ),
-        (
-            "malformed",
-            "AI_INVALID_RESPONSE",
-            "GEMINI_INVALID_RESPONSE",
-            False,
-        ),
+        ("quota", "AI_UNAVAILABLE", "GEMINI_QUOTA_EXCEEDED", True),
+        ("malformed", "AI_INVALID_RESPONSE", "GEMINI_INVALID_RESPONSE", False),
     ],
 )
 def test_ai_failures_persist_diagnostics_without_completion_or_approval(
@@ -349,13 +339,13 @@ def test_ai_failures_persist_diagnostics_without_completion_or_approval(
         repo,
         pr,
         "PASSED",
-        [
-            {
-                "name": "unit-tests",
-                "status": "completed",
-                "conclusion": "success",
-            }
-        ],
+        [{"name": "unit-tests", "status": "completed", "conclusion": "success"}],
+    )
+    auto_merge_attempts = []
+    monkeypatch.setattr(
+        pipeline.auto_merge,
+        "attempt",
+        lambda **kwargs: auto_merge_attempts.append(kwargs),
     )
 
     review = _run(db_session, repo, pr)
@@ -368,12 +358,14 @@ def test_ai_failures_persist_diagnostics_without_completion_or_approval(
     assert (review.ai_retryable_at == retryable_at) is has_retry_time
     assert review.analysis_completed_at is None
     assert review.risk_category == "NOT_EVALUATED"
+    assert review.overall_score == 0
     assert review.auto_merge_status is None
     assert review.github_review_state == "COMMENT"
     assert len(posted) == 1
     assert posted[0][0][5] == "COMMENT"
     assert "Not Evaluated" in posted[0][0][4]
     assert "APPROVE" not in posted[0][0][4]
+    assert not auto_merge_attempts
 
 
 def test_database_persistence_failure_rolls_back_without_github_decision(
