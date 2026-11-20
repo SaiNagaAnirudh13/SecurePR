@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -372,6 +373,7 @@ def test_database_persistence_failure_rolls_back_without_github_decision(
     db_session, repo_and_pr, monkeypatch, caplog
 ):
     repo, pr = repo_and_pr
+    caplog.set_level(logging.ERROR, logger="securepr.pipeline")
     posted, _ = _patch_review_dependencies(monkeypatch)
 
     def unavailable(*args, **kwargs):
@@ -906,12 +908,14 @@ def test_concurrent_workers_publish_only_one_final_review(
         ],
     )
     factory = sessionmaker(bind=db_session.get_bind(), future=True)
+    repo_id = repo.id
+    pull_request_id = pr.id
 
     def run_worker():
         session = factory()
         try:
-            worker_repo = session.query(m.Repository).filter_by(id=repo.id).one()
-            worker_pr = session.query(m.PullRequest).filter_by(id=pr.id).one()
+            worker_repo = session.query(m.Repository).filter_by(id=repo_id).one()
+            worker_pr = session.query(m.PullRequest).filter_by(id=pull_request_id).one()
             return _run(session, worker_repo, worker_pr).id
         finally:
             session.close()
