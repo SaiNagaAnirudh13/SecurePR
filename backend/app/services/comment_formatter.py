@@ -1,29 +1,38 @@
 """
 Formats SecurePR's independent AI analysis and current CI state as Markdown.
 """
+
 from datetime import datetime
 from urllib.parse import quote, urlsplit
 
 DECISION_META = {
-    "APPROVED":       {"emoji": "✅", "label": "Approved",       "color": "🟢"},
-    "BLOCKED":        {"emoji": "⛔", "label": "Blocked",        "color": "🔴"},
-    "MANUAL_REVIEW":  {"emoji": "🟡", "label": "Manual Review Required", "color": "🟡"},
-    "PENDING":        {"emoji": "⏳", "label": "Pending",         "color": "⚪"},
+    "APPROVED": {"emoji": "✅", "label": "Approved", "color": "🟢"},
+    "BLOCKED": {"emoji": "⛔", "label": "Blocked", "color": "🔴"},
+    "MANUAL_REVIEW": {"emoji": "🟡", "label": "Manual Review Required", "color": "🟡"},
+    "PENDING": {"emoji": "⏳", "label": "Pending", "color": "⚪"},
 }
 
-RISK_LABEL = {"LOW": "🟢 Low", "MEDIUM": "🟡 Medium", "HIGH": "🔴 High", "NOT_EVALUATED": "⚪ Not evaluated"}
+RISK_LABEL = {
+    "LOW": "🟢 Low",
+    "MEDIUM": "🟡 Medium",
+    "HIGH": "🔴 High",
+    "NOT_EVALUATED": "⚪ Not evaluated",
+}
 
 SEVERITY_META = {
     "CRITICAL": {"emoji": "🔴", "label": "Critical"},
-    "HIGH":     {"emoji": "🟠", "label": "High"},
-    "MEDIUM":   {"emoji": "🟡", "label": "Medium"},
-    "LOW":      {"emoji": "🔵", "label": "Low"},
+    "HIGH": {"emoji": "🟠", "label": "High"},
+    "MEDIUM": {"emoji": "🟡", "label": "Medium"},
+    "LOW": {"emoji": "🔵", "label": "Low"},
 }
 
 DIMENSION_LABELS = {
-    "change_surface": "Change Surface", "reversibility": "Reversibility",
-    "data_security": "Data Security", "operational": "Operational Impact",
-    "verification": "Verification", "policy_compliance": "Policy Compliance",
+    "change_surface": "Change Surface",
+    "reversibility": "Reversibility",
+    "data_security": "Data Security",
+    "operational": "Operational Impact",
+    "verification": "Verification",
+    "policy_compliance": "Policy Compliance",
 }
 
 RECOMMENDED_ACTION = {
@@ -41,14 +50,28 @@ def _score_bar(score: float) -> str:
     return "█" * filled + "░" * (10 - filled)
 
 
-def format_comment(*, decision: str, reasons: list[str], overall_score: float, category: str,
-                    dimension_scores: dict, findings: list[dict], changed_files: list[dict],
-                    circuit_breaker_tripped: bool, circuit_breaker_reason: str | None,
-                    impact_items: list, policy_name: str, policy_version: int,
-                    dashboard_url: str, ci_checks: list[dict] | None = None,
-                    analysis_error: str | None = None,
-                    ci_state: str | None = None) -> str:
+def format_comment(
+    *,
+    decision: str,
+    reasons: list[str],
+    overall_score: float,
+    category: str,
+    dimension_scores: dict,
+    findings: list[dict],
+    changed_files: list[dict],
+    circuit_breaker_tripped: bool,
+    circuit_breaker_reason: str | None,
+    impact_items: list,
+    policy_name: str,
+    policy_version: int,
+    dashboard_url: str,
+    ci_checks: list[dict] | None = None,
+    analysis_error: str | None = None,
+    ci_state: str | None = None,
+) -> str:
     meta = DECISION_META.get(decision, {"emoji": "", "label": decision})
+    if decision == "BLOCKED" and ci_state == "FAILED":
+        meta = {"emoji": "⛔", "label": "BLOCKED: CI Failed", "color": "🔴"}
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
     # ---------------------------------------------------------------- header
@@ -74,7 +97,9 @@ def format_comment(*, decision: str, reasons: list[str], overall_score: float, c
     lines.append("|---|---|---|")
     for dim, s in dimension_scores.items():
         score = s.score if hasattr(s, "score") else s
-        lines.append(f"| {DIMENSION_LABELS.get(dim, dim.replace('_', ' ').title())} | `{score}/100` | `{_score_bar(score)}` |")
+        lines.append(
+            f"| {DIMENSION_LABELS.get(dim, dim.replace('_', ' ').title())} | `{score}/100` | `{_score_bar(score)}` |"
+        )
     lines.append("\n</details>\n")
 
     # --------------------------------------------------------------- CI table
@@ -92,14 +117,18 @@ def format_comment(*, decision: str, reasons: list[str], overall_score: float, c
 
     # ---------------------------------------------------------------- findings
     if findings:
-        lines.append(f"<details open>\n<summary><b>🔎 Findings ({len(findings)})</b></summary>\n")
+        lines.append(
+            f"<details open>\n<summary><b>🔎 Findings ({len(findings)})</b></summary>\n"
+        )
         for f in findings[:20]:
             sev = SEVERITY_META.get(
                 f.get("severity") or "",
                 {"emoji": "⚪", "label": f.get("severity") or "Info"},
             )
             location = " ".join(
-                value for value in (f.get("file_path"), f.get("line_reference")) if value
+                value
+                for value in (f.get("file_path"), f.get("line_reference"))
+                if value
             )
             loc = f" — `{location}`" if location else ""
             action = RECOMMENDED_ACTION.get(f.get("dimension") or "")
@@ -114,29 +143,45 @@ def format_comment(*, decision: str, reasons: list[str], overall_score: float, c
     if changed_files:
         additions = sum(f.get("additions", 0) for f in changed_files)
         deletions = sum(f.get("deletions", 0) for f in changed_files)
-        lines.append(f"<details>\n<summary><b>📁 Changed Files ({len(changed_files)} files, "
-                      f"+{additions}/-{deletions})</b></summary>\n")
+        lines.append(
+            f"<details>\n<summary><b>📁 Changed Files ({len(changed_files)} files, "
+            f"+{additions}/-{deletions})</b></summary>\n"
+        )
         for f in changed_files[:30]:
             flag = " 🚫 **blocked path**" if f.get("is_blocked_path") else ""
-            lines.append(f"- `{f['file_path']}` (+{f.get('additions', 0)}/-{f.get('deletions', 0)}){flag}")
+            lines.append(
+                f"- `{f['file_path']}` (+{f.get('additions', 0)}/-{f.get('deletions', 0)}){flag}"
+            )
         if len(changed_files) > 30:
-            lines.append(f"- _…and {len(changed_files) - 30} more file(s), see the dashboard for the full list._")
+            lines.append(
+                f"- _…and {len(changed_files) - 30} more file(s), see the dashboard for the full list._"
+            )
         lines.append("\n</details>\n")
 
     # ---------------------------------------------------------- impact simulator
     if impact_items:
         confirmed = [i for i in impact_items if _get(i, "confidence") == "CONFIRMED"]
-        lines.append(f"<details>\n<summary><b>🧬 Change Impact Simulator</b> "
-                      f"({len(confirmed)} confirmed, {len(impact_items)} total)</summary>\n")
+        lines.append(
+            f"<details>\n<summary><b>🧬 Change Impact Simulator</b> "
+            f"({len(confirmed)} confirmed, {len(impact_items)} total)</summary>\n"
+        )
         lines.append("| Component | Type | Confidence | Potential Consequence |")
         lines.append("|---|---|---|---|")
         for i in impact_items[:20]:
-            name, ctype, conf, cons = (_get(i, "component_name"), _get(i, "component_type"),
-                                        _get(i, "confidence"), _get(i, "potential_consequence"))
-            conf_icon = {"CONFIRMED": "🟢", "INFERRED": "🟡", "UNRESOLVED": "⚪"}.get(conf, "")
+            name, ctype, conf, cons = (
+                _get(i, "component_name"),
+                _get(i, "component_type"),
+                _get(i, "confidence"),
+                _get(i, "potential_consequence"),
+            )
+            conf_icon = {"CONFIRMED": "🟢", "INFERRED": "🟡", "UNRESOLVED": "⚪"}.get(
+                conf, ""
+            )
             lines.append(f"| `{name}` | {ctype} | {conf_icon} {conf} | {cons} |")
         if len(impact_items) > 20:
-            lines.append(f"\n_…and {len(impact_items) - 20} more, see the dashboard for the full list._")
+            lines.append(
+                f"\n_…and {len(impact_items) - 20} more, see the dashboard for the full list._"
+            )
         lines.append("\n</details>\n")
 
     # --------------------------------------------------------- decision reasons
@@ -144,10 +189,15 @@ def format_comment(*, decision: str, reasons: list[str], overall_score: float, c
     for r in reasons:
         lines.append(f"- {r}")
     lines.append("")
-    lines.append(f"<sub>Policy: **{policy_name} v{policy_version}** · "
-                  f"[Open full analysis & evidence in the SecurePR dashboard]({dashboard_url})</sub>")
+    lines.append(
+        f"<sub>Policy: **{policy_name} v{policy_version}** · "
+        f"[Open full analysis & evidence in the SecurePR dashboard]({dashboard_url})</sub>"
+    )
     lines.append("")
-    lines.append("_Auto-merge is disabled by default and requires every discovered CI execution to pass._")
+    lines.append(
+        "_Auto-merge is opt-in and requests GitHub's protected auto-merge only "
+        "after all applicable CI checks pass._"
+    )
     return "\n".join(lines)
 
 
@@ -162,24 +212,44 @@ def format_review_status_comment(
     findings: list[dict],
     marker: str,
 ) -> str:
-    """Render the single durable waiting comment for a PR revision."""
+    """Render the single durable status comment for a PR revision."""
+    is_final = bool(
+        review and review.decision.value not in {"WAITING_FOR_CI", "PENDING"}
+    )
+    if not is_final:
+        title = "SecurePR Review — Waiting for CI"
+    elif review.decision.value == "BLOCKED" and ci_state == "FAILED":
+        title = "SecurePR Review — BLOCKED: CI Failed"
+    else:
+        title = f"SecurePR Review — {review.decision.value}"
     lines = [
-        "## SecurePR Review — Waiting for CI",
+        f"## {title}",
         "",
         f"SecurePR has received PR #{pr_number} at revision `{head_sha}`.",
-        "AI analysis and CI verification are being processed.",
-        "Final results will be published when the review is ready.",
+        (
+            f"Authoritative decision: **{review.decision.value}** "
+            f"(risk {review.overall_score}/100, {review.risk_category})."
+            if is_final
+            else "AI analysis and CI verification are being processed; no approval decision is final."
+        ),
         "",
         f"- **CI status:** {ci_state.replace('_', ' ').title()}",
     ]
+    if is_final:
+        lines.extend(
+            f"- **Decision reason:** {reason}"
+            for reason in (review.decision_reasons or [])
+        )
     if ci_error:
         lines.append(f"- **CI discovery error:** {ci_error}")
     if ci_checks:
-        lines.extend([
-            "",
-            "| Check | Provider | Result | Details |",
-            "|---|---|---|---|",
-        ])
+        lines.extend(
+            [
+                "",
+                "| Check | Provider | Result | Details |",
+                "|---|---|---|---|",
+            ]
+        )
         for check in ci_checks[:100]:
             lines.append(
                 f"| {_markdown_code(check.get('name') or check.get('context') or 'Unnamed check')} "
@@ -188,39 +258,68 @@ def format_review_status_comment(
                 f"| {_markdown_link(check.get('url') or check.get('html_url'))} |"
             )
         if len(ci_checks) > 100:
-            lines.append(f"\n_{len(ci_checks) - 100} additional checks are summarized in the counts above._")
+            lines.append(
+                f"\n_{len(ci_checks) - 100} additional checks are summarized in the counts above._"
+            )
     elif ci_state == "NOT_CONFIGURED":
         lines.append("No executable checks were discovered for this revision.")
     elif ci_state in {"UNKNOWN", "UNAVAILABLE"}:
         lines.append("Executable CI checks have not been confirmed yet.")
 
-    if ci_state == "UNKNOWN":
-        lines.append("CI checks are being discovered; SecurePR will monitor actual Check Runs and Commit Statuses as they appear.")
+    if is_final and review.decision.value == "BLOCKED" and ci_state == "FAILED":
+        lines.append(
+            "Approval and auto-merge are prohibited because one or more CI checks failed."
+        )
+    elif ci_state == "UNKNOWN":
+        lines.append(
+            "CI checks are being discovered; SecurePR will monitor actual Check Runs and Commit Statuses as they appear."
+        )
     elif ci_state == "IN_PROGRESS":
-        lines.append("CI checks are being monitored; their current actual states are listed above.")
+        lines.append(
+            "CI checks are being monitored; their current actual states are listed above."
+        )
     elif ci_state == "UNAVAILABLE":
-        lines.append("GitHub CI discovery is unavailable; SecurePR will retry and will not report CI as passing.")
+        lines.append(
+            "GitHub CI discovery is unavailable; SecurePR will retry and will not report CI as passing."
+        )
     lines.extend(["", marker])
     return "\n".join(lines)
 
 
-def format_auto_merge_comment(*, status: str, overall_score: float, reason: str,
-                              merge_commit_sha: str | None = None) -> str:
+def format_auto_merge_comment(
+    *,
+    status: str,
+    overall_score: float,
+    reason: str,
+    merge_commit_sha: str | None = None,
+) -> str:
     """Short, explicit follow-up after the final review/merge outcome."""
     if status == "MERGED":
         commit = f"\n\nMerge commit: `{merge_commit_sha}`" if merge_commit_sha else ""
-        return ("## ✅ SecurePR Review — **Approved & Automatically Merged**\n\n"
-                f"Risk Score: `{overall_score}/100` (LOW)\n\n"
-                "CI Status: All discovered checks passed  \nCircuit Breaker: Inactive  \nPolicy: Passed\n\n"
-                "🤖 **Auto-Merge:** This Pull Request satisfied all SecurePR safety requirements and was automatically merged."
-                f"{commit}")
-    if status in ("DISABLED_GLOBAL", "DISABLED_REPOSITORY"):
-        return ("## ✅ SecurePR Review — **Approved**\n\n"
-                "This Pull Request was approved, but automatic merging is disabled by configuration.\n\n"
-                f"Reason: {reason}")
-    return ("## ⚠️ SecurePR Review — **Approved, Manual Merge Required**\n\n"
-            "The PR passed SecurePR analysis, but automatic merging could not be completed.\n\n"
-            f"Reason: {reason}")
+        return (
+            "## ✅ SecurePR Review — **Approved & Automatically Merged**\n\n"
+            f"Risk Score: `{overall_score}/100` (LOW)\n\n"
+            "CI Status: All discovered checks passed  \nCircuit Breaker: Inactive  \nPolicy: Passed\n\n"
+            "🤖 **Auto-Merge:** This Pull Request satisfied all SecurePR safety requirements and was automatically merged."
+            f"{commit}"
+        )
+    headings = {
+        "DISABLED_GLOBAL": "Auto-merge disabled by SecurePR",
+        "DISABLED_REPOSITORY": "Auto-merge disabled for this repository in SecurePR",
+        "GITHUB_AUTO_MERGE_DISABLED": "GitHub repository auto-merge is disabled",
+        "PERMISSION_MISSING": "GitHub App permission missing",
+        "CI_PENDING": "Waiting for required CI",
+        "CI_FAILED": "Auto-merge blocked by failed CI",
+        "REQUIRED_REVIEW_PENDING": "Waiting for required GitHub review",
+        "AUTO_MERGE_ENABLED": "GitHub auto-merge enabled",
+        "MERGED": "Pull request merged",
+    }
+    heading = headings.get(status, "Auto-merge unavailable")
+    return (
+        f"## SecurePR Auto-Merge — **{heading}**\n\n"
+        f"SecurePR approval risk: `{overall_score}/100`.\n\n"
+        f"**Status:** `{status}`  \n**Reason:** {reason}"
+    )
 
 
 def _get(obj, attr):
@@ -228,15 +327,27 @@ def _get(obj, attr):
 
 
 def _ci_icon(check: dict) -> str:
-    if check.get("status") in {"queued", "requested", "waiting", "pending", "in_progress"}:
+    if check.get("status") in {
+        "queued",
+        "requested",
+        "waiting",
+        "pending",
+        "in_progress",
+    }:
         return "⏳ In progress"
     if check.get("status") != "completed":
         return "❔ Unknown status"
     conclusion = check.get("conclusion")
-    return {"success": "✅ Passed", "failure": "❌ Failed", "neutral": "➖ Neutral",
-            "skipped": "⏭️ Skipped", "cancelled": "🚫 Cancelled",
-            "timed_out": "⌛ Timed out", "action_required": "⚠️ Action required",
-            "startup_failure": "❌ Startup failure"            }.get(conclusion or "", f"❔ {conclusion}")
+    return {
+        "success": "✅ Passed",
+        "failure": "❌ Failed",
+        "neutral": "➖ Neutral",
+        "skipped": "⏭️ Skipped",
+        "cancelled": "🚫 Cancelled",
+        "timed_out": "⌛ Timed out",
+        "action_required": "⚠️ Action required",
+        "startup_failure": "❌ Startup failure",
+    }.get(conclusion or "", f"❔ {conclusion}")
 
 
 def _markdown_code(value) -> str:
@@ -259,7 +370,7 @@ def _markdown_link(url) -> str:
 
 def _ci_summary_line(ci_checks: list[dict] | None, ci_state: str | None = None) -> str:
     state_labels = {
-        "IN_PROGRESS": "⏳ In progress — AI review published; CI monitoring continues",
+        "IN_PROGRESS": "⏳ In progress — approval is waiting for CI",
         "PASSED": "✅ All discovered checks passed",
         "FAILED": "❌ At least one discovered check failed",
         "NON_SUCCESS": "⚠️ One or more checks ended without success",

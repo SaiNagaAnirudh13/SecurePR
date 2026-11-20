@@ -3,8 +3,9 @@
 AI-powered Pull Request risk assessment and automatic-approval platform.
 SecurePR analyzes GitHub Pull Requests, scores risk across six weighted
 dimensions, evaluates configurable policies, and publishes the AI review
-independently of CI. A separately
-guarded auto-merge flow is opt-in and disabled by default. A dark,
+only after executable CI for the exact revision is verified. GitHub auto-merge
+is requested only through GitHub's protected auto-merge flow, is opt-in, and
+is disabled by default. A dark,
 dropdown-driven dashboard (no internal
 IDs to copy/paste) covers every stage of that pipeline end to end.
 
@@ -39,7 +40,9 @@ SecurePR/
 │   ├── securepr_schema.sql  retained SQL Server fallback schema (run in SSMS)
 │   └── postgresql/
 │       ├── 001_initial_schema.sql  Supabase PostgreSQL bootstrap schema
-│       └── 002_independent_ci_monitoring.sql  durable review/CI workers
+│       ├── 002_independent_ci_monitoring.sql  durable review/CI workers
+│       ├── 003_review_publications.sql
+│       └── 004_ci_gated_decisions.sql
 ├── policies/
 │   └── default_policy.json   initial policy document (no code change needed to edit)
 ├── frontend/dashboard/        static HTML/CSS/JS dashboard + Vercel build config
@@ -71,21 +74,23 @@ SecurePR/
   with no AI dependency, and it is the only thing that produces an
   APPROVED/BLOCKED/MANUAL_REVIEW decision. AI scores can only
   raise a heuristic risk score, never lower one (`risk_engine.blend_with_ai`).
-- **AI review and CI monitoring are independent.** A pull-request webhook
-  queues durable review, status-comment, and CI-discovery jobs. SecurePR
-  promptly posts `SecurePR Review — Waiting for CI`, then updates that same
-  comment as analysis and actual checks become available. Review publication
-  never waits for CI; check runs and commit statuses are stored against the
-  exact PR head SHA and updated from webhooks, with bounded polling as backup.
-  Empty results, API failures, and unknown check names are never reported as
-  CI success. CI updates do not rerun AI analysis.
+- **CI gates every final decision.** A pull-request webhook queues durable
+  review, status-comment, and CI-discovery jobs. SecurePR updates one
+  `Waiting for CI` comment while checks are pending. CI failure blocks
+  approval regardless of risk; unknown, unavailable, incomplete, empty, and
+  non-success check results cannot approve. Only after every discovered
+  execution and applicable required status check for the exact head SHA passes
+  does the policy engine evaluate risk and eligibility. See
+  [`docs/CI_DECISION_LIFECYCLE.md`](docs/CI_DECISION_LIFECYCLE.md).
 - **Gemini model fallback.** `gemini-3.8-flash` is configured by default, but
   `integrations/gemini_client.py` probes model availability at call time and
   falls back to `GEMINI_FALLBACK_MODEL` (default `gemini-2.0-flash`) if it
   isn't available on your account — analysis continues either way.
-- **Guarded auto-merge.** It is disabled globally by default and requires
-  per-repository opt-in. Before merging, SecurePR rechecks the reviewed
-  commit, PR state, CI, policy, risk, and circuit breaker. See
+- **Guarded GitHub auto-merge.** It is disabled globally by default and
+  requires per-repository opt-in. Before requesting GitHub auto-merge,
+  SecurePR rechecks the reviewed commit, CI, branch protection, required
+  reviews, GitHub settings, and permissions. SecurePR never performs an
+  immediate or force merge. See
   `docs/SETUP_GUIDE.md` section 10 before enabling it.
 - **The dashboard never asks you to type an internal ID.** Every page
   (Repositories & PRs, Circuit Breaker, Evidence & Replay, Change Impact,
@@ -100,11 +105,10 @@ SecurePR/
     security configuration before deployment; production startup fails when
     critical settings are missing.
   - Review and CI tasks use a database-backed queue, so queued work survives
-    process restarts. Deployments must apply the numbered database migration
-    before enabling the new workers.
-  - CI fallback polling is bounded; GitHub webhooks remain the primary update
-    mechanism. Configure the GitHub App for Check run, Check suite, and Commit
-    status events.
+    process restarts. Deployments must apply all required numbered migrations,
+    including `004_ci_gated_decisions.sql`, before deploying this version.
+  - GitHub webhooks remain the primary CI update mechanism; configure Check
+    run, Check suite, Commit status, and pull-request events on the GitHub App.
   - GitHub App keys may be loaded from a local `.pem` file for development;
     production should set the backend-only `GITHUB_PRIVATE_KEY` secret.
   - Use provider secret settings for all production credentials; do not copy

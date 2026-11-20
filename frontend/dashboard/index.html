@@ -257,6 +257,16 @@
             <p class="subtitle">Pull requests may only be automatically approved when all required checks pass, the risk score is below the configured threshold, no critical findings exist, policies pass, and the Circuit Breaker is inactive.</p>
           </div>
         </div>
+        <div class="panel" id="autoMergeConfigPanel">
+          <h2 class="section-title">GitHub Auto-Merge</h2>
+          <p class="section-sub" id="autoMergeGlobalStatus">Loading SecurePR auto-merge configuration…</p>
+          <div class="form-row">
+            <label class="field-label" for="repoAutoMergeEnabled">Enable auto-merge for selected repository</label>
+            <input type="checkbox" id="repoAutoMergeEnabled" />
+            <button class="btn secondary" onclick="saveRepositoryAutoMerge()">Save repository setting</button>
+          </div>
+          <p class="section-sub">This setting does not enable auto-merge in GitHub or bypass branch protection. SecurePR global auto-merge remains off unless explicitly configured.</p>
+        </div>
         <div class="panel">
           <div class="form-row">
             <div>

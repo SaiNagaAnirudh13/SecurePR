@@ -1,6 +1,7 @@
-from pydantic import BaseModel
 from datetime import datetime
-from typing import Optional, Any
+from typing import Any, Optional
+
+from pydantic import BaseModel
 
 
 class ReviewSummary(BaseModel):
@@ -43,3 +44,8 @@ class CircuitBreakerResumeRequest(BaseModel):
 class ReevaluateRequest(BaseModel):
     pull_request_id: str
     actor: str = "dashboard"
+
+
+class RepositoryAutoMergeUpdate(BaseModel):
+    repository_id: str
+    is_enabled: bool

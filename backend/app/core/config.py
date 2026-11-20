@@ -66,7 +66,7 @@ class Settings(BaseSettings):
     RISK_WEIGHT_VERIFICATION: float = 0.15
     RISK_WEIGHT_POLICY_COMPLIANCE: float = 0.10
 
-    # Review and independent CI-monitoring limits
+    # CI-gated review and CI-monitoring limits
     REVIEW_RESULT_DEADLINE_SECONDS: int = 180
     CI_API_MAX_RETRIES: int = 5
     CI_FALLBACK_MAX_POLLS: int = 10
@@ -75,14 +75,11 @@ class Settings(BaseSettings):
     # Auto-merge settings
     AUTO_MERGE_ENABLED: bool = False
     AUTO_MERGE_LOW_RISK_ONLY: bool = True
-    AUTO_MERGE_REQUIRE_ALL_CI: bool = True
+    AUTO_MERGE_METHOD: str = "SQUASH"
 
 
 def _is_production_runtime(settings: Settings) -> bool:
-    return (
-        settings.SECUREPR_ENV.casefold() == "production"
-        or bool(os.getenv("PORT"))
-    )
+    return settings.SECUREPR_ENV.casefold() == "production" or bool(os.getenv("PORT"))
 
 
 def is_production_runtime(settings: Settings) -> bool:
@@ -112,15 +109,9 @@ def _require_https_url(setting_name: str, value: str) -> None:
     try:
         parsed = urlsplit(value)
     except ValueError as exc:
-        raise RuntimeError(
-            f"{setting_name} contains an invalid URL."
-        ) from exc
+        raise RuntimeError(f"{setting_name} contains an invalid URL.") from exc
 
-    if (
-        parsed.scheme != "https"
-        or not parsed.hostname
-        or parsed.path not in ("", "/")
-    ):
+    if parsed.scheme != "https" or not parsed.hostname or parsed.path not in ("", "/"):
         raise RuntimeError(
             f"{setting_name} must be an HTTPS origin without a path in production."
         )
@@ -150,26 +141,17 @@ def _validate_database_url(value: str) -> None:
         )
 
     if not hostname:
-        raise RuntimeError(
-            "DATABASE_URL must include a valid database hostname."
-        )
+        raise RuntimeError("DATABASE_URL must include a valid database hostname.")
 
     if not database_url.username:
-        raise RuntimeError(
-            "DATABASE_URL must include a database username."
-        )
+        raise RuntimeError("DATABASE_URL must include a database username.")
 
     if not database_url.path or database_url.path == "/":
-        raise RuntimeError(
-            "DATABASE_URL must include a database name."
-        )
+        raise RuntimeError("DATABASE_URL must include a database name.")
 
     ssl_modes = parse_qs(database_url.query).get("sslmode", [])
 
-    if not any(
-        mode in {"require", "verify-ca", "verify-full"}
-        for mode in ssl_modes
-    ):
+    if not any(mode in {"require", "verify-ca", "verify-full"} for mode in ssl_modes):
         raise RuntimeError(
             "Production DATABASE_URL must use SSL. "
             "Add ?sslmode=require to the PostgreSQL connection string."
@@ -201,16 +183,11 @@ def validate_production_settings(settings: Settings) -> None:
         "SECUREPR_ADMIN_IDS": settings.SECUREPR_ADMIN_IDS,
     }
 
-    missing = [
-        name
-        for name, value in required.items()
-        if not str(value).strip()
-    ]
+    missing = [name for name, value in required.items() if not str(value).strip()]
 
     if missing:
         raise RuntimeError(
-            "Production startup requires configuration for: "
-            + ", ".join(missing)
+            "Production startup requires configuration for: " + ", ".join(missing)
         )
 
     _require_https_url("SUPABASE_URL", settings.SUPABASE_URL)
@@ -218,9 +195,7 @@ def validate_production_settings(settings: Settings) -> None:
     _require_https_url("DASHBOARD_ORIGIN", settings.DASHBOARD_ORIGIN)
 
     if settings.SUPABASE_JWT_ALGORITHM not in SUPPORTED_SUPABASE_JWT_ALGORITHMS:
-        raise RuntimeError(
-            "SUPABASE_JWT_ALGORITHM is not supported."
-        )
+        raise RuntimeError("SUPABASE_JWT_ALGORITHM is not supported.")
 
     if (
         settings.SUPABASE_JWT_ALGORITHM == "HS256"
@@ -245,11 +220,7 @@ def validate_production_settings(settings: Settings) -> None:
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
 
-    if (
-        not operator_ids
-        or not admin_ids
-        or not admin_ids.issubset(operator_ids)
-    ):
+    if not operator_ids or not admin_ids or not admin_ids.issubset(operator_ids):
         raise RuntimeError(
             "Production requires operator and admin IDs; "
             "every admin ID must also be an operator ID."
@@ -260,17 +231,14 @@ def validate_production_settings(settings: Settings) -> None:
 
     if canonical_origin not in origins:
         raise RuntimeError(
-            "DASHBOARD_ORIGIN must also be included in the configured "
-            "CORS origins."
+            "DASHBOARD_ORIGIN must also be included in the configured CORS origins."
         )
 
     for origin in origins:
         try:
             parsed_origin = urlsplit(origin)
         except ValueError as exc:
-            raise RuntimeError(
-                f"Invalid dashboard origin: {origin}"
-            ) from exc
+            raise RuntimeError(f"Invalid dashboard origin: {origin}") from exc
 
         if (
             parsed_origin.scheme != "https"

@@ -1,23 +1,45 @@
 from datetime import datetime
 from types import SimpleNamespace
 
-from app.services.comment_formatter import format_comment
-from app.services.comment_formatter import format_review_status_comment
 from app.services import risk_engine
+from app.services.comment_formatter import format_comment, format_review_status_comment
 
 
 def test_full_comment_renders_all_sections():
-    files = [{"file_path": "app/db.py", "additions": 5, "deletions": 1, "patch_excerpt": ""}]
-    scores = risk_engine.compute_deterministic_scores(files, ci_checks=[{"name": "build", "status": "completed", "conclusion": "success"}])
+    files = [
+        {"file_path": "app/db.py", "additions": 5, "deletions": 1, "patch_excerpt": ""}
+    ]
+    scores = risk_engine.compute_deterministic_scores(
+        files,
+        ci_checks=[{"name": "build", "status": "completed", "conclusion": "success"}],
+    )
     scores["policy_compliance"] = risk_engine.compute_policy_compliance_score([])
-    findings = [{"severity": "HIGH", "title": "High data security risk", "description": "x", "file_path": "app/db.py", "dimension": "data_security"}]
-    ci_checks = [{"name": "build", "status": "completed", "conclusion": "success"},
-                 {"name": "lint", "status": "in_progress", "conclusion": None}]
+    findings = [
+        {
+            "severity": "HIGH",
+            "title": "High data security risk",
+            "description": "x",
+            "file_path": "app/db.py",
+            "dimension": "data_security",
+        }
+    ]
+    ci_checks = [{"name": "build", "status": "completed", "conclusion": "success"}]
     body = format_comment(
-        decision="APPROVED", reasons=["Risk score within threshold."], overall_score=22.5, category="LOW",
-        dimension_scores=scores, findings=findings, changed_files=files, circuit_breaker_tripped=False,
-        circuit_breaker_reason=None, impact_items=[], policy_name="default", policy_version=1,
-        dashboard_url="http://localhost:5173", ci_checks=ci_checks, ci_state="IN_PROGRESS",
+        decision="APPROVED",
+        reasons=["Risk score within threshold."],
+        overall_score=22.5,
+        category="LOW",
+        dimension_scores=scores,
+        findings=findings,
+        changed_files=files,
+        circuit_breaker_tripped=False,
+        circuit_breaker_reason=None,
+        impact_items=[],
+        policy_name="default",
+        policy_version=1,
+        dashboard_url="http://localhost:5173",
+        ci_checks=ci_checks,
+        ci_state="PASSED",
     )
     assert "SecurePR Review" in body
     assert "Risk Breakdown" in body
@@ -25,9 +47,9 @@ def test_full_comment_renders_all_sections():
     assert "Findings" in body
     assert "Why this decision" in body
     assert "AI Analysis" in body
-    assert "AI review published; CI monitoring continues" in body
+    assert "All discovered checks passed" in body
     assert "Waiting for CI" not in body
-    assert "Auto-merge is disabled by default" in body
+    assert "Auto-merge is opt-in" in body
 
 
 def test_waiting_status_comment_announces_analysis_and_only_lists_discovered_checks():
@@ -35,12 +57,14 @@ def test_waiting_status_comment_announces_analysis_and_only_lists_discovered_che
         pr_number=7,
         head_sha="abc123",
         ci_state="IN_PROGRESS",
-        ci_checks=[{
-            "name": "build",
-            "provider": "GitHub Actions",
-            "status": "in_progress",
-            "conclusion": None,
-        }],
+        ci_checks=[
+            {
+                "name": "build",
+                "provider": "GitHub Actions",
+                "status": "in_progress",
+                "conclusion": None,
+            }
+        ],
         ci_error=None,
         review=None,
         findings=[],
@@ -49,18 +73,17 @@ def test_waiting_status_comment_announces_analysis_and_only_lists_discovered_che
 
     assert "SecurePR Review — Waiting for CI" in body
     assert "SecurePR has received PR #7" in body
-    assert "AI analysis and CI verification are being processed." in body
+    assert "no approval decision is final" in body
     assert "build" in body
     assert "GitHub Actions" in body
     assert "Vercel" not in body
     assert "CI checks are being monitored" in body
-    assert "Final results will be published" in body
 
 
-def test_terminal_status_comment_remains_waiting_and_does_not_repeat_final_report():
+def test_failed_ci_status_comment_has_the_authoritative_blocked_decision():
     review = SimpleNamespace(
         analysis_completed_at=datetime.utcnow(),
-        decision=SimpleNamespace(value="MANUAL_REVIEW"),
+        decision=SimpleNamespace(value="BLOCKED"),
         overall_score=68.5,
         risk_category="MEDIUM",
         score_change_surface=20,
@@ -72,33 +95,52 @@ def test_terminal_status_comment_remains_waiting_and_does_not_repeat_final_repor
         github_action_confirmed=True,
         github_review_state="COMMENT",
         auto_merge_status="DISABLED_GLOBAL",
-        decision_reasons=["A human reviewer is required."],
+        decision_reasons=[
+            "Approval is blocked because CI failed for the reviewed revision."
+        ],
     )
     body = format_review_status_comment(
         pr_number=7,
         head_sha="abc123",
         ci_state="FAILED",
         ci_checks=[
-            {"name": "build", "provider": "Actions", "status": "completed", "conclusion": "success"},
-            {"name": "tests", "provider": "Actions", "status": "completed", "conclusion": "failure"},
-            {"name": "docs", "provider": "Actions", "status": "completed", "conclusion": "skipped"},
+            {
+                "name": "build",
+                "provider": "Actions",
+                "status": "completed",
+                "conclusion": "success",
+            },
+            {
+                "name": "tests",
+                "provider": "Actions",
+                "status": "completed",
+                "conclusion": "failure",
+            },
+            {
+                "name": "docs",
+                "provider": "Actions",
+                "status": "completed",
+                "conclusion": "skipped",
+            },
         ],
         ci_error=None,
         review=review,
-        findings=[{
-            "severity": "HIGH",
-            "title": "Unsafe operation",
-            "description": "Review this change.",
-            "file_path": "src/app.py",
-            "line_reference": "42",
-        }],
+        findings=[
+            {
+                "severity": "HIGH",
+                "title": "Unsafe operation",
+                "description": "Review this change.",
+                "file_path": "src/app.py",
+                "line_reference": "42",
+            }
+        ],
         marker="<!-- securepr-status:pr:abc123 -->",
     )
 
-    assert "SecurePR Review — Waiting for CI" in body
-    assert "Final results will be published" in body
-    assert "68.5/100" not in body
-    assert "Unsafe operation" not in body
+    assert "SecurePR Review — BLOCKED: CI Failed" in body
+    assert "68.5/100" in body
+    assert "Approval is blocked because CI failed" in body
+    assert "tests" in body
     assert "**CI status:** Failed" in body
     assert "Vercel" not in body
 
@@ -112,7 +154,7 @@ def test_unavailable_ci_is_reported_as_unavailable_not_passed():
         ci_error="check_runs: GitHub returned 503",
         review=SimpleNamespace(
             analysis_completed_at=datetime.utcnow(),
-            decision=SimpleNamespace(value="MANUAL_REVIEW"),
+            decision=SimpleNamespace(value="WAITING_FOR_CI"),
             overall_score=64,
             risk_category="MEDIUM",
             score_change_surface=20,

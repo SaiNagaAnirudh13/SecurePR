@@ -15,7 +15,7 @@ policy rules does not require application-code changes.
 | Field | Meaning |
 |---|---|
 | `auto_approval_risk_threshold` | Default maximum overall risk score for eligible authors. A per-author dashboard threshold may be lower. |
-| `block_on_ci_failure` | When true, a discovered terminal CI failure known before review publication is a policy violation and blocks the review. Failures discovered later update CI state and trigger a separate notification; they do not rerun or duplicate the AI review. |
+| `block_on_ci_failure` | Legacy field retained for compatibility. CI failure always blocks approval; this setting cannot disable the hard CI gate. |
 | `auto_merge_allowed_risk_categories` | Risk categories eligible for repository auto-merge. Defaults to `LOW`; the global low-risk-only setting can further restrict it. |
 | `blocked_paths` | Glob patterns that create a hard policy violation when changed. |
 | `human_review_required_paths` | Glob patterns that route an otherwise-eligible change to manual review. |
@@ -23,41 +23,46 @@ policy rules does not require application-code changes.
 | `disallowed_authors` | GitHub logins prohibited from automatic approval. |
 | `circuit_breaker_conditions` | Documents circuit-breaker intent. Automatic tripping requires a separately scheduled integration; manual dashboard controls work independently. |
 
-## Independent AI review and CI monitoring
+## CI-gated review and CI monitoring
 
-The PR webhook queues two durable jobs: an AI review for the exact head SHA
-and an independent CI refresh. Review analysis does not query, poll, or wait
-for CI before it can publish. Queued or in-progress CI, absent checks, unknown
-check names, and discovery API errors do not hold the AI review.
+The PR webhook queues durable review and CI-refresh jobs for the exact head
+SHA. Analysis can run while CI is pending, but only its risk score is
+informational: the deterministic decision engine will not publish a final
+decision until complete CI discovery verifies every applicable check.
 
-CI is discovered dynamically from GitHub Check Runs, Check Suites, and legacy
-commit statuses. Each actual record retains its SHA, provider, name/context,
-status, conclusion, and external URL. Check suites alone do not count as an
-active execution. Webhooks are the primary update mechanism; bounded,
-exponential-backoff retries and bounded polling are fallback mechanisms.
+CI is discovered dynamically from GitHub Check Runs and legacy commit
+statuses. Check Suites are diagnostic metadata, not executable checks. The
+backend also discovers required contexts from branch protection and
+applicable rulesets. Each execution retains its SHA, provider, name/context,
+status, conclusion, URL, and app identity. Webhooks are the primary update
+mechanism; failures retry with capped exponential backoff and incomplete or
+nonterminal states continue polling until verification completes or the PR
+revision changes.
 
 The CI states are:
 
 | State | Meaning |
 |---|---|
-| `UNKNOWN` | Discovery has not completed or returned an unrecognized result. |
-| `UNAVAILABLE` | GitHub CI discovery failed; the error is recorded and bounded retries continue. |
+| `UNKNOWN` | Discovery is incomplete or returned an unrecognized result. |
+| `UNAVAILABLE` | GitHub CI discovery failed; the error is recorded and retries continue with capped backoff. |
 | `NOT_CONFIGURED` | Discovery completed successfully but found no check runs or commit statuses. This is not a pass. |
-| `IN_PROGRESS` | At least one real discovered execution remains queued or running. The AI review can already be published. |
-| `PASSED` | At least one execution was discovered and every execution passed. |
-| `FAILED` | At least one discovered terminal execution failed (`failure`, `error`, `timed_out`, `startup_failure`, or `action_required`). |
+| `IN_PROGRESS` | At least one execution remains queued/running or a required context has not appeared. No final decision is published. |
+| `PASSED` | Discovery is complete, at least one execution exists, every execution passed, and all required contexts passed. |
+| `FAILED` | At least one discovered execution failed (`failure`, `error`, `timed_out`, `startup_failure`, or `action_required`); approval is prohibited. |
 | `NON_SUCCESS` | All executions are terminal, but one or more are `cancelled`, `neutral`, `skipped`, or `stale`; this is not reported as passed. |
 
-Unknown statuses remain `UNKNOWN`; API errors and missing records are never
-converted to success or failure. A real failure known at analysis time blocks
-only when `block_on_ci_failure` is enabled. A late failure updates the CI
-dashboard and creates a separate failure notification with a link to the
-discovered execution; it does not rerun the analysis.
+Unknown statuses, API errors, empty discovery, missing required checks, and
+incomplete pagination are never converted to success. Any known failure
+blocks regardless of `block_on_ci_failure`. CI transitions reconcile the
+decision for that revision; if a prior SecurePR approval is no longer valid,
+SecurePR attempts to dismiss it and records the outcome.
 
 Auto-merge is separately guarded and remains disabled by default. It requires
 a fresh live CI re-check in which at least one execution exists and every
-discovered execution is `PASSED`. Missing, pending, unavailable, failed, or
-non-success CI states fail closed for merging.
+discovered and required check is `PASSED`, plus the exact reviewed SHA,
+GitHub auto-merge setting, configured method, App permissions, and GitHub
+review/branch-protection eligibility. SecurePR requests GitHub's protected
+auto-merge; it does not invoke the immediate merge endpoint.
 
 ## Conditions that prevent automatic approval
 
@@ -65,18 +70,19 @@ The deterministic decision engine enforces the following:
 
 1. Incomplete changed-file analysis routes to `MANUAL_REVIEW`.
 2. Critical findings and blocked-path policy violations block.
-3. A configured policy violation, including an applicable known CI failure,
-   blocks.
+3. Any known CI failure or configured hard policy violation blocks.
 4. An active circuit breaker, an ineligible author, an excessive risk score,
    or a human-review policy warning routes to `MANUAL_REVIEW`.
 5. Otherwise, an eligible low-risk review may be approved.
 
-CI pending, absent, or unavailable is not a deferred AI-review state.
+CI pending, absent, incomplete, or unavailable is `WAITING_FOR_CI`; it cannot
+be converted to approval or manual review before CI verification.
 
 ## Editing policies safely
 
 - Bump `version` when changing substantive policy rules.
 - Use `blocked_paths` only for hard prohibitions; use
   `human_review_required_paths` for changes that need human judgment.
-- Do not add named mandatory-check lists or aliases. CI identities are
-  discovered from actual provider records, not matched against a fixed list.
+- Required CI contexts come from GitHub branch protection/rulesets and are
+  matched against actual provider records. Do not silently omit a required
+  context that cannot be discovered.

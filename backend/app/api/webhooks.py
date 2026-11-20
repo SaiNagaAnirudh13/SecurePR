@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import logging
+from datetime import datetime
 from typing import Any
 
 from fastapi import (
@@ -28,11 +29,14 @@ settings = get_settings()
 # SECURITY
 # ============================================================
 
+
 def _verify_signature(raw_body: bytes, signature_header: str | None) -> None:
     """Verify that the webhook request was sent by GitHub."""
 
     if not settings.GITHUB_WEBHOOK_SECRET:
-        logger.error("Webhook signature verification unavailable: GITHUB_WEBHOOK_SECRET is not configured.")
+        logger.error(
+            "Webhook signature verification unavailable: GITHUB_WEBHOOK_SECRET is not configured."
+        )
         raise HTTPException(
             status_code=503,
             detail="Webhook signature verification is unavailable",
@@ -58,8 +62,7 @@ def _verify_signature(raw_body: bytes, signature_header: str | None) -> None:
     )
 
     if not hmac.compare_digest(expected_signature, signature_header):
-        logger.error(
-            "Webhook signature verification failed: invalid signature.")
+        logger.error("Webhook signature verification failed: invalid signature.")
         raise HTTPException(
             status_code=401,
             detail="Invalid webhook signature",
@@ -71,6 +74,7 @@ def _verify_signature(raw_body: bytes, signature_header: str | None) -> None:
 # ============================================================
 # DIAGNOSTIC HELPERS
 # ============================================================
+
 
 def _safe_get(data: Any, *keys: str) -> Any:
     """Safely retrieve nested dictionary values."""
@@ -147,9 +151,7 @@ def _log_payload_diagnostics(
             installation.get("id"),
         )
     else:
-        logger.warning(
-            "No installation object found at payload['installation']."
-        )
+        logger.warning("No installation object found at payload['installation'].")
 
     # Check other possible locations for diagnostics.
     alternate_locations = {
@@ -233,15 +235,12 @@ def _extract_installation_id(payload: dict) -> str | None:
 
         if installation_id:
             logger.info(
-                "SUCCESS: Installation ID found in "
-                "payload['installation']['id']: %s",
+                "SUCCESS: Installation ID found in payload['installation']['id']: %s",
                 installation_id,
             )
             return str(installation_id)
 
-        logger.warning(
-            "Installation object exists, but installation['id'] is empty."
-        )
+        logger.warning("Installation object exists, but installation['id'] is empty.")
 
     # Diagnostic fallback locations.
     fallback_locations = [
@@ -262,8 +261,7 @@ def _extract_installation_id(payload: dict) -> str | None:
             return str(value)
 
     logger.error(
-        "FAILED: Installation ID could not be found anywhere in "
-        "the webhook payload."
+        "FAILED: Installation ID could not be found anywhere in the webhook payload."
     )
 
     return None
@@ -272,6 +270,7 @@ def _extract_installation_id(payload: dict) -> str | None:
 # ============================================================
 # DATABASE HELPERS
 # ============================================================
+
 
 def _get_or_create_repo(
     db: Session,
@@ -282,9 +281,7 @@ def _get_or_create_repo(
     gh_repo = payload.get("repository")
 
     if not isinstance(gh_repo, dict):
-        logger.error(
-            "Repository creation failed: 'repository' object is missing."
-        )
+        logger.error("Repository creation failed: 'repository' object is missing.")
         raise HTTPException(
             status_code=400,
             detail="Webhook payload does not contain a valid repository object.",
@@ -293,9 +290,7 @@ def _get_or_create_repo(
     github_repo_id = str(gh_repo.get("id", ""))
 
     if not github_repo_id:
-        logger.error(
-            "Repository creation failed: repository ID is missing."
-        )
+        logger.error("Repository creation failed: repository ID is missing.")
         raise HTTPException(
             status_code=400,
             detail="Repository ID is missing from webhook payload.",
@@ -351,9 +346,7 @@ def _get_or_create_pr(
     gh_pr = payload.get("pull_request")
 
     if not isinstance(gh_pr, dict):
-        logger.error(
-            "PR creation failed: 'pull_request' object is missing."
-        )
+        logger.error("PR creation failed: 'pull_request' object is missing.")
         raise HTTPException(
             status_code=400,
             detail="Webhook payload does not contain a valid pull request.",
@@ -393,6 +386,12 @@ def _get_or_create_pr(
             base_branch=gh_pr.get("base", {}).get("ref", ""),
             head_branch=gh_pr.get("head", {}).get("ref", ""),
             state=gh_pr.get("state", ""),
+            merged_at=_parse_github_datetime(gh_pr.get("merged_at"))
+            if gh_pr.get("merged") is True
+            else None,
+            merge_commit_sha=gh_pr.get("merge_commit_sha")
+            if gh_pr.get("merged") is True
+            else None,
         )
 
         db.add(pr)
@@ -413,15 +412,29 @@ def _get_or_create_pr(
         pr.base_branch = gh_pr.get("base", {}).get("ref", pr.base_branch)
         pr.head_branch = gh_pr.get("head", {}).get("ref", pr.head_branch)
         pr.state = gh_pr.get("state", pr.state)
+        if gh_pr.get("merged") is True:
+            pr.merged_at = _parse_github_datetime(gh_pr.get("merged_at"))
+            pr.merge_commit_sha = gh_pr.get("merge_commit_sha")
 
     db.flush()
 
     return pr
 
 
+def _parse_github_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        logger.warning("GitHub webhook contained an invalid merged_at timestamp.")
+        return None
+
+
 # ============================================================
 # CHECK SUITE / CHECK RUN EVENT HANDLING (CI-wait fast path)
 # ============================================================
+
 
 def _ci_event_head_sha(payload: dict, event_name: str) -> str | None:
     if event_name == "status":
@@ -488,7 +501,9 @@ def _handle_check_event(
     head_sha = _ci_event_head_sha(payload, event_name)
     pr_number = _safe_get(payload, "check_run", "pull_requests")
     if isinstance(pr_number, list) and pr_number:
-        pr_number = pr_number[0].get("number") if isinstance(pr_number[0], dict) else None
+        pr_number = (
+            pr_number[0].get("number") if isinstance(pr_number[0], dict) else None
+        )
     else:
         pr_number = None
 
@@ -506,7 +521,11 @@ def _handle_check_event(
         return {"status": "ignored", "reason": f"{event_name} action is missing."}
 
     github_repo_id = str(gh_repo.get("id", ""))
-    repo = db.query(m.Repository).filter(m.Repository.github_repo_id == github_repo_id).first()
+    repo = (
+        db.query(m.Repository)
+        .filter(m.Repository.github_repo_id == github_repo_id)
+        .first()
+    )
     if not repo:
         _log_ci_event(
             event_name=event_name,
@@ -516,7 +535,10 @@ def _handle_check_event(
             matched_current_revision=False,
             reason="repository_not_tracked",
         )
-        return {"status": "ignored", "reason": "Repository not tracked by SecurePR yet."}
+        return {
+            "status": "ignored",
+            "reason": "Repository not tracked by SecurePR yet.",
+        }
 
     if not head_sha:
         _log_ci_event(
@@ -571,24 +593,36 @@ def _handle_check_event(
             matched_current_revision=True,
             reason="installation_id_missing",
         )
-        return {"status": "ignored", "reason": "No installation_id available for this repository."}
+        return {
+            "status": "ignored",
+            "reason": "No installation_id available for this repository.",
+        }
 
     for pr in matching_prs:
-        revision = db.query(m.CIRevision).filter(
-            m.CIRevision.repository_id == repo.id,
-            m.CIRevision.pull_request_id == pr.id,
-            m.CIRevision.head_sha == head_sha,
-        ).first()
+        revision = (
+            db.query(m.CIRevision)
+            .filter(
+                m.CIRevision.repository_id == repo.id,
+                m.CIRevision.pull_request_id == pr.id,
+                m.CIRevision.head_sha == head_sha,
+            )
+            .first()
+        )
         if revision is None:
             revision = m.CIRevision(
-                repository_id=repo.id, pull_request_id=pr.id,
-                head_sha=head_sha, state="UNKNOWN",
+                repository_id=repo.id,
+                pull_request_id=pr.id,
+                head_sha=head_sha,
+                state="UNKNOWN",
             )
             db.add(revision)
         revision.retry_count = 0
-        key_source = delivery_id or hashlib.sha256(
-            json.dumps(payload, sort_keys=True).encode("utf-8")
-        ).hexdigest()
+        key_source = (
+            delivery_id
+            or hashlib.sha256(
+                json.dumps(payload, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+        )
         enqueue_job(
             db,
             "CI_REFRESH",
@@ -606,8 +640,11 @@ def _handle_check_event(
     logger.info(
         "CI refresh queued independently: event_type=%s repository=%s head_sha=%s "
         "pr_numbers=%s delivery_id=%s",
-        event_name, repo.full_name, head_sha,
-        [pr.github_pr_number for pr in matching_prs], delivery_id or "payload-hash",
+        event_name,
+        repo.full_name,
+        head_sha,
+        [pr.github_pr_number for pr in matching_prs],
+        delivery_id or "payload-hash",
     )
     return {"status": "accepted", "reason": "CI state refresh queued independently."}
 
@@ -615,6 +652,7 @@ def _handle_check_event(
 # ============================================================
 # GITHUB WEBHOOK ENDPOINT
 # ============================================================
+
 
 @router.post("/github")
 async def github_webhook(
@@ -647,9 +685,7 @@ async def github_webhook(
         try:
             payload = await request.json()
         except Exception:
-            logger.exception(
-                "Failed to parse webhook request body as JSON."
-            )
+            logger.exception("Failed to parse webhook request body as JSON.")
             raise HTTPException(
                 status_code=400,
                 detail="Invalid JSON webhook payload.",
@@ -721,9 +757,7 @@ async def github_webhook(
                 "reason": f"Action '{action}' is not analyzed.",
             }
 
-        logger.info(
-            "Webhook accepted for SecurePR analysis."
-        )
+        logger.info("Webhook accepted for SecurePR analysis.")
 
         # ----------------------------------------------------
         # Extract installation ID
@@ -775,17 +809,14 @@ async def github_webhook(
             db.flush()
 
             logger.info(
-                "PR saved successfully: "
-                "pull_request_id=%s number=%s",
+                "PR saved successfully: pull_request_id=%s number=%s",
                 pr.id,
                 pr.github_pr_number,
             )
 
             db.commit()
 
-            logger.info(
-                "Database transaction committed successfully."
-            )
+            logger.info("Database transaction committed successfully.")
 
         except HTTPException:
             db.rollback()
@@ -794,9 +825,7 @@ async def github_webhook(
         except Exception:
             db.rollback()
 
-            logger.exception(
-                "Database operation failed while processing webhook."
-            )
+            logger.exception("Database operation failed while processing webhook.")
 
             raise HTTPException(
                 status_code=500,
@@ -837,39 +866,61 @@ async def github_webhook(
             },
         )
 
-        revision = db.query(m.CIRevision).filter(
-            m.CIRevision.repository_id == repo.id,
-            m.CIRevision.pull_request_id == pr.id,
-            m.CIRevision.head_sha == expected_head_sha,
-        ).first()
+        revision = (
+            db.query(m.CIRevision)
+            .filter(
+                m.CIRevision.repository_id == repo.id,
+                m.CIRevision.pull_request_id == pr.id,
+                m.CIRevision.head_sha == expected_head_sha,
+            )
+            .first()
+        )
         if revision is None:
             revision = m.CIRevision(
-                repository_id=repo.id, pull_request_id=pr.id,
-                head_sha=expected_head_sha, state="UNKNOWN",
+                repository_id=repo.id,
+                pull_request_id=pr.id,
+                head_sha=expected_head_sha,
+                state="UNKNOWN",
             )
             db.add(revision)
         enqueue_job(
-            db, "REVIEW", f"review:{repo.id}:{pr.id}:{expected_head_sha}",
-            {"repository_id": repo.id, "pull_request_id": pr.id,
-             "installation_id": installation_id, "head_sha": expected_head_sha},
+            db,
+            "REVIEW",
+            f"review:{repo.id}:{pr.id}:{expected_head_sha}",
+            {
+                "repository_id": repo.id,
+                "pull_request_id": pr.id,
+                "installation_id": installation_id,
+                "head_sha": expected_head_sha,
+            },
         )
         enqueue_job(
-            db, "REVIEW_STATUS",
+            db,
+            "REVIEW_STATUS",
             f"review-status-initial:{pr.id}:{expected_head_sha}",
-            {"repository_id": repo.id, "pull_request_id": pr.id,
-             "installation_id": installation_id, "head_sha": expected_head_sha},
+            {
+                "repository_id": repo.id,
+                "pull_request_id": pr.id,
+                "installation_id": installation_id,
+                "head_sha": expected_head_sha,
+            },
         )
         enqueue_job(
-            db, "CI_REFRESH", f"ci-initial:{repo.id}:{pr.id}:{expected_head_sha}",
-            {"repository_id": repo.id, "pull_request_id": pr.id,
-             "installation_id": installation_id, "head_sha": expected_head_sha,
-             "event_name": "pull_request", "reason": "initial"},
+            db,
+            "CI_REFRESH",
+            f"ci-initial:{repo.id}:{pr.id}:{expected_head_sha}",
+            {
+                "repository_id": repo.id,
+                "pull_request_id": pr.id,
+                "installation_id": installation_id,
+                "head_sha": expected_head_sha,
+                "event_name": "pull_request",
+                "reason": "initial",
+            },
         )
         db.commit()
 
-        logger.info(
-            "Webhook processing completed successfully."
-        )
+        logger.info("Webhook processing completed successfully.")
 
         return {
             "status": "accepted",
@@ -881,20 +932,13 @@ async def github_webhook(
         }
 
     except HTTPException:
-        logger.exception(
-            "Webhook request failed with an expected HTTP error."
-        )
+        logger.exception("Webhook request failed with an expected HTTP error.")
         raise
 
     except Exception:
-        logger.exception(
-            "UNEXPECTED WEBHOOK ERROR."
-        )
+        logger.exception("UNEXPECTED WEBHOOK ERROR.")
 
         raise HTTPException(
             status_code=500,
-            detail=(
-                "Unexpected webhook processing error. "
-                "Check backend logs."
-            ),
+            detail=("Unexpected webhook processing error. Check backend logs."),
         )

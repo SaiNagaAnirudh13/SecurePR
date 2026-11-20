@@ -6,6 +6,7 @@ PR diffs/CI checks, posting review comments, and submitting (never merging)
 PR reviews, re-validating PR state, and (only through the guarded pipeline)
 merging eligible pull requests.
 """
+
 import logging
 import threading
 import time
@@ -38,10 +39,16 @@ class GitHubClient:
 
     def _app_jwt(self) -> str:
         now = int(time.time())
-        payload = {"iat": now - 60, "exp": now + 9 * 60, "iss": self.settings.GITHUB_APP_ID}
+        payload = {
+            "iat": now - 60,
+            "exp": now + 9 * 60,
+            "iss": self.settings.GITHUB_APP_ID,
+        }
         return jwt.encode(payload, self._private_key(), algorithm="RS256")
 
-    def _installation_token(self, installation_id: str, deadline: float | None = None) -> str:
+    def _installation_token(
+        self, installation_id: str, deadline: float | None = None
+    ) -> str:
         with self._installation_token_lock:
             now = time.monotonic()
             cached = self._installation_tokens.get(installation_id)
@@ -50,11 +57,16 @@ class GitHubClient:
 
             remaining = deadline - now if deadline is not None else 15
             if remaining <= 0:
-                raise TimeoutError("GitHub installation-token request exceeded its deadline.")
+                raise TimeoutError(
+                    "GitHub installation-token request exceeded its deadline."
+                )
             app_jwt = self._app_jwt()
             resp = requests.post(
                 f"{GITHUB_API}/app/installations/{installation_id}/access_tokens",
-                headers={"Authorization": f"Bearer {app_jwt}", "Accept": "application/vnd.github+json"},
+                headers={
+                    "Authorization": f"Bearer {app_jwt}",
+                    "Accept": "application/vnd.github+json",
+                },
                 timeout=min(15, remaining),
             )
             resp.raise_for_status()
@@ -69,7 +81,10 @@ class GitHubClient:
 
     def _headers(self, installation_id: str, deadline: float | None = None) -> dict:
         token = self._installation_token(installation_id, deadline)
-        return {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+        return {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+        }
 
     def _get_with_retry(
         self,
@@ -80,11 +95,14 @@ class GitHubClient:
         timeout: float = 20,
         max_attempts: int = GITHUB_GET_MAX_ATTEMPTS,
         deadline: float | None = None,
+        allowed_statuses: tuple[int, ...] = (),
     ):
         for attempt in range(max_attempts):
             remaining = deadline - time.monotonic() if deadline is not None else timeout
             if remaining <= 0:
-                raise TimeoutError("GitHub API request exceeded its discovery deadline.")
+                raise TimeoutError(
+                    "GitHub API request exceeded its discovery deadline."
+                )
             try:
                 resp = requests.get(
                     url,
@@ -95,7 +113,7 @@ class GitHubClient:
             except requests.RequestException:
                 if attempt + 1 == max_attempts:
                     raise
-                delay = min(0.25 * (2 ** attempt), GITHUB_GET_MAX_RETRY_DELAY_SECONDS)
+                delay = min(0.25 * (2**attempt), GITHUB_GET_MAX_RETRY_DELAY_SECONDS)
                 if deadline is not None:
                     delay = min(delay, max(0, deadline - time.monotonic()))
                 time.sleep(delay)
@@ -108,6 +126,8 @@ class GitHubClient:
             )
             retryable = status in (429, 500, 502, 503, 504) or rate_limited
             if not retryable or attempt + 1 == max_attempts:
+                if status in allowed_statuses:
+                    return resp
                 resp.raise_for_status()
                 return resp
 
@@ -118,9 +138,9 @@ class GitHubClient:
                 elif rate_limited and resp.headers.get("X-RateLimit-Reset"):
                     delay = float(resp.headers["X-RateLimit-Reset"]) - time.time()
                 else:
-                    delay = 0.25 * (2 ** attempt)
+                    delay = 0.25 * (2**attempt)
             except ValueError:
-                delay = 0.25 * (2 ** attempt)
+                delay = 0.25 * (2**attempt)
             delay = min(max(delay, 0), GITHUB_GET_MAX_RETRY_DELAY_SECONDS)
             if deadline is not None:
                 delay = min(delay, max(0, deadline - time.monotonic()))
@@ -148,6 +168,7 @@ class GitHubClient:
                 deadline=deadline,
             )
             payload = resp.json()
+            raw_batch: object
             if isinstance(payload, list):
                 raw_batch = payload
             elif collection_key is not None and isinstance(payload, dict):
@@ -156,17 +177,23 @@ class GitHubClient:
                 raw_batch = None
             if not isinstance(raw_batch, list):
                 field = collection_key or "response"
-                raise ValueError(f"GitHub API response must contain a list of objects in '{field}'.")
+                raise ValueError(
+                    f"GitHub API response must contain a list of objects in '{field}'."
+                )
             batch = [item for item in raw_batch if isinstance(item, dict)]
             if len(batch) != len(raw_batch):
                 field = collection_key or "response"
-                raise ValueError(f"GitHub API response must contain a list of objects in '{field}'.")
+                raise ValueError(
+                    f"GitHub API response must contain a list of objects in '{field}'."
+                )
             items.extend(batch)
             if len(batch) < GITHUB_PAGE_SIZE:
                 return items
             page += 1
 
-    def get_pr_files(self, installation_id: str, owner: str, repo: str, pr_number: int) -> list[dict]:
+    def get_pr_files(
+        self, installation_id: str, owner: str, repo: str, pr_number: int
+    ) -> list[dict]:
         headers = self._headers(installation_id)
         payload = self._get_paginated_items(
             f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}/files",
@@ -176,17 +203,23 @@ class GitHubClient:
         for item in payload:
             filename = item.get("filename")
             if not isinstance(filename, str) or not filename:
-                raise ValueError("GitHub pull-request file response is missing a filename.")
-            files.append({
-                "file_path": filename,
-                "change_type": item.get("status"),
-                "additions": item.get("additions", 0),
-                "deletions": item.get("deletions", 0),
-                "patch_excerpt": (item.get("patch") or "")[:4000],
-            })
+                raise ValueError(
+                    "GitHub pull-request file response is missing a filename."
+                )
+            files.append(
+                {
+                    "file_path": filename,
+                    "change_type": item.get("status"),
+                    "additions": item.get("additions", 0),
+                    "deletions": item.get("deletions", 0),
+                    "patch_excerpt": (item.get("patch") or "")[:4000],
+                }
+            )
         return files
 
-    def get_check_runs(self, installation_id: str, owner: str, repo: str, head_sha: str) -> list[dict]:
+    def get_check_runs(
+        self, installation_id: str, owner: str, repo: str, head_sha: str
+    ) -> list[dict]:
         """
         Returns each check run's name, status (queued|in_progress|completed) and
         conclusion (success|failure|neutral|cancelled|timed_out|action_required|
@@ -211,23 +244,32 @@ class GitHubClient:
                 continue
             app = check.get("app") or {}
             identity = check.get("id")
-            normalized.append({
-                "identity": f"check_run:{identity}" if identity is not None else None,
-                "id": identity,
-                "kind": "check_run",
-                "name": check.get("name"),
-                "provider": app.get("slug") or app.get("name") or "GitHub Check Run",
-                "status": check.get("status"),
-                "conclusion": check.get("conclusion"),
-                "url": check.get("html_url"),
-                "html_url": check.get("html_url"),
-                "sha": check_sha,
-                "completed_at": check.get("completed_at"),
-                "started_at": check.get("started_at"),
-            })
+            normalized.append(
+                {
+                    "identity": f"check_run:{identity}"
+                    if identity is not None
+                    else None,
+                    "id": identity,
+                    "kind": "check_run",
+                    "name": check.get("name"),
+                    "provider": app.get("slug")
+                    or app.get("name")
+                    or "GitHub Check Run",
+                    "app_id": str(app.get("id")) if app.get("id") is not None else None,
+                    "status": check.get("status"),
+                    "conclusion": check.get("conclusion"),
+                    "url": check.get("html_url"),
+                    "html_url": check.get("html_url"),
+                    "sha": check_sha,
+                    "completed_at": check.get("completed_at"),
+                    "started_at": check.get("started_at"),
+                }
+            )
         return normalized
 
-    def get_check_suites(self, installation_id: str, owner: str, repo: str, head_sha: str) -> list[dict]:
+    def get_check_suites(
+        self, installation_id: str, owner: str, repo: str, head_sha: str
+    ) -> list[dict]:
         deadline = time.monotonic() + 8
         headers = self._headers(installation_id, deadline)
         suites = self._get_paginated_items(
@@ -245,23 +287,31 @@ class GitHubClient:
                 continue
             app = suite.get("app") or {}
             identity = suite.get("id")
-            normalized.append({
-                "identity": f"check_suite:{identity}" if identity is not None else None,
-                "id": identity,
-                "kind": "check_suite",
-                "name": app.get("name") or app.get("slug") or "GitHub Check Suite",
-                "provider": app.get("slug") or app.get("name") or "GitHub Check Suite",
-                "status": suite.get("status"),
-                "conclusion": suite.get("conclusion"),
-                "url": suite.get("html_url"),
-                "html_url": suite.get("html_url"),
-                "sha": suite_sha,
-                "completed_at": suite.get("completed_at"),
-                "started_at": suite.get("created_at"),
-            })
+            normalized.append(
+                {
+                    "identity": f"check_suite:{identity}"
+                    if identity is not None
+                    else None,
+                    "id": identity,
+                    "kind": "check_suite",
+                    "name": app.get("name") or app.get("slug") or "GitHub Check Suite",
+                    "provider": app.get("slug")
+                    or app.get("name")
+                    or "GitHub Check Suite",
+                    "status": suite.get("status"),
+                    "conclusion": suite.get("conclusion"),
+                    "url": suite.get("html_url"),
+                    "html_url": suite.get("html_url"),
+                    "sha": suite_sha,
+                    "completed_at": suite.get("completed_at"),
+                    "started_at": suite.get("created_at"),
+                }
+            )
         return normalized
 
-    def get_commit_statuses(self, installation_id: str, owner: str, repo: str, head_sha: str) -> list[dict]:
+    def get_commit_statuses(
+        self, installation_id: str, owner: str, repo: str, head_sha: str
+    ) -> list[dict]:
         """Legacy commit-status API (used by some non-Actions CI providers).
         Normalized into the same {name, status, conclusion} shape as check runs:
         state "pending" -> status "in_progress"/conclusion None; "success"/"failure"/
@@ -276,7 +326,7 @@ class GitHubClient:
             max_attempts=2,
             deadline=deadline,
         )
-        latest_by_context = {}
+        latest_by_context: dict[tuple[str, str | None], dict] = {}
         for s in statuses:
             state = s.get("state")
             context = s.get("context")
@@ -297,22 +347,205 @@ class GitHubClient:
                 conclusion = state
             identity = s.get("id")
             latest_by_context[(provider, context)] = {
-                "identity": f"commit_status:{identity}" if identity is not None else None,
+                "identity": f"commit_status:{identity}"
+                if identity is not None
+                else None,
                 "id": identity,
                 "kind": "commit_status",
                 "name": context,
                 "context": context,
                 "provider": provider,
+                "app_id": str(creator.get("id"))
+                if creator.get("id") is not None
+                else None,
                 "status": status,
                 "conclusion": conclusion,
                 "url": s.get("target_url"),
                 "html_url": s.get("target_url"),
                 "sha": head_sha,
-                "completed_at": s.get("updated_at") or s.get("created_at") if status == "completed" else None,
+                "completed_at": s.get("updated_at") or s.get("created_at")
+                if status == "completed"
+                else None,
                 "started_at": s.get("created_at"),
                 "created_at": s.get("created_at"),
             }
         return list(latest_by_context.values())
+
+    def get_required_status_checks(
+        self, installation_id: str, owner: str, repo: str, branch: str
+    ) -> list[dict]:
+        """Discover required checks from branch protection and applicable rulesets."""
+        headers = self._headers(installation_id)
+        branch_url = f"{GITHUB_API}/repos/{owner}/{repo}/branches/{branch}"
+        branch_response = self._get_with_retry(
+            branch_url, headers, allowed_statuses=(404,)
+        )
+        if branch_response.status_code == 404:
+            raise ValueError(
+                f"GitHub could not verify base branch protection for '{branch}'."
+            )
+        branch_data = branch_response.json()
+        if not isinstance(branch_data, dict) or not isinstance(
+            branch_data.get("protected"), bool
+        ):
+            raise ValueError("GitHub branch response is missing its protection state.")
+        required = []
+        if branch_data["protected"]:
+            checks_url = (
+                f"{GITHUB_API}/repos/{owner}/{repo}/branches/{branch}"
+                "/protection/required_status_checks"
+            )
+            response = self._get_with_retry(
+                checks_url, headers, allowed_statuses=(404,)
+            )
+            if response.status_code != 404:
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise ValueError(
+                        "GitHub required-status-check response is malformed."
+                    )
+                contexts = payload.get("checks")
+                if isinstance(contexts, list):
+                    for item in contexts:
+                        if not isinstance(item, dict) or not isinstance(
+                            item.get("context"), str
+                        ):
+                            raise ValueError(
+                                "GitHub returned a malformed required status check."
+                            )
+                        required.append(
+                            {
+                                "context": item["context"],
+                                "app_id": str(item["app_id"])
+                                if item.get("app_id") is not None
+                                else None,
+                            }
+                        )
+                else:
+                    legacy_contexts = payload.get("contexts")
+                    if not isinstance(legacy_contexts, list) or any(
+                        not isinstance(context, str) for context in legacy_contexts
+                    ):
+                        raise ValueError(
+                            "GitHub required-status-check response has no valid contexts."
+                        )
+                    required.extend(
+                        {"context": context, "app_id": None}
+                        for context in legacy_contexts
+                    )
+
+        rules_url = f"{GITHUB_API}/repos/{owner}/{repo}/rules/branches/{branch}"
+        rules = self._get_paginated_items(rules_url, headers)
+        for rule in rules:
+            if rule.get("type") != "required_status_checks":
+                continue
+            parameters = rule.get("parameters") or {}
+            checks = parameters.get("required_status_checks")
+            if not isinstance(checks, list):
+                raise ValueError(
+                    "GitHub branch ruleset has malformed required status checks."
+                )
+            for item in checks:
+                if not isinstance(item, dict) or not isinstance(
+                    item.get("context"), str
+                ):
+                    raise ValueError(
+                        "GitHub branch ruleset contains an invalid required check."
+                    )
+                required.append(
+                    {
+                        "context": item["context"],
+                        "app_id": (
+                            str(item["integration_id"])
+                            if item.get("integration_id") is not None
+                            else None
+                        ),
+                    }
+                )
+
+        unique = {(item["context"], item["app_id"]): item for item in required}
+        return list(unique.values())
+
+    def _graphql(self, installation_id: str, query: str, variables: dict) -> dict:
+        response = requests.post(
+            f"{GITHUB_API}/graphql",
+            headers=self._headers(installation_id),
+            json={"query": query, "variables": variables},
+            timeout=20,
+        )
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {"message": response.text}
+        if not response.ok:
+            return {
+                "succeeded": False,
+                "status_code": response.status_code,
+                "payload": payload,
+            }
+        if not isinstance(payload, dict) or payload.get("errors"):
+            return {
+                "succeeded": False,
+                "status_code": response.status_code,
+                "payload": payload,
+            }
+        return {
+            "succeeded": True,
+            "status_code": response.status_code,
+            "payload": payload.get("data") or {},
+        }
+
+    def get_auto_merge_capabilities(
+        self, installation_id: str, owner: str, repo: str, pr_number: int
+    ) -> dict:
+        query = """
+        query($owner: String!, $name: String!, $number: Int!) {
+          repository(owner: $owner, name: $name) {
+            autoMergeAllowed
+            mergeCommitAllowed
+            squashMergeAllowed
+            rebaseMergeAllowed
+            pullRequest(number: $number) {
+              id
+              state
+              isDraft
+              headRefOid
+              baseRefName
+              mergeable
+              mergeStateStatus
+              reviewDecision
+              autoMergeRequest { enabledAt mergeMethod }
+            }
+          }
+        }
+        """
+        return self._graphql(
+            installation_id,
+            query,
+            {"owner": owner, "name": repo, "number": pr_number},
+        )
+
+    def enable_pull_request_auto_merge(
+        self, installation_id: str, pull_request_id: str, merge_method: str
+    ) -> dict:
+        mutation = """
+        mutation($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!) {
+          enablePullRequestAutoMerge(input: {
+            pullRequestId: $pullRequestId,
+            mergeMethod: $mergeMethod
+          }) {
+            pullRequest {
+              id
+              autoMergeRequest { enabledAt mergeMethod }
+            }
+          }
+        }
+        """
+        return self._graphql(
+            installation_id,
+            mutation,
+            {"pullRequestId": pull_request_id, "mergeMethod": merge_method},
+        )
 
     def post_review(
         self,
@@ -324,6 +557,7 @@ class GitHubClient:
         event: str,
         *,
         idempotency_marker: str | None = None,
+        commit_id: str | None = None,
     ) -> dict:
         """
         event must be one of APPROVE | COMMENT | REQUEST_CHANGES.
@@ -347,14 +581,54 @@ class GitHubClient:
                 }
         resp = requests.post(
             f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
-            headers=headers, json={"body": body, "event": event}, timeout=20,
+            headers=headers,
+            json={
+                "body": body,
+                "event": event,
+                **({"commit_id": commit_id} if commit_id else {}),
+            },
+            timeout=20,
         )
         succeeded = resp.ok
         if not succeeded:
-            logger.error("GitHub review submission failed (%s): %s", resp.status_code, resp.text)
-        return {"succeeded": succeeded, "status_code": resp.status_code, "payload": resp.json() if succeeded else resp.text}
+            logger.error(
+                "GitHub review submission failed (%s): %s", resp.status_code, resp.text
+            )
+        return {
+            "succeeded": succeeded,
+            "status_code": resp.status_code,
+            "payload": resp.json() if succeeded else resp.text,
+        }
 
-    def get_pull_request(self, installation_id: str, owner: str, repo: str, pr_number: int) -> dict:
+    def dismiss_review(
+        self,
+        installation_id: str,
+        owner: str,
+        repo: str,
+        pr_number: int,
+        review_id: str,
+        message: str,
+    ) -> dict:
+        """Ask GitHub to dismiss a now-invalid SecurePR approval or request-changes review."""
+        resp = requests.put(
+            f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}/reviews/{review_id}/dismissals",
+            headers=self._headers(installation_id),
+            json={"message": message},
+            timeout=20,
+        )
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = {"message": resp.text}
+        return {
+            "succeeded": resp.ok,
+            "status_code": resp.status_code,
+            "payload": payload,
+        }
+
+    def get_pull_request(
+        self, installation_id: str, owner: str, repo: str, pr_number: int
+    ) -> dict:
         """Fetch live state used immediately before an auto-merge attempt."""
         resp = self._get_with_retry(
             f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}",
@@ -362,28 +636,12 @@ class GitHubClient:
         )
         data = resp.json()
         return {
-            "state": data.get("state"), "mergeable": data.get("mergeable"),
+            "state": data.get("state"),
+            "mergeable": data.get("mergeable"),
             "mergeable_state": data.get("mergeable_state"),
             "head_sha": (data.get("head") or {}).get("sha"),
             "base_ref": (data.get("base") or {}).get("ref"),
         }
-
-    def merge_pull_request(self, installation_id: str, owner: str, repo: str, pr_number: int,
-                           expected_head_sha: str) -> dict:
-        """Use GitHub's merge endpoint with the reviewed head SHA as a CAS guard."""
-        resp = requests.put(
-            f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}/merge",
-            headers=self._headers(installation_id),
-            json={"sha": expected_head_sha}, timeout=20,
-        )
-        try:
-            payload = resp.json()
-        except ValueError:
-            payload = {"message": resp.text}
-        if not resp.ok or not payload.get("merged", False):
-            logger.error("GitHub merge failed (%s): %s", resp.status_code, payload)
-        return {"succeeded": bool(resp.ok and payload.get("merged", False)),
-                "status_code": resp.status_code, "payload": payload}
 
     def _find_marked_record(
         self,
@@ -453,13 +711,21 @@ class GitHubClient:
                     "payload": payload,
                     "updated": resp.ok,
                 }
-        resp = requests.post(f"{GITHUB_API}/repos/{owner}/{repo}/issues/{pr_number}/comments",
-                             headers=headers, json={"body": body}, timeout=20)
+        resp = requests.post(
+            f"{GITHUB_API}/repos/{owner}/{repo}/issues/{pr_number}/comments",
+            headers=headers,
+            json={"body": body},
+            timeout=20,
+        )
         try:
             payload = resp.json()
         except ValueError:
             payload = {"message": resp.text}
-        return {"succeeded": resp.ok, "status_code": resp.status_code, "payload": payload}
+        return {
+            "succeeded": resp.ok,
+            "status_code": resp.status_code,
+            "payload": payload,
+        }
 
     def notify_owner(
         self,
@@ -475,13 +741,19 @@ class GitHubClient:
         body = f"@{owner} {message}"
         if idempotency_marker:
             return self.post_issue_comment(
-                installation_id, owner, repo, pr_number, body,
+                installation_id,
+                owner,
+                repo,
+                pr_number,
+                body,
                 idempotency_marker=idempotency_marker,
             )
         headers = self._headers(installation_id)
         resp = requests.post(
             f"{GITHUB_API}/repos/{owner}/{repo}/issues/{pr_number}/comments",
-            headers=headers, json={"body": body}, timeout=20,
+            headers=headers,
+            json={"body": body},
+            timeout=20,
         )
         return {"succeeded": resp.ok, "status_code": resp.status_code}
 

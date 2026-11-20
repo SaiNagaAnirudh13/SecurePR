@@ -19,24 +19,39 @@ from app.services.background_jobs import (
     stop_background_workers,
 )
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
 logger = logging.getLogger("securepr")
 
 settings = get_settings()
 production_runtime = is_production_runtime(settings)
 
-app = FastAPI(title="SecurePR", version="1.0.0",
-              description="AI-powered Pull Request risk assessment and automatic approval platform.",
-              docs_url=None if production_runtime else "/docs",
-              redoc_url=None if production_runtime else "/redoc",
-              openapi_url=None if production_runtime else "/openapi.json")
+app = FastAPI(
+    title="SecurePR",
+    version="1.0.0",
+    description="AI-powered Pull Request risk assessment and automatic approval platform.",
+    docs_url=None if production_runtime else "/docs",
+    redoc_url=None if production_runtime else "/redoc",
+    openapi_url=None if production_runtime else "/openapi.json",
+)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_dashboard_origins(settings),
-    allow_credentials=False, allow_methods=["*"], allow_headers=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def disable_dashboard_api_caching(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
 
 app.include_router(webhooks.router)
 app.include_router(dashboard.router)
@@ -47,7 +62,8 @@ def on_startup():
     validate_production_settings(settings)
     if not settings.GITHUB_WEBHOOK_SECRET:
         logger.warning(
-            "GITHUB_WEBHOOK_SECRET is not configured; webhook requests will be rejected.")
+            "GITHUB_WEBHOOK_SECRET is not configured; webhook requests will be rejected."
+        )
     # Create missing tables from the ORM models. The SQL Server schema remains
     # available for existing local installations and is not used for PostgreSQL.
     Base.metadata.create_all(bind=get_engine())

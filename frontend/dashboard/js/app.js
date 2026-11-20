@@ -39,6 +39,7 @@ function showDashboard() {
     dashboardInitialized = true;
   }
   loadOverview();
+  loadAutoMergeConfiguration();
   handleInitialHash();
 }
 
@@ -83,7 +84,7 @@ async function fetchProtected(path, opts, accessToken) {
   const headers = new Headers(opts.headers || {});
   headers.set('Content-Type', 'application/json');
   headers.set('Authorization', `Bearer ${accessToken}`);
-  return fetch(apiBase() + path, { ...opts, headers });
+  return fetch(apiBase() + path, { ...opts, headers, cache: 'no-store' });
 }
 
 async function api(path, opts = {}) {
@@ -142,11 +143,13 @@ function ciBadge(ci) {
     unavailable: 'CI status unavailable',
     non_success: 'CI needs attention',
     unknown: 'CI status unknown',
+    waiting_for_ci: 'Approval waiting for CI',
   };
   const titles = {
     PASSED: 'All discovered executions passed.',
     FAILED: 'At least one discovered CI execution failed.',
-    IN_PROGRESS: 'AI review is independent and published; CI monitoring continues.',
+    IN_PROGRESS: 'The final decision waits until every applicable check for this exact revision passes.',
+    WAITING_FOR_CI: 'No final decision is allowed until CI is verified for this exact revision.',
     NO_CHECKS_FOUND: 'No check runs or commit statuses were discovered for this revision.',
     NOT_CONFIGURED: 'No check runs or commit statuses were discovered for this revision.',
     UNAVAILABLE: ci.error || 'CI discovery is unavailable; bounded retries continue.',
@@ -161,6 +164,7 @@ function reviewStatusBadge(status) {
     PROCESSING: 'AI review processing',
     QUEUED: 'AI review queued',
     FAILED: 'AI review failed',
+    WAITING_FOR_CI: 'Final decision is waiting for CI verification.',
     NOT_STARTED: 'AI review not started',
   };
   return `<span class="badge">${escapeHtml(labels[status] || 'AI review status unknown')}</span>`;
@@ -380,7 +384,7 @@ async function loadOverview() {
           <td><span class="avatar-chip"><span class="avatar-circle">${initials(p.author)}</span>${escapeHtml(p.author || '')}</span></td>
           <td>${p.latest_score != null ? '<span class="badge ' + (p.latest_score < 40 ? 'LOW' : p.latest_score < 70 ? 'MEDIUM' : 'HIGH') + '">' + p.latest_score.toFixed(2) + '</span>' : '—'}</td>
           <td>${reviewStatusBadge(p.review_status)}</td>
-          <td>${badge(p.latest_decision)}</td>
+          <td>${badge(p.authoritative_decision)}</td>
           <td>${ciBadge(p.ci_status)}</td>
           <td>${timeAgo(p.updated_at)}</td>
           <td><button class="btn secondary" style="padding:5px 10px;">View →</button></td>
@@ -415,7 +419,7 @@ async function onPrRepoChange() {
         <td><code>${escapeHtml(p.head_branch || '')} → ${escapeHtml(p.base_branch || '')}</code></td>
         <td>${p.latest_score != null ? p.latest_score.toFixed(1) : '—'}</td>
         <td>${reviewStatusBadge(p.review_status)}</td>
-        <td>${badge(p.latest_decision)}</td>
+        <td>${badge(p.authoritative_decision)}</td>
         <td>${ciBadge(p.ci_status)}</td>
         <td>${p.changed_files_count}</td>
         <td>${p.findings_count}</td>
@@ -430,7 +434,8 @@ async function showPrDetail(prId) {
   panel.innerHTML = '<div class="empty-state">Loading…</div>';
   const pr = await api(`/api/pull-requests/${prId}`);
   const reviews = await api(`/api/pull-requests/${prId}/reviews`);
-  const latest = reviews.find(r => !r.is_ci_wait_placeholder) || reviews[0];
+  const latest = reviews.find(r => r.head_sha === pr.current_head_sha && !r.is_ci_wait_placeholder);
+  const ci = pr.ci_status || {};
   panel.innerHTML = `
     <div class="panel-header">
       <div>
@@ -439,9 +444,16 @@ async function showPrDetail(prId) {
       </div>
       ${reviewStatusBadge(pr.review_status)}
     </div>
-    ${latest ? `
-      <p>Latest risk score: <strong>${latest.overall_score}</strong> (${escapeHtml(latest.risk_category)}) — ${badge(latest.decision)}</p>
-    ` : '<div class="empty-state">No completed review yet.</div>'}
+    <p>Current revision: <code>${escapeHtml(pr.current_head_sha || 'unknown')}</code></p>
+    <p>Authoritative decision: ${badge(pr.authoritative_decision)} · CI: ${ciBadge(ci)}</p>
+    ${latest ? `<p>AI risk score: <strong>${Number(latest.overall_score).toFixed(2)}/100</strong> (${escapeHtml(latest.risk_category)})</p>` : '<div class="empty-state">No analysis is available for the current revision.</div>'}
+    ${ci.failed_checks?.length ? `<p><strong>Failed checks</strong></p><ul>${ci.failed_checks.map(c => `<li>${escapeHtml(c.name || c.context || 'Unnamed check')} — ${escapeHtml(c.provider || 'Unknown provider')}: ${escapeHtml(c.conclusion || 'failed')}${safeHttpUrl(c.url || c.html_url) ? ` · <a href="${safeHttpUrl(c.url || c.html_url)}" target="_blank" rel="noopener noreferrer">Details</a>` : ''}</li>`).join('')}</ul>` : ''}
+    ${ci.missing_required_checks?.length ? `<p><strong>Missing required checks:</strong> ${ci.missing_required_checks.map(escapeHtml).join(', ')}</p>` : ''}
+    ${ci.error ? `<p><strong>CI verification error:</strong> ${escapeHtml(ci.error)}</p>` : ''}
+    <p>Last CI verification: ${timeAgo(ci.last_verified_at)}</p>
+    <p>Auto-merge: ${badge(pr.auto_merge_status)}${pr.auto_merge_blocker ? ` — ${escapeHtml(pr.auto_merge_blocker)}` : ''}</p>
+    <p>Review publication: ${escapeHtml(JSON.stringify(pr.review_publications || {}))}</p>
+    ${pr.merged_at ? `<p>GitHub confirmed merge at ${timeAgo(pr.merged_at)}${pr.merge_commit_sha ? ` · commit <code>${escapeHtml(pr.merge_commit_sha)}</code>` : ''}</p>` : ''}
     <button class="btn" onclick="jumpToEvidence('${pr.repository.id}','${prId}')">View Full Evidence &amp; Replay →</button>
   `;
 }
@@ -670,10 +682,42 @@ async function onEligRepoChange() {
     document.getElementById('eligPanel').innerHTML = '<div class="empty-state">Select a repository above to see configured users.</div>';
     return;
   }
+  const selectedRepo = state.repos.find(repo => repo.id === repoId);
+  document.getElementById('repoAutoMergeEnabled').checked = Boolean(selectedRepo?.is_auto_merge_enabled);
   const authors = await api(`/api/repositories/${repoId}/authors`);
   userSel.innerHTML = '<option value="">Select a known author…</option>' +
     authors.map(a => `<option value="${escapeHtml(a.login)}">${escapeHtml(a.login)}${a.is_enabled ? ' (enabled)' : ''}</option>`).join('');
   loadEligibility();
+}
+
+async function loadAutoMergeConfiguration() {
+  try {
+    const config = await api('/api/auto-merge/config');
+    const label = config.enabled_by_securepr
+      ? 'Enabled by SecurePR configuration'
+      : 'Disabled by SecurePR configuration';
+    document.getElementById('autoMergeGlobalStatus').textContent =
+      `${label}. Configured merge method: ${config.merge_method}; low-risk-only: ${config.low_risk_only ? 'yes' : 'no'}.`;
+  } catch (e) {
+    document.getElementById('autoMergeGlobalStatus').textContent =
+      'Could not verify SecurePR auto-merge configuration.';
+  }
+}
+
+async function saveRepositoryAutoMerge() {
+  const repoId = state.selectedEligRepoId;
+  if (!repoId) {
+    toast('Select a repository first.', true);
+    return;
+  }
+  const isEnabled = document.getElementById('repoAutoMergeEnabled').checked;
+  await api('/api/repositories/auto-merge', {
+    method: 'POST',
+    body: JSON.stringify({ repository_id: repoId, is_enabled: isEnabled }),
+  });
+  const selectedRepo = state.repos.find(repo => repo.id === repoId);
+  if (selectedRepo) selectedRepo.is_auto_merge_enabled = isEnabled;
+  toast(`Repository auto-merge ${isEnabled ? 'enabled' : 'disabled'} in SecurePR settings.`);
 }
 
 async function loadEligibility() {
@@ -726,7 +770,7 @@ async function loadPolicies() {
       </div>
       <table>
         <tr><td style="width:220px;color:var(--muted);">Auto-approval threshold</td><td>${p.content.auto_approval_risk_threshold ?? '—'}</td></tr>
-        <tr><td style="color:var(--muted);">Mandatory CI checks</td><td>${(p.content.mandatory_ci_checks || []).map(c => `<code>${escapeHtml(c)}</code>`).join(' ')}</td></tr>
+        <tr><td style="color:var(--muted);">CI approval gate</td><td>Required checks for the exact revision must pass; failure blocks and incomplete verification waits.</td></tr>
         <tr><td style="color:var(--muted);">Blocked paths</td><td>${(p.content.blocked_paths || []).map(c => `<code>${escapeHtml(c)}</code>`).join(' ')}</td></tr>
         <tr><td style="color:var(--muted);">Human-review-required paths</td><td>${(p.content.human_review_required_paths || []).map(c => `<code>${escapeHtml(c)}</code>`).join(' ')}</td></tr>
         <tr><td style="color:var(--muted);">Max files for auto-approval</td><td>${p.content.max_files_for_auto_approval ?? '—'}</td></tr>

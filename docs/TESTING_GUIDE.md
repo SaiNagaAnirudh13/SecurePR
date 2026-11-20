@@ -1,16 +1,17 @@
 # SecurePR — Complete Testing Guide
 
-This walks through testing SecurePR end to end, including the independent AI
-review and CI-monitoring lifecycles. It uses the `sample-repo/` folder
+This walks through testing SecurePR end to end, including the CI-gated
+decision and CI-monitoring lifecycles. It uses the `sample-repo/` folder
 included in this project.
 
 ## 1. Start the complete application
 
 Follow `docs/SETUP_GUIDE.md` end to end first. In short, in this order:
 
-1. `DATABASE_URL` points to the Supabase PostgreSQL project; apply
-   `database/postgresql/002_independent_ci_monitoring.sql` before deploying
-   the workers to an existing database.
+1. `DATABASE_URL` points to the Supabase PostgreSQL project; apply the
+   numbered migrations, including
+   `database/postgresql/004_ci_gated_decisions.sql`, before deploying to an
+   existing database.
 2. Backend: `cd backend && venv\Scripts\activate && uvicorn app.main:app --reload --port 8000`
 3. Frontend: `cd frontend\dashboard && python -m http.server 5173`
 4. If testing against real GitHub (not just unit tests), a tunnel to your backend: `ngrok http 8000`, with that URL set as the GitHub App's webhook URL.
@@ -74,7 +75,7 @@ git checkout -b low-risk-fix
 ```
 Edit `app/utils.py`: fix the typo in the `greet()` docstring. Commit and push, then open a PR.
 
-**Expected:** SecurePR promptly posts `SecurePR Review — Waiting for CI`, then publishes the detailed AI review as soon as analysis completes, regardless of CI timing. The status comment is updated with actual CI results as they arrive; duplicate webhooks do not create duplicate reviews or status comments.
+**Expected:** SecurePR promptly posts `SecurePR Review — Waiting for CI`. It may compute a risk score while CI runs, but it does not publish an approval or manual-review decision until every applicable check for the exact SHA is verified. Once checks pass, the policy decision and detailed report are published. The waiting comment is updated in place; duplicate webhooks do not duplicate it.
 
 ### Scenario B — Higher-Risk / Security Finding
 
@@ -83,7 +84,7 @@ git checkout -b high-risk-secret
 ```
 Edit `app/db.py`: add a line like `API_KEY = "sk-test-12345"` (an obviously-fake test value — never commit a real secret). Commit, push, open a PR.
 
-**Expected:** a 🔴 **Blocked** decision — note it does **not** wait for CI first, since a confirmed secret is a critical finding that blocks immediately regardless of check status. The comment's Findings section calls out the hardcoded secret with a recommended action, and Data Security scores high in the Risk Breakdown table.
+**Expected:** while CI is pending, the only decision is `WAITING_FOR_CI`; a risk score is informational. If CI passes, the critical finding blocks. If CI fails, the result is `BLOCKED: CI Failed` and the report lists failed checks as well as risk context.
 
 ### Scenario C — Blocked Path
 
@@ -102,13 +103,17 @@ Repeat Scenario A's change as a user you did **not** mark eligible in step 5 (a 
 
 ### Scenario E — CI Pending / Slow Checks
 
-This verifies that the AI review does not wait for CI.
+This verifies the hard CI gate and that the risk analysis is not mistaken for a
+final decision.
 
 1. Temporarily add a delay to the `unit-tests` job in `.github/workflows/ci.yml` (e.g. `- run: sleep 90` before the pytest step), push it on its own branch, and open a PR.
 2. The waiting-for-CI status comment should appear promptly while the job remains in progress; it must not wait for the job.
-3. Confirm the AI review publishes as soon as analysis completes and reports actual CI progress when discovered. The dashboard should show AI review completed and CI in progress.
-4. When the delayed job finishes, its webhook should update the same status comment and dashboard without rerunning AI analysis or duplicating the review.
-5. Also test a PR with no CI workflow and one where check discovery returns an API error. The AI review should still publish; the dashboard must show no checks discovered or unavailable, never CI passed.
+3. Confirm the dashboard shows the exact SHA, risk score, and CI `IN_PROGRESS`, while the authoritative decision remains `WAITING_FOR_CI`; no approval review or completion notification should exist yet.
+4. When the delayed job finishes successfully, its webhook should update the same status comment, evaluate policy, and publish one final decision.
+5. Also test a PR with no CI workflow, an API error, and an empty/incomplete discovery response. Each must remain non-approvable; polling/retries continue, and the dashboard must never show CI passed.
+6. Make one check fail while another passes. Expect `BLOCKED: CI Failed`, the failed check/provider/details, no APPROVE review, and no auto-merge request.
+7. Test cancelled, skipped, neutral, and unknown conclusions. None satisfies the gate unless a future explicit policy rule is added.
+8. Push a new commit while a prior SHA is being reviewed. Confirm the old job/result cannot publish an approval for the new head.
 
 ### Scenario F — Circuit Breaker
 
@@ -135,14 +140,18 @@ For at least one PR from the scenarios above, open the actual comment on GitHub 
 
 ## 9. Auto-merge scenarios
 
-Enable `AUTO_MERGE_ENABLED=true`, restart the backend, and set `is_auto_merge_enabled=1` for only the test repository as documented in the setup guide.
+Only in a disposable test environment, enable `AUTO_MERGE_ENABLED=true`,
+restart the backend, and opt in only the test repository using the dashboard
+or the documented database setting. Production stays disabled unless the
+approved deployment configuration says otherwise.
 
-- A: low risk + passed CI: expect Approved, then Approved & Automatically Merged.
-- B: disable the global or repository flag: expect Approved but no merge.
-- C: medium risk: expect Manual Review and no merge.
-- D: high/critical finding: expect Blocked and no merge.
-- E: trip the circuit breaker: expect Manual Review and no merge.
-- F: remove Contents write from the installation or prevent the bot with branch protection: expect Approved, Manual Merge Required, `auto_merge_status=FAILED`, and an open PR.
+- A: low risk + all discovered and required checks passed: expect SecurePR to request GitHub auto-merge, and report it enabled only after GitHub confirms.
+- B: disable the SecurePR global or repository flag: expect the exact SecurePR-disabled status and no GitHub request.
+- C: configure GitHub repository auto-merge off: expect `GITHUB_AUTO_MERGE_DISABLED`.
+- D: remove required GitHub App permissions: expect `PERMISSION_MISSING` with the API reason and no merge request.
+- E: CI pending/failed, required review missing, branch protection blocked, or configured method unavailable: expect the exact blocker and no request.
+- F: simulate a GitHub rejection of the GraphQL mutation: expect failure recorded accurately; do not report enabled or merged.
+- G: verify `MERGED` appears only after GitHub confirms the merge through a webhook.
 
 Run automated tests with `cd backend; venv\Scripts\python -m pytest`.
 
@@ -151,8 +160,8 @@ Run automated tests with `cd backend; venv\Scripts\python -m pytest`.
 - [ ] Backend and frontend both start without errors.
 - [ ] Dashboard successfully calls the backend (no CORS/API-error toasts).
 - [ ] A real GitHub webhook reaches the backend and is processed.
-- [ ] A slow or absent CI result never prevents the AI review from publishing (Scenario E).
-- [ ] CI transitions update separately and never turn missing, unknown, or failed CI into a passed result.
+- [ ] A slow, absent, incomplete, or unavailable CI result never produces a final approval (Scenario E).
+- [ ] CI transitions update the same waiting comment and never turn missing, unknown, or failed CI into a passed result.
 - [ ] Circuit Breaker trip/resume visibly changes PR decisions without disabling analysis or comments.
 - [ ] Every dashboard page can be used end-to-end via dropdowns and clicks, with no Repository/PR/Review ID typed anywhere.
 - [ ] No console errors in the browser dev tools while navigating all seven dashboard tabs.

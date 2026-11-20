@@ -39,23 +39,32 @@ def test_unknown_check_names_are_discovered_without_name_policy():
         "conclusion": None,
     }
 
-    result = evaluate_ci_status([record])
+    result = evaluate_ci_status([record], discovery_complete=True)
 
     assert result.state == "IN_PROGRESS"
     assert result.pending_count == 1
 
 
 def test_checks_from_multiple_providers_are_aggregated():
-    result = evaluate_ci_status([
-        {
-            "kind": "check_run", "name": "compile", "provider": "actions",
-            "status": "completed", "conclusion": "success",
-        },
-        {
-            "kind": "commit_status", "context": "buildkite/deploy",
-            "provider": "buildkite", "status": "completed", "conclusion": "success",
-        },
-    ])
+    result = evaluate_ci_status(
+        [
+            {
+                "kind": "check_run",
+                "name": "compile",
+                "provider": "actions",
+                "status": "completed",
+                "conclusion": "success",
+            },
+            {
+                "kind": "commit_status",
+                "context": "buildkite/deploy",
+                "provider": "buildkite",
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ],
+        discovery_complete=True,
+    )
 
     assert result.state == "PASSED"
     assert result.passed_count == 2
@@ -73,10 +82,17 @@ def test_checks_from_multiple_providers_are_aggregated():
     ],
 )
 def test_failed_and_non_success_results_are_never_reported_as_passed(conclusion, state):
-    result = evaluate_ci_status([{
-        "kind": "check_run", "name": "unknown-check",
-        "status": "completed", "conclusion": conclusion,
-    }])
+    result = evaluate_ci_status(
+        [
+            {
+                "kind": "check_run",
+                "name": "unknown-check",
+                "status": "completed",
+                "conclusion": conclusion,
+            }
+        ],
+        discovery_complete=True,
+    )
 
     assert result.state == state
     assert result.passed_count == 0
@@ -84,10 +100,18 @@ def test_failed_and_non_success_results_are_never_reported_as_passed(conclusion,
 
 
 def test_pending_work_does_not_hide_a_discovered_failure():
-    result = evaluate_ci_status([
-        {"kind": "check_run", "name": "verify", "status": "in_progress"},
-        {"kind": "commit_status", "context": "deploy", "status": "completed", "conclusion": "error"},
-    ])
+    result = evaluate_ci_status(
+        [
+            {"kind": "check_run", "name": "verify", "status": "in_progress"},
+            {
+                "kind": "commit_status",
+                "context": "deploy",
+                "status": "completed",
+                "conclusion": "error",
+            },
+        ],
+        discovery_complete=True,
+    )
 
     assert result.state == "FAILED"
     assert result.pending_count == 1
@@ -98,23 +122,30 @@ def test_pending_work_does_not_hide_a_discovered_failure():
     "executions",
     [
         [],
-        [{
-            "kind": "check_suite", "name": "queued suite",
-            "status": "queued", "conclusion": None,
-        }],
+        [
+            {
+                "kind": "check_suite",
+                "name": "queued suite",
+                "status": "queued",
+                "conclusion": None,
+            }
+        ],
     ],
 )
 def test_no_execution_records_including_suite_only_is_no_checks(executions):
-    result = evaluate_ci_status(executions)
+    result = evaluate_ci_status(executions, discovery_complete=True)
     assert result.state == "NOT_CONFIGURED"
     assert result.pending_count == 0
 
 
 def test_queued_suite_with_active_run_is_in_progress():
-    result = evaluate_ci_status([
-        {"kind": "check_suite", "status": "queued"},
-        {"kind": "check_run", "name": "job", "status": "in_progress"},
-    ])
+    result = evaluate_ci_status(
+        [
+            {"kind": "check_suite", "status": "queued"},
+            {"kind": "check_run", "name": "job", "status": "in_progress"},
+        ],
+        discovery_complete=True,
+    )
     assert result.state == "IN_PROGRESS"
     assert result.pending_count == 1
 
@@ -130,10 +161,14 @@ def test_discovery_api_error_is_unavailable_not_success_or_failure():
 
 def test_real_failure_remains_actionable_when_another_ci_api_is_unavailable():
     result = evaluate_ci_status(
-        [{
-            "kind": "check_run", "name": "real failing execution",
-            "status": "completed", "conclusion": "failure",
-        }],
+        [
+            {
+                "kind": "check_run",
+                "name": "real failing execution",
+                "status": "completed",
+                "conclusion": "failure",
+            }
+        ],
         fetch_error="Commit status API returned 503",
     )
     assert result.state == "FAILED"
@@ -147,10 +182,16 @@ def test_no_records_before_first_discovery_is_unknown():
 
 
 def test_unknown_terminal_result_is_not_success():
-    result = evaluate_ci_status([{
-        "kind": "check_run", "name": "unknown state",
-        "status": "completed", "conclusion": "new-provider-result",
-    }])
+    result = evaluate_ci_status(
+        [
+            {
+                "kind": "check_run",
+                "name": "unknown state",
+                "status": "completed",
+                "conclusion": "new-provider-result",
+            }
+        ]
+    )
     assert result.state == "UNKNOWN"
     assert result.passed_count == result.failed_count == 0
 
@@ -180,17 +221,19 @@ def test_exact_production_failure_queued_suites_do_not_override_passed_runs():
         }
         for index in range(1, 5)
     ]
-    suites.extend([
-        {
-            "kind": "check_suite",
-            "identity": f"check_suite:{index}",
-            "status": "completed",
-            "conclusion": "success",
-        }
-        for index in range(5, 8)
-    ])
+    suites.extend(
+        [
+            {
+                "kind": "check_suite",
+                "identity": f"check_suite:{index}",
+                "status": "completed",
+                "conclusion": "success",
+            }
+            for index in range(5, 8)
+        ]
+    )
 
-    result = evaluate_ci_status(runs + suites)
+    result = evaluate_ci_status(runs + suites, discovery_complete=True)
 
     assert result.state == "PASSED"
     assert result.passed_count == 4

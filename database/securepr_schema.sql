@@ -74,6 +74,8 @@ BEGIN
         base_branch         NVARCHAR(255) NULL,
         head_branch         NVARCHAR(255) NULL,
         state               NVARCHAR(32) NOT NULL CONSTRAINT DF_pr_state DEFAULT 'open',
+        merged_at           DATETIME2 NULL,
+        merge_commit_sha    NVARCHAR(64) NULL,
         created_at          DATETIME2 NOT NULL CONSTRAINT DF_pr_created DEFAULT SYSUTCDATETIME(),
         updated_at          DATETIME2 NOT NULL CONSTRAINT DF_pr_updated DEFAULT SYSUTCDATETIME(),
         CONSTRAINT FK_pr_repository FOREIGN KEY (repository_id) REFERENCES dbo.repositories(id),
@@ -81,6 +83,13 @@ BEGIN
     );
     CREATE INDEX IX_pull_requests_repository_id ON dbo.pull_requests(repository_id);
 END
+GO
+
+IF COL_LENGTH('dbo.pull_requests', 'merged_at') IS NULL
+    ALTER TABLE dbo.pull_requests ADD merged_at DATETIME2 NULL;
+GO
+IF COL_LENGTH('dbo.pull_requests', 'merge_commit_sha') IS NULL
+    ALTER TABLE dbo.pull_requests ADD merge_commit_sha NVARCHAR(64) NULL;
 GO
 
 /* -------------------------------------------------------------- commits --- */
@@ -193,6 +202,8 @@ BEGIN
 
         decision                  NVARCHAR(16) NOT NULL CONSTRAINT DF_rv_decision DEFAULT 'PENDING',
         decision_reasons          NVARCHAR(MAX) NULL,  -- JSON array of strings
+        lifecycle_state           NVARCHAR(32) NOT NULL CONSTRAINT DF_rv_lifecycle DEFAULT 'RECEIVED',
+        ci_verified_at            DATETIME2 NULL,
         circuit_breaker_active    BIT NOT NULL CONSTRAINT DF_rv_cb_active DEFAULT 0,
         github_comment_url        NVARCHAR(1024) NULL,
         github_review_state       NVARCHAR(32) NULL,
@@ -218,6 +229,14 @@ BEGIN
     CREATE INDEX IX_reviews_pr ON dbo.reviews(pull_request_id);
     CREATE INDEX IX_reviews_decision ON dbo.reviews(decision);
 END
+GO
+
+IF COL_LENGTH('dbo.reviews', 'lifecycle_state') IS NULL
+    ALTER TABLE dbo.reviews ADD lifecycle_state NVARCHAR(32) NOT NULL
+        CONSTRAINT DF_rv_lifecycle DEFAULT 'RECEIVED';
+GO
+IF COL_LENGTH('dbo.reviews', 'ci_verified_at') IS NULL
+    ALTER TABLE dbo.reviews ADD ci_verified_at DATETIME2 NULL;
 GO
 
 /* ---------------------------------------------------------------------------
@@ -395,7 +414,7 @@ BEGIN
         repository_id      UNIQUEIDENTIFIER NOT NULL,
         pull_request_id    UNIQUEIDENTIFIER NOT NULL,
         head_sha           NVARCHAR(64) NOT NULL,
-        message_type       NVARCHAR(32) NOT NULL,
+        message_type       NVARCHAR(64) NOT NULL,
         state              NVARCHAR(16) NOT NULL CONSTRAINT DF_rpub_state DEFAULT 'PENDING',
         github_message_id  NVARCHAR(64) NULL,
         marker             NVARCHAR(255) NULL,
@@ -407,6 +426,20 @@ BEGIN
         CONSTRAINT FK_rpub_pull_request FOREIGN KEY (pull_request_id) REFERENCES dbo.pull_requests(id)
     );
     CREATE INDEX IX_review_publications_pr_sha ON dbo.review_publications(pull_request_id, head_sha);
+END
+GO
+
+IF COL_LENGTH('dbo.review_publications', 'message_type') < 128
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM sys.key_constraints
+        WHERE parent_object_id = OBJECT_ID('dbo.review_publications')
+          AND name = 'UQ_rpub_revision_type'
+    )
+        ALTER TABLE dbo.review_publications DROP CONSTRAINT UQ_rpub_revision_type;
+    ALTER TABLE dbo.review_publications ALTER COLUMN message_type NVARCHAR(64) NOT NULL;
+    ALTER TABLE dbo.review_publications ADD CONSTRAINT UQ_rpub_revision_type
+        UNIQUE (repository_id, pull_request_id, head_sha, message_type);
 END
 GO
 
@@ -475,6 +508,9 @@ BEGIN
         head_sha           NVARCHAR(64) NOT NULL,
         state              NVARCHAR(24) NOT NULL CONSTRAINT DF_ci_revisions_state DEFAULT 'UNKNOWN',
         error              NVARCHAR(MAX) NULL,
+        required_checks    NVARCHAR(MAX) NOT NULL CONSTRAINT DF_ci_revisions_required DEFAULT N'[]',
+        discovery_complete BIT NOT NULL CONSTRAINT DF_ci_revisions_discovered DEFAULT 0,
+        last_verified_at   DATETIME2 NULL,
         retry_count        INT NOT NULL CONSTRAINT DF_ci_revisions_retry DEFAULT 0,
         poll_count         INT NOT NULL CONSTRAINT DF_ci_revisions_poll DEFAULT 0,
         updated_at         DATETIME2 NOT NULL CONSTRAINT DF_ci_revisions_updated DEFAULT SYSUTCDATETIME(),
@@ -486,6 +522,18 @@ BEGIN
 END
 GO
 
+IF COL_LENGTH('dbo.ci_revisions', 'required_checks') IS NULL
+    ALTER TABLE dbo.ci_revisions ADD required_checks NVARCHAR(MAX) NOT NULL
+        CONSTRAINT DF_ci_revisions_required DEFAULT N'[]';
+GO
+IF COL_LENGTH('dbo.ci_revisions', 'discovery_complete') IS NULL
+    ALTER TABLE dbo.ci_revisions ADD discovery_complete BIT NOT NULL
+        CONSTRAINT DF_ci_revisions_discovered DEFAULT 0;
+GO
+IF COL_LENGTH('dbo.ci_revisions', 'last_verified_at') IS NULL
+    ALTER TABLE dbo.ci_revisions ADD last_verified_at DATETIME2 NULL;
+GO
+
 IF OBJECT_ID('dbo.ci_executions', 'U') IS NULL
 BEGIN
     CREATE TABLE dbo.ci_executions (
@@ -494,6 +542,7 @@ BEGIN
         identity           NVARCHAR(255) NOT NULL,
         kind               NVARCHAR(24) NOT NULL,
         provider           NVARCHAR(255) NULL,
+        app_id             NVARCHAR(64) NULL,
         context            NVARCHAR(512) NULL,
         name               NVARCHAR(512) NULL,
         status             NVARCHAR(32) NULL,
@@ -506,6 +555,10 @@ BEGIN
     );
     CREATE INDEX IX_ci_execution_revision ON dbo.ci_executions(ci_revision_id);
 END
+GO
+
+IF COL_LENGTH('dbo.ci_executions', 'app_id') IS NULL
+    ALTER TABLE dbo.ci_executions ADD app_id NVARCHAR(64) NULL;
 GO
 
 PRINT 'SecurePR schema verified/created successfully.';

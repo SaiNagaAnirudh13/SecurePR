@@ -158,8 +158,18 @@ def test_commit_statuses_keep_only_the_latest_context_result(monkeypatch):
     client = github_module.GitHubClient()
     monkeypatch.setattr(client, "_headers", lambda installation_id, deadline=None: {})
     statuses = [
-        {"id": 2, "context": "checks/security", "state": "success", "created_at": "2026-01-02T00:00:00Z"},
-        {"id": 1, "context": "checks/security", "state": "pending", "created_at": "2026-01-01T00:00:00Z"},
+        {
+            "id": 2,
+            "context": "checks/security",
+            "state": "success",
+            "created_at": "2026-01-02T00:00:00Z",
+        },
+        {
+            "id": 1,
+            "context": "checks/security",
+            "state": "pending",
+            "created_at": "2026-01-01T00:00:00Z",
+        },
     ]
     monkeypatch.setattr(
         github_module.requests,
@@ -186,7 +196,12 @@ def test_check_suites_are_normalized_and_reject_other_revisions(monkeypatch):
             "html_url": "https://github.com/octo/widgets/runs/9",
             "app": {"name": "GitHub Actions", "slug": "github-actions"},
         },
-        {"id": 10, "head_sha": "old-sha", "status": "completed", "conclusion": "failure"},
+        {
+            "id": 10,
+            "head_sha": "old-sha",
+            "status": "completed",
+            "conclusion": "failure",
+        },
     ]
     monkeypatch.setattr(
         github_module.requests,
@@ -203,17 +218,80 @@ def test_check_suites_are_normalized_and_reject_other_revisions(monkeypatch):
     assert result[0]["url"] == "https://github.com/octo/widgets/runs/9"
 
 
+def test_required_checks_combine_branch_protection_and_rulesets(monkeypatch):
+    client = github_module.GitHubClient()
+    monkeypatch.setattr(client, "_headers", lambda *args, **kwargs: {})
+
+    def fake_get(url, headers, params=None, **kwargs):
+        if url.endswith("/branches/main"):
+            return FakeResponse({"protected": True})
+        if url.endswith("/protection/required_status_checks"):
+            return FakeResponse(
+                {
+                    "checks": [
+                        {"context": "build", "app_id": 12},
+                        {"context": "unit-tests", "app_id": None},
+                    ],
+                }
+            )
+        raise AssertionError(f"Unexpected endpoint: {url}")
+
+    monkeypatch.setattr(client, "_get_with_retry", fake_get)
+    monkeypatch.setattr(
+        client,
+        "_get_paginated_items",
+        lambda *args, **kwargs: [
+            {
+                "type": "required_status_checks",
+                "parameters": {
+                    "required_status_checks": [
+                        {"context": "build", "integration_id": 12},
+                        {"context": "release-gate", "integration_id": 45},
+                    ],
+                },
+            },
+        ],
+    )
+
+    result = client.get_required_status_checks("42", "octo", "widgets", "main")
+
+    assert result == [
+        {"context": "build", "app_id": "12"},
+        {"context": "unit-tests", "app_id": None},
+        {"context": "release-gate", "app_id": "45"},
+    ]
+
+
+def test_required_check_discovery_errors_are_not_empty_success(monkeypatch):
+    client = github_module.GitHubClient()
+    monkeypatch.setattr(client, "_headers", lambda *args, **kwargs: {})
+
+    def fail_request(*args, **kwargs):
+        raise github_module.requests.HTTPError("forbidden")
+
+    monkeypatch.setattr(
+        client,
+        "_get_with_retry",
+        fail_request,
+    )
+
+    with pytest.raises(github_module.requests.HTTPError):
+        client.get_required_status_checks("42", "octo", "widgets", "main")
+
+
 def test_github_get_retries_rate_limits_with_bounded_retry_after(monkeypatch):
     client = github_module.GitHubClient()
     monkeypatch.setattr(client, "_headers", lambda installation_id, deadline=None: {})
-    responses = iter([
-        FakeResponse(
-            {"message": "rate limited"},
-            status_code=429,
-            headers={"Retry-After": "2"},
-        ),
-        FakeResponse({"statuses": []}),
-    ])
+    responses = iter(
+        [
+            FakeResponse(
+                {"message": "rate limited"},
+                status_code=429,
+                headers={"Retry-After": "2"},
+            ),
+            FakeResponse({"statuses": []}),
+        ]
+    )
     sleeps = []
     monkeypatch.setattr(github_module.requests, "get", lambda *a, **kw: next(responses))
     monkeypatch.setattr(github_module.time, "sleep", sleeps.append)
@@ -278,10 +356,12 @@ def test_malformed_pr_file_payload_is_rejected(monkeypatch):
 
 def test_review_and_comment_collection_endpoints_accept_raw_arrays(monkeypatch):
     client = github_module.GitHubClient()
-    pages = iter([
-        FakeResponse([{"id": index, "body": "review"} for index in range(100)]),
-        FakeResponse([]),
-    ])
+    pages = iter(
+        [
+            FakeResponse([{"id": index, "body": "review"} for index in range(100)]),
+            FakeResponse([]),
+        ]
+    )
     calls = []
 
     def fake_get(url, headers, params, timeout):
@@ -320,10 +400,12 @@ def test_wrapped_collections_and_empty_raw_arrays_are_valid(monkeypatch):
 def test_marked_review_retries_after_ambiguous_post_without_duplicate(monkeypatch):
     client = github_module.GitHubClient()
     marker = "<!-- securepr-review:pr:sha -->"
-    get_responses = iter([
-        FakeResponse([]),
-        FakeResponse([{"id": 9, "body": f"review {marker}"}]),
-    ])
+    get_responses = iter(
+        [
+            FakeResponse([]),
+            FakeResponse([{"id": 9, "body": f"review {marker}"}]),
+        ]
+    )
     post_calls = []
     monkeypatch.setattr(client, "_headers", lambda installation_id, deadline=None: {})
     monkeypatch.setattr(
@@ -341,11 +423,21 @@ def test_marked_review_retries_after_ambiguous_post_without_duplicate(monkeypatc
     )
 
     first = client.post_review(
-        "42", "octo", "widgets", 7, f"review {marker}", "COMMENT",
+        "42",
+        "octo",
+        "widgets",
+        7,
+        f"review {marker}",
+        "COMMENT",
         idempotency_marker=marker,
     )
     retry = client.post_review(
-        "42", "octo", "widgets", 7, f"review {marker}", "COMMENT",
+        "42",
+        "octo",
+        "widgets",
+        7,
+        f"review {marker}",
+        "COMMENT",
         idempotency_marker=marker,
     )
 
@@ -368,13 +460,19 @@ def test_review_lookup_api_error_is_not_treated_as_an_empty_list(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        github_module.requests, "post",
+        github_module.requests,
+        "post",
         lambda *args, **kwargs: post_calls.append((args, kwargs)),
     )
 
     with pytest.raises(github_module.requests.HTTPError):
         client.post_review(
-            "42", "octo", "widgets", 7, "body <!-- marker -->", "COMMENT",
+            "42",
+            "octo",
+            "widgets",
+            7,
+            "body <!-- marker -->",
+            "COMMENT",
             idempotency_marker="<!-- marker -->",
         )
     assert post_calls == []
@@ -384,10 +482,12 @@ def test_marked_issue_comment_is_updated_in_place(monkeypatch):
     client = github_module.GitHubClient()
     marker = "<!-- securepr-status:pr:sha -->"
     patch_calls = []
-    get_responses = iter([
-        FakeResponse([{"id": 19, "body": f"Waiting {marker}"}]),
-        FakeResponse([{"id": 19, "body": f"Final {marker}"}]),
-    ])
+    get_responses = iter(
+        [
+            FakeResponse([{"id": 19, "body": f"Waiting {marker}"}]),
+            FakeResponse([{"id": 19, "body": f"Final {marker}"}]),
+        ]
+    )
     monkeypatch.setattr(client, "_headers", lambda installation_id, deadline=None: {})
     monkeypatch.setattr(
         github_module.requests,
@@ -404,11 +504,19 @@ def test_marked_issue_comment_is_updated_in_place(monkeypatch):
     )
 
     updated = client.post_issue_comment(
-        "42", "octo", "widgets", 7, f"Final {marker}",
+        "42",
+        "octo",
+        "widgets",
+        7,
+        f"Final {marker}",
         idempotency_marker=marker,
     )
     unchanged = client.post_issue_comment(
-        "42", "octo", "widgets", 7, f"Final {marker}",
+        "42",
+        "octo",
+        "widgets",
+        7,
+        f"Final {marker}",
         idempotency_marker=marker,
     )
 
