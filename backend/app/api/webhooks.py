@@ -12,6 +12,7 @@ from fastapi import (
     HTTPException,
     Request,
 )
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -499,13 +500,29 @@ def _handle_check_event(
 
     repository_name = gh_repo.get("full_name")
     head_sha = _ci_event_head_sha(payload, event_name)
-    pr_number = _safe_get(payload, "check_run", "pull_requests")
-    if isinstance(pr_number, list) and pr_number:
-        pr_number = (
-            pr_number[0].get("number") if isinstance(pr_number[0], dict) else None
+    check_payload_key = {
+        "check_run": "check_run",
+        "check_suite": "check_suite",
+    }.get(event_name)
+    event_pull_requests = (
+        _safe_get(payload, check_payload_key, "pull_requests")
+        if check_payload_key
+        else None
+    )
+    pr_numbers = (
+        sorted(
+            {
+                item["number"]
+                for item in event_pull_requests or []
+                if isinstance(item, dict)
+                and isinstance(item.get("number"), int)
+                and not isinstance(item.get("number"), bool)
+            }
         )
-    else:
-        pr_number = None
+        if isinstance(event_pull_requests, list)
+        else []
+    )
+    pr_number = pr_numbers[0] if len(pr_numbers) == 1 else None
 
     action = payload.get("action")
     if event_name != "status" and (not isinstance(action, str) or not action):
@@ -521,29 +538,10 @@ def _handle_check_event(
         return {"status": "ignored", "reason": f"{event_name} action is missing."}
 
     github_repo_id = str(gh_repo.get("id", ""))
-    repo = (
-        db.query(m.Repository)
-        .filter(m.Repository.github_repo_id == github_repo_id)
-        .first()
-    )
-    if not repo:
-        _log_ci_event(
-            event_name=event_name,
-            repository=repository_name,
-            pr_number=pr_number,
-            head_sha=head_sha,
-            matched_current_revision=False,
-            reason="repository_not_tracked",
-        )
-        return {
-            "status": "ignored",
-            "reason": "Repository not tracked by SecurePR yet.",
-        }
-
     if not head_sha:
         _log_ci_event(
             event_name=event_name,
-            repository=repo.full_name,
+            repository=repository_name,
             pr_number=pr_number,
             head_sha=None,
             matched_current_revision=False,
@@ -551,92 +549,141 @@ def _handle_check_event(
         )
         return {"status": "ignored", "reason": "No head_sha on check event."}
 
-    matching_prs = (
-        db.query(m.PullRequest)
-        .filter(
+    try:
+        repo = (
+            db.query(m.Repository)
+            .filter(m.Repository.github_repo_id == github_repo_id)
+            .first()
+        )
+        if not repo:
+            _log_ci_event(
+                event_name=event_name,
+                repository=repository_name,
+                pr_number=pr_number,
+                head_sha=head_sha,
+                matched_current_revision=False,
+                reason="repository_not_tracked",
+            )
+            return {
+                "status": "ignored",
+                "reason": "Repository not tracked by SecurePR yet.",
+            }
+
+        pr_query = db.query(m.PullRequest).filter(
             m.PullRequest.repository_id == repo.id,
             m.PullRequest.head_sha == head_sha,
             m.PullRequest.state == "open",
         )
-        .all()
-    )
-    if not matching_prs:
-        _log_ci_event(
-            event_name=event_name,
-            repository=repo.full_name,
-            pr_number=pr_number,
-            head_sha=head_sha,
-            matched_current_revision=False,
-            reason="no_open_pr_at_current_head_sha",
-        )
-        return {
-            "status": "ignored",
-            "reason": "No open SecurePR-tracked PR has this current head SHA.",
-        }
-
-    for pr in matching_prs:
-        _log_ci_event(
-            event_name=event_name,
-            repository=repo.full_name,
-            pr_number=pr.github_pr_number,
-            head_sha=head_sha,
-            matched_current_revision=True,
-        )
-
-    installation_id = _extract_installation_id(payload) or repo.installation_id
-    if not installation_id:
-        _log_ci_event(
-            event_name=event_name,
-            repository=repo.full_name,
-            pr_number=pr_number,
-            head_sha=head_sha,
-            matched_current_revision=True,
-            reason="installation_id_missing",
-        )
-        return {
-            "status": "ignored",
-            "reason": "No installation_id available for this repository.",
-        }
-
-    for pr in matching_prs:
-        revision = (
-            db.query(m.CIRevision)
-            .filter(
-                m.CIRevision.repository_id == repo.id,
-                m.CIRevision.pull_request_id == pr.id,
-                m.CIRevision.head_sha == head_sha,
-            )
-            .first()
-        )
-        if revision is None:
-            revision = m.CIRevision(
-                repository_id=repo.id,
-                pull_request_id=pr.id,
+        if pr_numbers:
+            pr_query = pr_query.filter(m.PullRequest.github_pr_number.in_(pr_numbers))
+        matching_prs = pr_query.all()
+        if not matching_prs:
+            _log_ci_event(
+                event_name=event_name,
+                repository=repo.full_name,
+                pr_number=pr_number,
                 head_sha=head_sha,
-                state="UNKNOWN",
+                matched_current_revision=False,
+                reason="no_open_pr_at_current_head_sha",
             )
-            db.add(revision)
-        revision.retry_count = 0
-        key_source = (
-            delivery_id
-            or hashlib.sha256(
-                json.dumps(payload, sort_keys=True).encode("utf-8")
-            ).hexdigest()
-        )
-        enqueue_job(
-            db,
-            "CI_REFRESH",
-            f"ci-event:{repo.id}:{pr.id}:{head_sha}:{key_source}",
-            {
-                "repository_id": repo.id,
-                "pull_request_id": pr.id,
-                "installation_id": installation_id,
+            return {
+                "status": "ignored",
+                "reason": "No open SecurePR-tracked PR has this current head SHA.",
+            }
+
+        for pr in matching_prs:
+            _log_ci_event(
+                event_name=event_name,
+                repository=repo.full_name,
+                pr_number=pr.github_pr_number,
+                head_sha=head_sha,
+                matched_current_revision=True,
+            )
+
+        installation_id = _extract_installation_id(payload) or repo.installation_id
+        if not installation_id:
+            _log_ci_event(
+                event_name=event_name,
+                repository=repo.full_name,
+                pr_number=pr_number,
+                head_sha=head_sha,
+                matched_current_revision=True,
+                reason="installation_id_missing",
+            )
+            return {
+                "status": "ignored",
+                "reason": "No installation_id available for this repository.",
+            }
+
+        for pr in matching_prs:
+            revision = (
+                db.query(m.CIRevision)
+                .filter(
+                    m.CIRevision.repository_id == repo.id,
+                    m.CIRevision.pull_request_id == pr.id,
+                    m.CIRevision.head_sha == head_sha,
+                )
+                .first()
+            )
+            if revision is None:
+                revision = m.CIRevision(
+                    repository_id=repo.id,
+                    pull_request_id=pr.id,
+                    head_sha=head_sha,
+                    state="UNKNOWN",
+                )
+                db.add(revision)
+            revision.retry_count = 0
+            key_source = (
+                delivery_id
+                or hashlib.sha256(
+                    json.dumps(payload, sort_keys=True).encode("utf-8")
+                ).hexdigest()
+            )
+            enqueue_job(
+                db,
+                "CI_REFRESH",
+                f"ci-event:{repo.id}:{pr.id}:{head_sha}:{key_source}",
+                {
+                    "repository_id": repo.id,
+                    "pull_request_id": pr.id,
+                    "installation_id": installation_id,
+                    "head_sha": head_sha,
+                    "event_name": event_name,
+                    "reason": "webhook",
+                },
+            )
+        db.commit()
+    except SQLAlchemyError as exc:
+        try:
+            db.rollback()
+        except SQLAlchemyError:
+            logger.exception(
+                "Check webhook transaction rollback failed: event_type=%s repository=%s head_sha=%s",
+                event_name,
+                repository_name,
+                head_sha,
+            )
+        logger.exception(
+            "Check webhook database processing failed: event_type=%s repository=%s head_sha=%s delivery_id=%s",
+            event_name,
+            repository_name,
+            head_sha,
+            delivery_id or "unknown",
+            extra={
+                "event_type": event_name,
+                "repository": repository_name,
                 "head_sha": head_sha,
-                "event_name": event_name,
-                "reason": "webhook",
+                "delivery_id": delivery_id,
+                "database_error_type": type(exc).__name__,
+                "processing_failed": True,
             },
         )
-    db.commit()
+        raise HTTPException(
+            status_code=503,
+            detail="Check event could not be processed because a database operation failed.",
+        ) from exc
+
     logger.info(
         "CI refresh queued independently: event_type=%s repository=%s head_sha=%s "
         "pr_numbers=%s delivery_id=%s",

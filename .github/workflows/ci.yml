@@ -11,6 +11,22 @@ permissions:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: securepr_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: securepr_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d securepr_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TEST_POSTGRES_URL: postgresql+psycopg2://postgres:securepr_test@127.0.0.1:5432/securepr_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -30,6 +46,9 @@ jobs:
         run: >-
           python -m ruff format --check tests/test_webhook_lifecycle.py
           tests/test_health.py tests/test_dashboard_contract.py
+          tests/test_check_webhook_events.py
+          tests/test_pull_request_schema_migration.py
+          migrations/env.py migrations/versions/20261120_01_reconcile_ci_gate_schema.py
         working-directory: backend
       - name: Run Mypy
         run: >-

@@ -1,5 +1,9 @@
 import logging
+from pathlib import Path
 
+from alembic.config import Config
+from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
@@ -64,11 +68,28 @@ def on_startup():
         logger.warning(
             "GITHUB_WEBHOOK_SECRET is not configured; webhook requests will be rejected."
         )
-    # Create missing tables from the ORM models. The SQL Server schema remains
-    # available for existing local installations and is not used for PostgreSQL.
-    Base.metadata.create_all(bind=get_engine())
+    if production_runtime:
+        alembic_config = Config(
+            str(Path(__file__).resolve().parents[1] / "alembic.ini")
+        )
+        expected_revision = ScriptDirectory.from_config(
+            alembic_config
+        ).get_current_head()
+        with get_engine().connect() as connection:
+            current_revision = MigrationContext.configure(
+                connection
+            ).get_current_revision()
+        if current_revision != expected_revision:
+            raise RuntimeError(
+                "Production database migrations are not current; "
+                "run `alembic upgrade head` before starting the application."
+            )
+    else:
+        # Local development can create new databases; production schema changes
+        # are exclusively applied by the Render pre-deploy migration command.
+        Base.metadata.create_all(bind=get_engine())
     start_background_workers()
-    logger.info("Database tables verified/created.")
+    logger.info("Database schema verified.")
 
 
 @app.on_event("shutdown")

@@ -85,7 +85,35 @@ Set the connection string in `backend/.env` using the database password from the
 DATABASE_URL=postgresql://postgres:[PASSWORD]@db.haxqjifflpwzxowevzvz.supabase.co:5432/postgres?sslmode=require
 ```
 
-URL-encode special characters in the password. `sslmode=require` enables TLS for the Supabase connection. On first startup, SQLAlchemy creates missing tables, constraints, and indexes from `backend/app/models/models.py`. For an existing PostgreSQL database, apply the numbered migrations in order, including `database/postgresql/004_ci_gated_decisions.sql`, before deploying this version. Migration `004` adds durable decision lifecycle, required-check discovery, verification timestamp, and merge result fields without dropping data. The reference schema `database/postgresql/001_initial_schema.sql` is for new installations. The existing `database/securepr_schema.sql` remains the SQL Server fallback and must not be run against PostgreSQL.
+URL-encode special characters in the password. `sslmode=require` enables TLS
+for the Supabase connection. The numbered SQL files in `database/postgresql/`
+are the legacy bootstrap history. The deployment migration is now
+Alembic-managed:
+`backend/migrations/versions/20261120_01_reconcile_ci_gate_schema.py`
+safely reconciles the changes from SQL migration `004`, including the
+pull-request merge metadata. It adds nullable fields and widens the
+publication message type without replacing existing rows. It is forward-only
+because dropping columns during rollback could discard production data.
+
+Render's `render.yaml` runs `alembic upgrade head` as the service
+`preDeployCommand`, before the new application instance starts. Set Render's
+`DATABASE_URL` to the intended production PostgreSQL URL; the migration
+command and backend use the same setting, and neither prints it. Configure a
+single pre-deploy migration command rather than running migrations from app
+workers. Render supports `preDeployCommand` only for paid web services,
+private services, and background workers. If the backend is on a plan that
+does not support it, move it to a supported plan or run the same command once
+as a serialized release step before routing traffic; do not rely on startup
+workers to race through migrations. Production startup verifies that the
+Alembic revision is current and does not call `create_all`; a failed or
+skipped migration prevents the app from starting. Local development retains
+`create_all` for disposable databases.
+
+For a fresh database, initialize the tables with
+`database/postgresql/001_initial_schema.sql` and the required legacy bootstrap
+scripts first, then run `alembic upgrade head`. The existing
+`database/securepr_schema.sql` remains the SQL Server fallback and must not be
+run against PostgreSQL.
 
 The app does not copy existing SQL Server rows automatically. Before migrating any local data, ensure the source SQL Server is available and take a backup; the current local database was not reachable during this setup.
 
