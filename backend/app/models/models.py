@@ -294,6 +294,7 @@ class Review(Base):
             native_enum=False,
             create_constraint=True,
             name="ck_reviews_decision",
+            length=40,
         ),
         default=DecisionStatus.PENDING,
         nullable=False,
@@ -301,7 +302,7 @@ class Review(Base):
     )
     decision_reasons = Column(JSON)  # list[str]
     lifecycle_state = Column(
-        String(32),
+        String(40),
         default="RECEIVED",
         nullable=False,
         server_default=text("'RECEIVED'"),

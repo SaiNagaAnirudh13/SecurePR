@@ -68,7 +68,8 @@ def postgres_migration_database():
             """
             CREATE TABLE reviews (
                 id VARCHAR(36) PRIMARY KEY,
-                decision VARCHAR(32) NOT NULL DEFAULT 'PENDING'
+                decision VARCHAR(14) NOT NULL DEFAULT 'PENDING',
+                lifecycle_state VARCHAR(14) NOT NULL DEFAULT 'RECEIVED'
             )
             """
         )
@@ -107,6 +108,12 @@ def postgres_migration_database():
             text(
                 "INSERT INTO review_publications (id, message_type) "
                 "VALUES ('existing-publication', 'REVIEW')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO reviews (id, decision, lifecycle_state) "
+                "VALUES ('existing-review', 'PENDING', 'RECEIVED')"
             )
         )
 
@@ -166,6 +173,98 @@ def test_postgres_migration_adds_columns_and_preserves_existing_pr(
         )
     ).scalar_one()
     assert publication_length == 64
+    assert connection.execute(
+        text(
+            "SELECT decision, lifecycle_state FROM reviews WHERE id = 'existing-review'"
+        )
+    ).one() == ("PENDING", "RECEIVED")
+    state_lengths = connection.execute(
+        text(
+            "SELECT column_name, character_maximum_length "
+            "FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = 'reviews' "
+            "AND column_name IN ('decision', 'lifecycle_state')"
+        )
+    ).all()
+    assert dict(state_lengths) == {"decision": 40, "lifecycle_state": 40}
+
+
+def test_postgres_migration_saves_all_decision_and_lifecycle_states(
+    postgres_migration_database,
+):
+    connection, config = postgres_migration_database
+    command.upgrade(config, "head")
+
+    for decision in m.DecisionStatus:
+        connection.execute(
+            text(
+                "UPDATE reviews SET decision = :decision WHERE id = 'existing-review'"
+            ),
+            {"decision": decision.value},
+        )
+        assert (
+            connection.execute(
+                text("SELECT decision FROM reviews WHERE id = 'existing-review'")
+            ).scalar_one()
+            == decision.value
+        )
+
+    lifecycle_states = {"RECEIVED", "ANALYSIS_FAILED"} | {
+        decision.value for decision in m.DecisionStatus
+    }
+    for lifecycle_state in lifecycle_states:
+        connection.execute(
+            text(
+                "UPDATE reviews SET lifecycle_state = :lifecycle_state "
+                "WHERE id = 'existing-review'"
+            ),
+            {"lifecycle_state": lifecycle_state},
+        )
+        assert (
+            connection.execute(
+                text("SELECT lifecycle_state FROM reviews WHERE id = 'existing-review'")
+            ).scalar_one()
+            == lifecycle_state
+        )
+
+
+def test_postgres_migration_keeps_preexpanded_columns_and_existing_values(
+    postgres_migration_database,
+):
+    connection, config = postgres_migration_database
+    command.upgrade(config, "20261120_02")
+
+    with connection.begin():
+        connection.exec_driver_sql(
+            "ALTER TABLE reviews ALTER COLUMN decision TYPE VARCHAR(64)"
+        )
+        connection.exec_driver_sql(
+            "ALTER TABLE reviews ALTER COLUMN lifecycle_state TYPE VARCHAR(64)"
+        )
+        connection.execute(
+            text(
+                "UPDATE reviews SET decision = 'REVIEW_UNAVAILABLE', "
+                "lifecycle_state = 'REVIEW_UNAVAILABLE' "
+                "WHERE id = 'existing-review'"
+            )
+        )
+
+    command.upgrade(config, "head")
+
+    lengths = connection.execute(
+        text(
+            "SELECT column_name, character_maximum_length "
+            "FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = 'reviews' "
+            "AND column_name IN ('decision', 'lifecycle_state')"
+        )
+    ).all()
+    assert dict(lengths) == {"decision": 64, "lifecycle_state": 64}
+    assert connection.execute(
+        text(
+            "SELECT decision, lifecycle_state FROM reviews WHERE id = 'existing-review'"
+        )
+    ).one() == ("REVIEW_UNAVAILABLE", "REVIEW_UNAVAILABLE")
 
 
 def test_postgres_migration_rerun_is_safe(postgres_migration_database):
@@ -274,3 +373,8 @@ def test_pull_request_model_is_usable_after_schema_creation(tmp_path):
     finally:
         session.close()
         engine.dispose()
+
+
+def test_review_model_state_columns_fit_ai_lifecycle_values():
+    assert m.Review.__table__.c.decision.type.length == 40
+    assert m.Review.__table__.c.lifecycle_state.type.length == 40

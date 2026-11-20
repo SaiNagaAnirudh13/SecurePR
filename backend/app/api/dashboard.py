@@ -622,7 +622,7 @@ def list_reviews(pr_id: str, db: Session = Depends(get_db)):
     return [
         {
             "id": r.id,
-            "overall_score": r.overall_score,
+            "overall_score": r.overall_score if r.ai_state == "AI_COMPLETED" else None,
             "risk_category": r.risk_category,
             "decision": r.decision.value,
             "ai_state": r.ai_state,
@@ -681,7 +681,9 @@ def recent_reviews(limit: int = 15, db: Session = Depends(get_db)):
                 "pr_title": pr.title if pr else None,
                 "repository_full_name": repo.full_name if repo else None,
                 "decision": r.decision.value,
-                "overall_score": r.overall_score,
+                "overall_score": r.overall_score
+                if r.ai_state == "AI_COMPLETED"
+                else None,
                 "created_at": r.created_at,
                 "impact_count": impact_count,
             }

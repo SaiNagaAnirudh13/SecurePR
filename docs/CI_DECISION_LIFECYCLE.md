@@ -84,6 +84,17 @@ requests, repository metadata, and branch/ruleset protections, plus
 permission or unavailable protection data blocks approval or merge rather than
 being treated as an empty successful result.
 
+## Render migration startup
+
+The Render service installs `backend/requirements.txt` in its build command,
+which provides Alembic before the service starts. Render's Pre-Deploy Command
+is not available for this service, so `python run.py` acquires a PostgreSQL
+advisory lock, logs the current and target revisions, runs `alembic upgrade
+head`, and verifies the resulting revision before starting Uvicorn. The lock
+serializes startup across service instances. A migration error or failed
+revision check stops startup; FastAPI independently verifies that migrations
+are current before starting background workers.
+
 ## Database update
 
 Apply `database/postgresql/004_ci_gated_decisions.sql` to existing PostgreSQL

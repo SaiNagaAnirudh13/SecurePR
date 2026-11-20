@@ -12,6 +12,8 @@ from app.api.dashboard import (  # noqa: E402
     _auto_merge_status,
     _review_status,
     get_review,
+    list_reviews,
+    recent_reviews,
 )
 from app.core.db import Base  # noqa: E402
 from app.models import models as m  # noqa: E402
@@ -212,6 +214,49 @@ def test_review_status_requires_confirmed_publication(tmp_path):
         review.github_action_confirmed = True
         db.commit()
         assert _review_status(db, pr) == "COMPLETED"
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_unavailable_ai_scores_are_hidden_from_review_lists(tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'unavailable-score.db'}", future=True
+    )
+    Base.metadata.create_all(bind=engine)
+    db = sessionmaker(bind=engine, future=True)()
+    try:
+        repo = m.Repository(
+            github_repo_id="1",
+            owner_login="octo",
+            name="widgets",
+            full_name="octo/widgets",
+            installation_id="999",
+        )
+        db.add(repo)
+        db.flush()
+        pr = m.PullRequest(
+            repository_id=repo.id,
+            github_pr_number=7,
+            head_sha="abc123",
+            ai_state="AI_UNAVAILABLE",
+            state="open",
+        )
+        db.add(pr)
+        db.flush()
+        review = m.Review(
+            pull_request_id=pr.id,
+            head_sha=pr.head_sha,
+            decision=m.DecisionStatus.REVIEW_UNAVAILABLE,
+            lifecycle_state="REVIEW_UNAVAILABLE",
+            ai_state="AI_UNAVAILABLE",
+            analysis_completed_at=None,
+        )
+        db.add(review)
+        db.commit()
+
+        assert list_reviews(pr.id, db)[0]["overall_score"] is None
+        assert recent_reviews(db=db)[0]["overall_score"] is None
     finally:
         db.close()
         engine.dispose()

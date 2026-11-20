@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from typing import Iterator
 
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -1127,7 +1128,18 @@ def _run_analysis_locked(
         analysis_started_at=started_at,
     )
     db.add(review)
-    db.flush()
+    try:
+        db.flush()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception(
+            "Review persistence failed; refusing to publish a GitHub decision: "
+            "repository=%s pr=%s review_id=%s",
+            repo.full_name,
+            pr.github_pr_number,
+            review.id,
+        )
+        raise
     for finding in findings:
         db.add(m.Finding(review_id=review.id, **finding))
     for item in impact_items:
@@ -1221,7 +1233,7 @@ def _run_analysis_locked(
         datetime.utcnow() if ci_evaluation.state in {"PASSED", "FAILED"} else None
     )
     review.circuit_breaker_active = cb_tripped
-    review.analysis_completed_at = datetime.utcnow()
+    review.analysis_completed_at = datetime.utcnow() if ai_scores is not None else None
     if decision.status == m.DecisionStatus.WAITING_FOR_AI:
         review.lifecycle_state = "WAITING_FOR_AI"
     elif decision.status == m.DecisionStatus.REVIEW_UNAVAILABLE:
@@ -1278,7 +1290,18 @@ def _run_analysis_locked(
                 content=body,
             )
         )
-        db.commit()
+        try:
+            db.commit()
+        except SQLAlchemyError:
+            db.rollback()
+            logger.exception(
+                "Review persistence failed before GitHub publication: "
+                "repository=%s pr=%s review_id=%s",
+                repo.full_name,
+                pr.github_pr_number,
+                review.id,
+            )
+            raise
         _queue_review_status_update(db, repo, pr, review.head_sha)
         db.commit()
         _log_analysis_timing("total", started_clock, repo, pr)
@@ -1332,7 +1355,18 @@ def _run_analysis_locked(
             content=body,
         )
     )
-    db.commit()
+    try:
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception(
+            "Review persistence failed before GitHub publication: "
+            "repository=%s pr=%s review_id=%s",
+            repo.full_name,
+            pr.github_pr_number,
+            review.id,
+        )
+        raise
     db.refresh(review)
     if final_publication.state == "PUBLISHED":
         review.github_action_confirmed = True
