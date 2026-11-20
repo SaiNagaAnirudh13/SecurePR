@@ -17,6 +17,7 @@ def _base_input(**overrides):
         author_eligible=True,
         author_risk_threshold=39,
         analysis_complete=True,
+        ai_state="AI_COMPLETED",
         ci_state="PASSED",
     )
     defaults.update(overrides)
@@ -59,7 +60,43 @@ def test_manual_review_when_score_exceeds_threshold():
 
 def test_manual_review_when_analysis_incomplete():
     d = decide(_base_input(analysis_complete=False))
-    assert d.status == DecisionStatus.MANUAL_REVIEW
+    assert d.status == DecisionStatus.REVIEW_UNAVAILABLE
+
+
+@pytest.mark.parametrize(
+    ("ai_state", "expected"),
+    [
+        ("AI_PENDING", DecisionStatus.WAITING_FOR_AI),
+        ("AI_RUNNING", DecisionStatus.WAITING_FOR_AI),
+        ("AI_FAILED", DecisionStatus.REVIEW_UNAVAILABLE),
+        ("AI_UNAVAILABLE", DecisionStatus.REVIEW_UNAVAILABLE),
+        ("AI_INVALID_RESPONSE", DecisionStatus.REVIEW_UNAVAILABLE),
+    ],
+)
+def test_ai_gate_precedes_ci_and_risk_decisions(ai_state, expected):
+    decision = decide(
+        _base_input(
+            ai_state=ai_state,
+            ci_state="FAILED",
+            failed_checks=[{"name": "required"}],
+        )
+    )
+
+    assert decision.status == expected
+
+
+def test_failed_ai_never_uses_available_ci_as_an_approval_signal():
+    decision = decide(
+        _base_input(
+            ai_state="AI_FAILED",
+            ci_state="PASSED",
+            overall_score=0,
+            risk_category="LOW",
+        )
+    )
+
+    assert decision.status == DecisionStatus.REVIEW_UNAVAILABLE
+    assert "No AI approval decision" in decision.reasons[0]
 
 
 def test_eligibility_cannot_override_critical_finding():

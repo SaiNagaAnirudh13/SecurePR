@@ -1,13 +1,12 @@
 """
 Risk Scoring Engine.
 
-Combines deterministic heuristics (always run, never skipped) with an
-optional AI-generated opinion (Gemini) for each of the six risk dimensions.
-The AI's scores are treated as *one input*, not the final authority -- see
-services/decision_engine.py for why. If the AI call fails or returns
-malformed output, SecurePR falls back to the deterministic heuristic score
-alone rather than failing the whole analysis.
+Combines deterministic safety signals with validated AI-generated risk
+scores. Deterministic signals may raise an evaluated risk score, but they
+cannot replace a missing or invalid AI result; the decision engine enforces
+that prerequisite before risk and policy evaluation.
 """
+
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -30,19 +29,44 @@ DIMENSION_WEIGHTS = {
 }
 
 SENSITIVE_PATH_HINTS = [
-    "auth", "security", "secrets", "credential", "payment", "billing",
-    "migrations", "migration", ".github/workflows", "infra", "terraform",
-    "iam", "permission", "encryption", "crypto", "key", "password",
+    "auth",
+    "security",
+    "secrets",
+    "credential",
+    "payment",
+    "billing",
+    "migrations",
+    "migration",
+    ".github/workflows",
+    "infra",
+    "terraform",
+    "iam",
+    "permission",
+    "encryption",
+    "crypto",
+    "key",
+    "password",
 ]
 
 IRREVERSIBLE_HINTS = [
-    "drop table", "truncate", "delete from", "rm -rf", "alter table",
-    "drop column", "drop database",
+    "drop table",
+    "truncate",
+    "delete from",
+    "rm -rf",
+    "alter table",
+    "drop column",
+    "drop database",
 ]
 
 SECRET_PATTERN_HINTS = [
-    "api_key", "apikey", "secret_key", "private_key", "password=",
-    "token=", "aws_secret", "-----begin",
+    "api_key",
+    "apikey",
+    "secret_key",
+    "private_key",
+    "password=",
+    "token=",
+    "aws_secret",
+    "-----begin",
 ]
 
 
@@ -73,12 +97,15 @@ def _category_for(score: float) -> str:
 
 
 def _heuristic_change_surface(changed_files: list[dict]) -> DimensionScore:
-    total_lines = sum(f.get("additions", 0) + f.get("deletions", 0) for f in changed_files)
+    total_lines = sum(
+        f.get("additions", 0) + f.get("deletions", 0) for f in changed_files
+    )
     n_files = len(changed_files)
     # Blast radius grows with file count and total line churn
     score = min(100, n_files * 4 + total_lines * 0.08)
     return DimensionScore(
-        "change_surface", round(score, 1),
+        "change_surface",
+        round(score, 1),
         f"{n_files} file(s) changed, {total_lines} total line(s) touched.",
         "heuristic",
     )
@@ -92,11 +119,17 @@ def _heuristic_reversibility(changed_files: list[dict]) -> DimensionScore:
         if any(h in patch for h in IRREVERSIBLE_HINTS):
             score = max(score, 80.0)
             flagged.append(f["file_path"])
-        if "migrations" in f["file_path"].lower() or "migration" in f["file_path"].lower():
+        if (
+            "migrations" in f["file_path"].lower()
+            or "migration" in f["file_path"].lower()
+        ):
             score = max(score, 55.0)
             flagged.append(f["file_path"])
-    rationale = "Irreversible operations detected in: " + ", ".join(flagged) if flagged \
+    rationale = (
+        "Irreversible operations detected in: " + ", ".join(flagged)
+        if flagged
         else "No irreversible schema/data operations detected."
+    )
     return DimensionScore("reversibility", round(score, 1), rationale, "heuristic")
 
 
@@ -112,8 +145,11 @@ def _heuristic_data_security(changed_files: list[dict]) -> DimensionScore:
         if any(h in patch for h in SECRET_PATTERN_HINTS):
             score = max(score, 90.0)
             flagged.append(f["file_path"] + " (possible hardcoded secret)")
-    rationale = "Sensitive security/data surface touched: " + ", ".join(flagged) if flagged \
+    rationale = (
+        "Sensitive security/data surface touched: " + ", ".join(flagged)
+        if flagged
         else "No sensitive security or data-handling paths touched."
+    )
     return DimensionScore("data_security", round(score, 1), rationale, "heuristic")
 
 
@@ -122,16 +158,32 @@ def _heuristic_operational(changed_files: list[dict]) -> DimensionScore:
     flagged = []
     for f in changed_files:
         path = f["file_path"].lower()
-        if any(h in path for h in ["dockerfile", "docker-compose", ".github/workflows",
-                                    "requirements.txt", "package.json", "infra", "terraform", "config"]):
+        if any(
+            h in path
+            for h in [
+                "dockerfile",
+                "docker-compose",
+                ".github/workflows",
+                "requirements.txt",
+                "package.json",
+                "infra",
+                "terraform",
+                "config",
+            ]
+        ):
             score = max(score, 45.0)
             flagged.append(f["file_path"])
-    rationale = "Deployment/config/dependency surface touched: " + ", ".join(flagged) if flagged \
+    rationale = (
+        "Deployment/config/dependency surface touched: " + ", ".join(flagged)
+        if flagged
         else "No deployment, infrastructure, or dependency files touched."
+    )
     return DimensionScore("operational", round(score, 1), rationale, "heuristic")
 
 
-def _heuristic_verification(changed_files: list[dict], ci_checks: Optional[list[dict]]) -> DimensionScore:
+def _heuristic_verification(
+    changed_files: list[dict], ci_checks: Optional[list[dict]]
+) -> DimensionScore:
     has_test_changes = any("test" in f["file_path"].lower() for f in changed_files)
     non_test_changes = any("test" not in f["file_path"].lower() for f in changed_files)
     score = 20.0
@@ -140,8 +192,12 @@ def _heuristic_verification(changed_files: list[dict], ci_checks: Optional[list[
         score = 55.0
         notes.append("Non-test code changed with no accompanying test changes.")
     if ci_checks:
-        failed = [c["name"] for c in ci_checks
-                  if c.get("status") == "completed" and c.get("conclusion") not in ("success", "skipped", "neutral")]
+        failed = [
+            c["name"]
+            for c in ci_checks
+            if c.get("status") == "completed"
+            and c.get("conclusion") not in ("success", "skipped", "neutral")
+        ]
         if failed:
             score = max(score, 85.0)
             notes.append("Failing CI checks: " + ", ".join(failed))
@@ -151,7 +207,9 @@ def _heuristic_verification(changed_files: list[dict], ci_checks: Optional[list[
     return DimensionScore("verification", round(score, 1), " ".join(notes), "heuristic")
 
 
-def compute_deterministic_scores(changed_files: list[dict], ci_checks: Optional[list[dict]] = None) -> dict:
+def compute_deterministic_scores(
+    changed_files: list[dict], ci_checks: Optional[list[dict]] = None
+) -> dict:
     return {
         "change_surface": _heuristic_change_surface(changed_files),
         "reversibility": _heuristic_reversibility(changed_files),
@@ -180,7 +238,8 @@ def blend_with_ai(heuristic_scores: dict, ai_scores: Optional[dict]) -> dict:
             continue
         if ai_score > heuristic.score:
             blended[dim] = DimensionScore(
-                dim, round(ai_score, 1),
+                dim,
+                round(ai_score, 1),
                 heuristic.rationale + " | AI: " + str(ai_val.get("rationale", "")),
                 "blended",
             )
@@ -189,12 +248,19 @@ def blend_with_ai(heuristic_scores: dict, ai_scores: Optional[dict]) -> dict:
 
 def compute_policy_compliance_score(policy_violations: list[str]) -> DimensionScore:
     score = min(100.0, len(policy_violations) * 35.0) if policy_violations else 5.0
-    rationale = "Policy violations: " + "; ".join(policy_violations) if policy_violations \
+    rationale = (
+        "Policy violations: " + "; ".join(policy_violations)
+        if policy_violations
         else "No policy violations detected."
+    )
     return DimensionScore("policy_compliance", round(score, 1), rationale, "heuristic")
 
 
 def compute_overall(scores: dict) -> RiskAssessment:
-    overall = sum(scores[d].score * DIMENSION_WEIGHTS[d] for d in RISK_DIMENSIONS if d in scores)
+    overall = sum(
+        scores[d].score * DIMENSION_WEIGHTS[d] for d in RISK_DIMENSIONS if d in scores
+    )
     overall = round(overall, 2)
-    return RiskAssessment(scores=scores, overall_score=overall, category=_category_for(overall))
+    return RiskAssessment(
+        scores=scores, overall_score=overall, category=_category_for(overall)
+    )

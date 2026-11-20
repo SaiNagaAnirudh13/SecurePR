@@ -16,10 +16,10 @@ services:
         value: authenticated
       - key: GEMINI_MODEL
         value: gemini-3.8-flash
-      - key: GEMINI_FALLBACK_MODEL
-        value: gemini-2.0-flash
       - key: GEMINI_REQUEST_TIMEOUT_SECONDS
         value: "20"
+      - key: GEMINI_MAX_ATTEMPTS
+        value: "3"
       - key: REVIEW_RESULT_DEADLINE_SECONDS
         value: "180"
       - key: CI_API_MAX_RETRIES

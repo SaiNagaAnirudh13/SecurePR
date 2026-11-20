@@ -89,11 +89,11 @@ URL-encode special characters in the password. `sslmode=require` enables TLS
 for the Supabase connection. The numbered SQL files in `database/postgresql/`
 are the legacy bootstrap history. The deployment migration is now
 Alembic-managed:
-`backend/migrations/versions/20261120_01_reconcile_ci_gate_schema.py`
-safely reconciles the changes from SQL migration `004`, including the
-pull-request merge metadata. It adds nullable fields and widens the
-publication message type without replacing existing rows. It is forward-only
-because dropping columns during rollback could discard production data.
+`backend/migrations/versions/20261120_01_reconcile_ci_gate_schema.py` and
+`20261120_02_ai_review_lifecycle.py` reconcile the CI and AI lifecycle
+schemas. They preserve existing rows, record old reviews without verified AI
+evidence as unavailable, and are forward-only to avoid discarding production
+data.
 
 Render's `render.yaml` runs `alembic upgrade head` as the service
 `preDeployCommand`, before the new application instance starts. Set Render's
@@ -164,14 +164,14 @@ service-role key formats and requires HTTPS origins.
 
 1. Get an API key from Google AI Studio: https://aistudio.google.com/apikey.
 2. Set `GEMINI_API_KEY` in `.env`.
-3. Set `GEMINI_MODEL=gemini-3.8-flash` (the model requested for this project).
-   **Model availability note:** SecurePR automatically checks at call time whether
-   `GEMINI_MODEL` is listed for your API key. If `gemini-3.8-flash` is not yet
-   available on your account/region, it transparently falls back to
-   `GEMINI_FALLBACK_MODEL` (default `gemini-2.0-flash`, also configurable in
-   `.env`) and logs a warning — analysis continues uninterrupted either way,
-   since AI scoring is only one input into the deterministic decision engine,
-   never a requirement for it to run.
+3. Set `GEMINI_MODEL` to the approved model available to your API key.
+   SecurePR uses only that configured model and does not silently substitute
+   another model. A missing model, authentication failure, quota exhaustion,
+   provider outage, timeout, or invalid response leaves the AI review
+   unavailable; no risk score or approval is produced.
+4. `GEMINI_MAX_ATTEMPTS` controls bounded retries for transient provider
+   failures (1-5, default 3). Permanent authentication/configuration errors
+   are not retried.
 
 ## 9. CI-gated review lifecycle
 
@@ -322,8 +322,8 @@ automatically. Set the following backend **public configuration**:
 - `SECUREPR_ENV=production`
 - `SUPABASE_AUTH_AUDIENCE`
 - `SUPABASE_JWT_ALGORITHM`
-- `GEMINI_MODEL`, `GEMINI_FALLBACK_MODEL`, and
-  `GEMINI_REQUEST_TIMEOUT_SECONDS`
+- `GEMINI_MODEL`, `GEMINI_REQUEST_TIMEOUT_SECONDS`, and
+  `GEMINI_MAX_ATTEMPTS`
 - `REVIEW_RESULT_DEADLINE_SECONDS`
 - `CI_API_MAX_RETRIES`, `CI_FALLBACK_MAX_POLLS`,
   `CI_FALLBACK_POLL_INTERVAL_SECONDS`
@@ -372,7 +372,7 @@ processing; a sleeping instance can delay webhook responses.
 | PostgreSQL driver install fails                                       | Re-run `pip install -r requirements.txt` in the backend environment.                                                                                                                                                                                                                                                                                 |
 | Database connection/schema errors                                    | Check that `DATABASE_URL` is a valid Supabase URL with URL-encoded password and `sslmode=require`, and that outbound network access to Supabase is available.                                                                                                                                                                                       |
 | Webhook never fires                                                   | Confirm the GitHub App's webhook URL is reachable from the internet (`ngrok` for local tests, permanent HTTPS backend URL for production), and that the App is installed on the repository.                                                                                                                                                           |
-| Gemini calls fail silently                                            | Check `GEMINI_API_KEY` is set; SecurePR falls back to heuristic-only scoring automatically and logs a warning — this is expected behavior, not a crash.                                                                                                                                                                                               |
+| Gemini analysis is unavailable                                         | Check the `AI Review Status` and safe error category in the dashboard, then verify `GEMINI_API_KEY`, quota, and the configured `GEMINI_MODEL`. SecurePR does not substitute heuristic-only scores or approve without validated AI output.                                                                                                                                 |
 | GitHub review/comment doesn't post                                    | Check the App's permissions include Pull requests: Read & write, and that the installation ID stored for the repo matches an active installation.                                                                                                                                                                                                     |
 | AI review remains queued or processing                                 | Check the `background_jobs` row for the revision, `last_error`, attempt count, and worker logs. A final decision is intentionally withheld until CI verification succeeds or a failure is confirmed.                                                                      |
 | CI state is unavailable                                                | Check the stored `ci_revisions.error`, GitHub App Check/Status/Administration permissions, rate-limit responses, and webhook delivery history. Retries continue with capped backoff; no approval is published while verification is unavailable.                       |

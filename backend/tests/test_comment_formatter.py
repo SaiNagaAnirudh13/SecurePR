@@ -174,3 +174,34 @@ def test_unavailable_ci_is_reported_as_unavailable_not_passed():
 
     assert "CI discovery error" in body
     assert "retry and will not report CI as passing" in body
+
+
+def test_ai_failure_message_never_contains_fallback_risk_or_approval():
+    body = format_comment(
+        decision="REVIEW_UNAVAILABLE",
+        reasons=["AI analysis did not complete."],
+        overall_score=0,
+        category="NOT_EVALUATED",
+        dimension_scores={},
+        findings=[],
+        changed_files=[],
+        circuit_breaker_tripped=False,
+        circuit_breaker_reason=None,
+        impact_items=[],
+        policy_name="default",
+        policy_version=1,
+        dashboard_url="https://dashboard.example.invalid",
+        ci_checks=[],
+        ci_state="IN_PROGRESS",
+        ai_state="AI_INVALID_RESPONSE",
+        ai_error_code="GEMINI_INVALID_RESPONSE",
+    )
+
+    assert "SecurePR AI Review — **NOT COMPLETED**" in body
+    assert "**Review Decision:** UNAVAILABLE" in body
+    assert "**Risk Score:** Not Evaluated" in body
+    assert "**CI Status:** ⏳ In progress" in body
+    assert "**Reason:** Gemini returned an invalid or incomplete response." in body
+    assert "**No AI approval decision has been made.**" in body
+    assert "Risk Breakdown" not in body
+    assert "APPROVED" not in body

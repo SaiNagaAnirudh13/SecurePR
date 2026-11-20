@@ -48,6 +48,11 @@ def _auto_merge_status(
 ) -> tuple[str, str | None]:
     if pr.merged_at:
         return "MERGED", None
+    if pr.ai_state != "AI_COMPLETED" or not review or review.ai_state != "AI_COMPLETED":
+        return (
+            "AI_REVIEW_UNAVAILABLE",
+            "A validated AI analysis for the current PR revision is required.",
+        )
     settings = get_settings()
     if not settings.AUTO_MERGE_ENABLED:
         return "DISABLED_GLOBAL", "Auto-merge is disabled by SecurePR configuration."
@@ -93,13 +98,19 @@ def _authoritative_decision(
     db: Session, pr: m.PullRequest, review: m.Review | None
 ) -> str:
     """Derive the current decision from exact-SHA CI before trusting cached review state."""
+    if pr.ai_state in {"AI_PENDING", "AI_RUNNING"}:
+        return m.DecisionStatus.WAITING_FOR_AI.value
+    if pr.ai_state != "AI_COMPLETED":
+        return m.DecisionStatus.REVIEW_UNAVAILABLE.value
     ci_summary = _ci_status_summary(db, pr.id, pr.head_sha or "")
     if ci_summary["state"] == "FAILED":
         return m.DecisionStatus.BLOCKED.value
     if ci_summary["state"] != "PASSED":
         return m.DecisionStatus.WAITING_FOR_CI.value
     if not review or review.head_sha != pr.head_sha:
-        return m.DecisionStatus.WAITING_FOR_CI.value
+        return m.DecisionStatus.WAITING_FOR_AI.value
+    if review.ai_state != "AI_COMPLETED":
+        return m.DecisionStatus.REVIEW_UNAVAILABLE.value
     if review.decision == m.DecisionStatus.WAITING_FOR_CI:
         return m.DecisionStatus.WAITING_FOR_CI.value
     return review.decision.value
@@ -215,6 +226,14 @@ def _ci_status_summary(db: Session, pull_request_id: str, head_sha: str) -> dict
 
 
 def _review_status(db: Session, pr: m.PullRequest) -> str:
+    if pr.ai_state in {
+        "AI_PENDING",
+        "AI_RUNNING",
+        "AI_FAILED",
+        "AI_UNAVAILABLE",
+        "AI_INVALID_RESPONSE",
+    }:
+        return pr.ai_state
     review = (
         db.query(m.Review)
         .filter(
@@ -473,9 +492,17 @@ def list_prs(repo_id: str, db: Session = Depends(get_db)):
                 "review_publications": _publication_statuses(
                     db, pr.repository_id, pr.id, pr.head_sha
                 ),
-                "latest_score": latest.overall_score if latest else None,
-                "latest_risk_category": latest.risk_category if latest else None,
+                "latest_score": latest.overall_score
+                if latest and latest.ai_state == "AI_COMPLETED"
+                else None,
+                "latest_risk_category": latest.risk_category
+                if latest and latest.ai_state == "AI_COMPLETED"
+                else None,
                 "review_status": _review_status(db, pr),
+                "ai_state": pr.ai_state,
+                "ai_error_code": pr.ai_error_code,
+                "ai_retryable_at": pr.ai_retryable_at,
+                "ai_attempt_id": pr.ai_attempt_id,
                 "ci_status": _ci_status_summary(db, pr.id, pr.head_sha or ""),
                 "changed_files_count": files_count or 0,
                 "findings_count": findings_count or 0,
@@ -520,8 +547,14 @@ def recent_pull_requests(limit: int = 10, db: Session = Depends(get_db)):
                 "current_head_sha": pr.head_sha,
                 "auto_merge_status": merge_status,
                 "auto_merge_blocker": merge_blocker,
-                "latest_score": latest.overall_score if latest else None,
+                "latest_score": latest.overall_score
+                if latest and latest.ai_state == "AI_COMPLETED"
+                else None,
                 "review_status": _review_status(db, pr),
+                "ai_state": pr.ai_state,
+                "ai_error_code": pr.ai_error_code,
+                "ai_retryable_at": pr.ai_retryable_at,
+                "ai_attempt_id": pr.ai_attempt_id,
                 "ci_status": _ci_status_summary(db, pr.id, pr.head_sha or ""),
             }
         )
@@ -569,6 +602,10 @@ def get_pull_request(pr_id: str, db: Session = Depends(get_db)):
             db, pr.repository_id, pr.id, pr.head_sha
         ),
         "review_status": _review_status(db, pr),
+        "ai_state": pr.ai_state,
+        "ai_error_code": pr.ai_error_code,
+        "ai_retryable_at": pr.ai_retryable_at,
+        "ai_attempt_id": pr.ai_attempt_id,
         "head_sha": pr.head_sha,
         "ci_status": _ci_status_summary(db, pr.id, pr.head_sha or ""),
     }
@@ -588,6 +625,10 @@ def list_reviews(pr_id: str, db: Session = Depends(get_db)):
             "overall_score": r.overall_score,
             "risk_category": r.risk_category,
             "decision": r.decision.value,
+            "ai_state": r.ai_state,
+            "ai_error_code": r.ai_error_code,
+            "ai_retryable_at": r.ai_retryable_at,
+            "ai_attempt_id": r.ai_attempt_id,
             "head_sha": r.head_sha,
             "lifecycle_state": r.lifecycle_state,
             "auto_merge_status": r.auto_merge_status,
@@ -702,7 +743,13 @@ def get_review(review_id: str, db: Session = Depends(get_db)):
             "verification": review.score_verification,
             "policy_compliance": review.score_policy_compliance,
             "overall": review.overall_score,
-        },
+        }
+        if review.ai_state == "AI_COMPLETED"
+        else None,
+        "ai_state": review.ai_state,
+        "ai_error_code": review.ai_error_code,
+        "ai_retryable_at": review.ai_retryable_at,
+        "ai_attempt_id": review.ai_attempt_id,
         "risk_category": review.risk_category,
         "decision": review.decision.value,
         "decision_reasons": review.decision_reasons,

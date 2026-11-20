@@ -36,6 +36,8 @@ class DecisionStatus(str, enum.Enum):
     APPROVED = "APPROVED"
     BLOCKED = "BLOCKED"
     MANUAL_REVIEW = "MANUAL_REVIEW"
+    REVIEW_UNAVAILABLE = "REVIEW_UNAVAILABLE"
+    WAITING_FOR_AI = "WAITING_FOR_AI"
     WAITING_FOR_CI = "WAITING_FOR_CI"
     PENDING = "PENDING"
 
@@ -108,6 +110,15 @@ class PullRequest(Base):
     state = Column(
         String(32), default="open", nullable=False, server_default=text("'open'")
     )
+    ai_state = Column(
+        String(32),
+        default="AI_UNAVAILABLE",
+        nullable=False,
+        server_default=text("'AI_UNAVAILABLE'"),
+    )
+    ai_error_code = Column(String(64), nullable=True)
+    ai_retryable_at = Column(DateTime, nullable=True)
+    ai_attempt_id = Column(String(36), nullable=True)
     merged_at = Column(DateTime, nullable=True)
     merge_commit_sha = Column(String(64), nullable=True)
     created_at = Column(
@@ -295,6 +306,15 @@ class Review(Base):
         nullable=False,
         server_default=text("'RECEIVED'"),
     )
+    ai_state = Column(
+        String(32),
+        default="AI_UNAVAILABLE",
+        nullable=False,
+        server_default=text("'AI_UNAVAILABLE'"),
+    )
+    ai_error_code = Column(String(64), nullable=True)
+    ai_retryable_at = Column(DateTime, nullable=True)
+    ai_attempt_id = Column(String(36), nullable=True)
     ci_verified_at = Column(DateTime, nullable=True)
     circuit_breaker_active = Column(
         Boolean, default=False, nullable=False, server_default=false()

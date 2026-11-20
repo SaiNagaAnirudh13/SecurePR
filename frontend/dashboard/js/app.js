@@ -160,6 +160,12 @@ function ciBadge(ci) {
 }
 function reviewStatusBadge(status) {
   const labels = {
+    AI_PENDING: 'AI review pending',
+    AI_RUNNING: 'AI review running',
+    AI_COMPLETED: 'AI review completed',
+    AI_FAILED: 'AI review failed',
+    AI_UNAVAILABLE: 'AI review unavailable',
+    AI_INVALID_RESPONSE: 'AI response invalid',
     COMPLETED: 'AI review completed',
     PROCESSING: 'AI review processing',
     QUEUED: 'AI review queued',
@@ -167,7 +173,7 @@ function reviewStatusBadge(status) {
     WAITING_FOR_CI: 'Final decision is waiting for CI verification.',
     NOT_STARTED: 'AI review not started',
   };
-  return `<span class="badge">${escapeHtml(labels[status] || 'AI review status unknown')}</span>`;
+  return `<span class="badge ${escapeHtml(status || 'unknown')}">${escapeHtml(labels[status] || 'AI review status unknown')}</span>`;
 }
 function ciCheckResult(check) {
   if (check.status !== 'completed') return 'Running (' + (check.status || 'pending') + ')';
@@ -383,7 +389,7 @@ async function loadOverview() {
           <td><span class="avatar-chip"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--muted)"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="9" r="2.5"/></svg>${escapeHtml(p.repository_full_name || '')}</span></td>
           <td><span class="avatar-chip"><span class="avatar-circle">${initials(p.author)}</span>${escapeHtml(p.author || '')}</span></td>
           <td>${p.latest_score != null ? '<span class="badge ' + (p.latest_score < 40 ? 'LOW' : p.latest_score < 70 ? 'MEDIUM' : 'HIGH') + '">' + p.latest_score.toFixed(2) + '</span>' : '—'}</td>
-          <td>${reviewStatusBadge(p.review_status)}</td>
+          <td>${reviewStatusBadge(p.ai_state || p.review_status)}</td>
           <td>${badge(p.authoritative_decision)}</td>
           <td>${ciBadge(p.ci_status)}</td>
           <td>${timeAgo(p.updated_at)}</td>
@@ -418,7 +424,7 @@ async function onPrRepoChange() {
         <td><span class="avatar-chip"><span class="avatar-circle">${initials(p.author)}</span>${escapeHtml(p.author || '')}</span></td>
         <td><code>${escapeHtml(p.head_branch || '')} → ${escapeHtml(p.base_branch || '')}</code></td>
         <td>${p.latest_score != null ? p.latest_score.toFixed(1) : '—'}</td>
-        <td>${reviewStatusBadge(p.review_status)}</td>
+        <td>${reviewStatusBadge(p.ai_state || p.review_status)}</td>
         <td>${badge(p.authoritative_decision)}</td>
         <td>${ciBadge(p.ci_status)}</td>
         <td>${p.changed_files_count}</td>
@@ -442,11 +448,12 @@ async function showPrDetail(prId) {
         <h2 class="section-title">#${pr.number} — ${escapeHtml(pr.title || '')}</h2>
         <p class="section-sub">${escapeHtml(pr.repository ? pr.repository.full_name : '')} · opened by ${escapeHtml(pr.author || '')} · ${reviews.length} review(s) on record</p>
       </div>
-      ${reviewStatusBadge(pr.review_status)}
+      ${reviewStatusBadge(pr.ai_state || pr.review_status)}
     </div>
     <p>Current revision: <code>${escapeHtml(pr.current_head_sha || 'unknown')}</code></p>
     <p>Authoritative decision: ${badge(pr.authoritative_decision)} · CI: ${ciBadge(ci)}</p>
-    ${latest ? `<p>AI risk score: <strong>${Number(latest.overall_score).toFixed(2)}/100</strong> (${escapeHtml(latest.risk_category)})</p>` : '<div class="empty-state">No analysis is available for the current revision.</div>'}
+    ${latest && latest.ai_state === 'AI_COMPLETED' ? `<p>AI risk score: <strong>${Number(latest.overall_score).toFixed(2)}/100</strong> (${escapeHtml(latest.risk_category)})</p>` : latest ? `<p class="ai-unavailable">AI analysis was not completed; risk score was not evaluated.</p>` : '<div class="empty-state">No analysis is available for the current revision.</div>'}
+    ${pr.ai_retryable_at ? `<p>AI retryable after: ${escapeHtml(new Date(pr.ai_retryable_at).toLocaleString())}</p>` : ''}
     ${ci.failed_checks?.length ? `<p><strong>Failed checks</strong></p><ul>${ci.failed_checks.map(c => `<li>${escapeHtml(c.name || c.context || 'Unnamed check')} — ${escapeHtml(c.provider || 'Unknown provider')}: ${escapeHtml(c.conclusion || 'failed')}${safeHttpUrl(c.url || c.html_url) ? ` · <a href="${safeHttpUrl(c.url || c.html_url)}" target="_blank" rel="noopener noreferrer">Details</a>` : ''}</li>`).join('')}</ul>` : ''}
     ${ci.missing_required_checks?.length ? `<p><strong>Missing required checks:</strong> ${ci.missing_required_checks.map(escapeHtml).join(', ')}</p>` : ''}
     ${ci.error ? `<p><strong>CI verification error:</strong> ${escapeHtml(ci.error)}</p>` : ''}
@@ -603,13 +610,16 @@ async function toggleAccordion(domId, reviewId) {
   const d = await api(`/api/reviews/${reviewId}`);
   _loadedAccordions.add(reviewId);
   body.innerHTML = `
+    <p><strong>AI review status:</strong> ${escapeHtml(d.ai_state || 'Unknown')}</p>
+    ${d.ai_error_code ? `<p><strong>AI error category:</strong> ${escapeHtml(d.ai_error_code)}</p>` : ''}
+    ${d.decision === 'REVIEW_UNAVAILABLE' ? '<p class="ai-unavailable">AI review was not completed. No AI approval decision has been made.</p>' : ''}
     <p><strong>Why this decision:</strong></p>
     <ul class="reason-list">${(d.decision_reasons || []).map(r => `<li>${escapeHtml(r)}</li>`).join('') || '<li>—</li>'}</ul>
 
-    ${!d.is_ci_wait_placeholder ? `
+    ${!d.is_ci_wait_placeholder && d.scores ? `
     <table style="margin:10px 0;"><tr><th>Dimension</th><th>Score</th></tr>
       ${Object.entries(d.scores).filter(([k]) => k !== 'overall').map(([k, v]) => `<tr><td>${k.replace(/_/g, ' ')}</td><td>${v}</td></tr>`).join('')}
-    </table>` : ''}
+    </table>` : !d.is_ci_wait_placeholder ? '<p class="ai-unavailable">Risk scores were not evaluated because AI analysis did not complete.</p>' : ''}
 
     ${d.ci_status ? `
     <details style="margin:10px 0;">

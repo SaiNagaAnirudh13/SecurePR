@@ -60,6 +60,15 @@ def attempt(
 ):
     """Revalidate the exact reviewed SHA and request auto-merge (never direct merge)."""
     settings = get_settings()
+    if (
+        pr.head_sha != review.head_sha
+        or pr.ai_state != "AI_COMPLETED"
+        or review.ai_state != "AI_COMPLETED"
+    ):
+        return AutoMergeResult(
+            "NOT_ELIGIBLE",
+            "A validated AI analysis for the current PR head SHA is required.",
+        )
     if review.decision.value != "APPROVED" or not review.github_action_confirmed:
         return AutoMergeResult(
             "NOT_ELIGIBLE", "A confirmed SecurePR approval is required."

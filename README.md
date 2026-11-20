@@ -69,23 +69,25 @@ SecurePR/
 
 ## Design notes worth knowing before you run this
 
-- **The AI never decides.** Gemini contributes dimension-score opinions and
-  rationale text; `services/decision_engine.py` is pure deterministic Python
-  with no AI dependency, and it is the only thing that produces an
-  APPROVED/BLOCKED/MANUAL_REVIEW decision. AI scores can only
-  raise a heuristic risk score, never lower one (`risk_engine.blend_with_ai`).
+- **AI review is a required decision prerequisite.** Gemini must return
+  validated risk dimensions, explanations, and findings for the exact PR head
+  SHA. The deterministic decision engine applies CI and repository policy to
+  that completed analysis. If AI fails or returns invalid data, SecurePR
+  records `REVIEW_UNAVAILABLE`, reports risk as not evaluated, and cannot
+  approve or auto-merge.
 - **CI gates every final decision.** A pull-request webhook queues durable
   review, status-comment, and CI-discovery jobs. SecurePR updates one
   `Waiting for CI` comment while checks are pending. CI failure blocks
   approval regardless of risk; unknown, unavailable, incomplete, empty, and
   non-success check results cannot approve. Only after every discovered
   execution and applicable required status check for the exact head SHA passes
-  does the policy engine evaluate risk and eligibility. See
+  and AI analysis are valid for the exact head SHA does the policy engine
+  evaluate risk and eligibility. See
   [`docs/CI_DECISION_LIFECYCLE.md`](docs/CI_DECISION_LIFECYCLE.md).
-- **Gemini model fallback.** `gemini-3.8-flash` is configured by default, but
-  `integrations/gemini_client.py` probes model availability at call time and
-  falls back to `GEMINI_FALLBACK_MODEL` (default `gemini-2.0-flash`) if it
-  isn't available on your account — analysis continues either way.
+- **Gemini model selection is explicit.** SecurePR uses only the configured
+  `GEMINI_MODEL`; an unavailable model or provider failure produces an
+  unavailable review instead of silently switching models or substituting
+  deterministic scores.
 - **Guarded GitHub auto-merge.** It is disabled globally by default and
   requires per-repository opt-in. Before requesting GitHub auto-merge,
   SecurePR rechecks the reviewed commit, CI, branch protection, required
