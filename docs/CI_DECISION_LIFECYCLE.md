@@ -13,6 +13,7 @@ RECEIVED
                                         -> MANUAL_REVIEW
                                         -> BLOCKED
        -> BLOCKED (a discovered CI failure)
+  -> ANALYSIS_FAILED -> MANUAL_REVIEW
 ```
 
 `UNKNOWN`, `UNAVAILABLE`, incomplete discovery, missing required checks,
@@ -36,6 +37,22 @@ applicable rulesets are queried for required status contexts. All records and
 required contexts are tied to the exact PR head SHA. Discovery errors and
 incomplete pagination remain non-approvable; polling and webhook events
 reconcile the current revision.
+
+Gemini timeouts, unavailable responses, and malformed output are recorded as
+analysis failures. Heuristic scores may be retained as evidence, but they
+cannot substitute for valid AI analysis: the risk category is not evaluated,
+the review is routed to manual review, and it cannot request approval or
+auto-merge. The decision uses the latest CI state for the exact current PR
+head SHA; if CI turns green while the initial analysis is running, a new full
+review is queued so policy evaluation runs against that verified state. A
+later review/webhook retry can recover a failed durable job using its existing
+idempotency key.
+
+The four durable workers (`REVIEW`, `CI_REFRESH`, `CI_NOTIFY`, and
+`REVIEW_STATUS`) start with the API service. `/health` is unhealthy if any
+worker thread is not alive so the hosting platform can detect the issue; job
+pickup, completion, retry, and publication outcomes include structured
+identifiers in backend logs.
 
 The durable review, CI revision, and publication rows are keyed by PR and
 revision. A single waiting comment is updated in place. Final review and

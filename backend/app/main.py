@@ -19,6 +19,7 @@ from app.core.config import (
 from app.core.db import Base, get_engine
 from app.models import models  # noqa: F401 ensures models are registered on Base.metadata
 from app.services.background_jobs import (
+    background_worker_status,
     start_background_workers,
     stop_background_workers,
 )
@@ -108,7 +109,23 @@ def health():
             status_code=503,
             detail="Database is unavailable.",
         ) from exc
-    return {"status": "ok", "service": "SecurePR", "env": settings.SECUREPR_ENV}
+    workers = background_worker_status()
+    if not all(workers.values()):
+        logger.error(
+            "Health check failed because one or more durable workers are not alive: %s",
+            workers,
+            extra={"worker_status": workers, "health_check_failed": True},
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="One or more durable background workers are unavailable.",
+        )
+    return {
+        "status": "ok",
+        "service": "SecurePR",
+        "env": settings.SECUREPR_ENV,
+        "workers": workers,
+    }
 
 
 @app.get("/")

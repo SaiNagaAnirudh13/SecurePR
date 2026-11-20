@@ -65,6 +65,31 @@ def test_check_event_queries_current_pr_revision_and_queues_ci_refresh(tmp_path)
         engine.dispose()
 
 
+def test_distinct_check_events_for_same_sha_queue_only_ci_refresh_jobs(tmp_path):
+    engine, session, _, pr = _session_with_open_pr(tmp_path)
+    try:
+        check_run = _check_payload("current-sha", [{"number": 7}])
+        check_suite = {
+            **check_run,
+            "check_suite": {
+                "head_sha": "current-sha",
+                "pull_requests": [{"number": 7}],
+            },
+        }
+
+        _handle_check_event(session, check_run, "check_run", "delivery-run")
+        _handle_check_event(session, check_suite, "check_suite", "delivery-suite")
+
+        jobs = session.query(m.BackgroundJob).all()
+        assert len(jobs) == 2
+        assert {job.job_type for job in jobs} == {"CI_REFRESH"}
+        assert {job.payload["head_sha"] for job in jobs} == {"current-sha"}
+        assert {job.payload["pull_request_id"] for job in jobs} == {pr.id}
+    finally:
+        session.close()
+        engine.dispose()
+
+
 def test_unknown_check_sha_is_ignored_without_queueing(tmp_path):
     engine, session, _, _ = _session_with_open_pr(tmp_path)
     try:

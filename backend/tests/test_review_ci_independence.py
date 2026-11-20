@@ -118,7 +118,9 @@ def _patch_review_dependencies(
         lambda *args, **kwargs: {"succeeded": True, "status_code": 200, "payload": {}},
     )
     monkeypatch.setattr(
-        gemini_module.gemini_client, "score_dimensions", lambda *args, **kwargs: None
+        gemini_module.gemini_client,
+        "score_dimensions",
+        lambda *args, **kwargs: _valid_ai_scores(),
     )
     monkeypatch.setattr(
         pipeline.policy_engine,
@@ -156,6 +158,20 @@ def _patch_review_dependencies(
         pipeline.auto_merge, "attempt", lambda **kwargs: auto_merge_result
     )
     return posted_reviews, posted_comments
+
+
+def _valid_ai_scores():
+    return {
+        dimension: {"score": 20, "rationale": "test rationale"}
+        for dimension in (
+            "change_surface",
+            "reversibility",
+            "data_security",
+            "operational",
+            "verification",
+            "policy_compliance",
+        )
+    } | {"summary": "test summary"}
 
 
 def _add_ci_revision(db_session, repo, pr, state, checks=(), required=()):
@@ -201,6 +217,11 @@ def test_passed_ci_and_eligible_low_risk_publish_approval(
 ):
     repo, pr = repo_and_pr
     posted, _ = _patch_review_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        gemini_module.gemini_client,
+        "score_dimensions",
+        lambda *args, **kwargs: _valid_ai_scores(),
+    )
     _add_ci_revision(
         db_session,
         repo,
@@ -224,6 +245,219 @@ def test_passed_ci_and_eligible_low_risk_publish_approval(
     assert len(posted) == 1
     assert posted[0][0][5] == "APPROVE"
     assert posted[0][1]["commit_id"] == pr.head_sha
+
+
+def test_gemini_timeout_requires_manual_review_and_never_approves(
+    db_session, repo_and_pr, monkeypatch
+):
+    repo, pr = repo_and_pr
+    posted, _ = _patch_review_dependencies(monkeypatch)
+    def timeout(*args, **kwargs):
+        raise gemini_module.GeminiAnalysisError(
+            "DeadlineExceeded: 504 Deadline expired before operation could complete."
+        )
+
+    monkeypatch.setattr(gemini_module.gemini_client, "score_dimensions", timeout)
+    _add_ci_revision(
+        db_session,
+        repo,
+        pr,
+        "PASSED",
+        [
+            {
+                "name": "unit-tests",
+                "status": "completed",
+                "conclusion": "success",
+            }
+        ],
+    )
+
+    review = _run(db_session, repo, pr)
+
+    assert review.decision == m.DecisionStatus.MANUAL_REVIEW
+    assert review.lifecycle_state == "ANALYSIS_FAILED"
+    assert review.risk_category == "NOT_EVALUATED"
+    assert review.github_review_state == "COMMENT"
+    assert review.auto_merge_status is None
+    assert len(posted) == 1
+    assert posted[0][0][5] == "COMMENT"
+    assert "Gemini analysis failed" in posted[0][0][4]
+    assert "| **AI Analysis** | Incomplete |" in posted[0][0][4]
+    evidence = (
+        db_session.query(m.Evidence)
+        .filter_by(review_id=review.id, evidence_type="error", source="gemini")
+        .one()
+    )
+    assert "manual review is required" in evidence.content
+    assert "504 Deadline expired" in evidence.content
+
+
+def test_failed_final_review_publication_retries_with_same_marker(
+    db_session, repo_and_pr, monkeypatch
+):
+    repo, pr = repo_and_pr
+    _patch_review_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        gemini_module.gemini_client,
+        "score_dimensions",
+        lambda *args, **kwargs: _valid_ai_scores(),
+    )
+    _add_ci_revision(
+        db_session,
+        repo,
+        pr,
+        "PASSED",
+        [{"name": "unit-tests", "status": "completed", "conclusion": "success"}],
+    )
+    created_reviews = {}
+    requests = []
+
+    def post_review(*args, **kwargs):
+        marker = kwargs["idempotency_marker"]
+        requests.append(marker)
+        if marker in created_reviews:
+            return {
+                "succeeded": True,
+                "status_code": 200,
+                "payload": created_reviews[marker],
+                "already_exists": True,
+            }
+        created_reviews[marker] = {"id": 91, "body": args[4]}
+        return {
+            "succeeded": False,
+            "status_code": 504,
+            "payload": {"message": "request timed out after publication"},
+        }
+
+    monkeypatch.setattr(github_module.github_client, "post_review", post_review)
+
+    with pytest.raises(RuntimeError, match="GitHub rejected review publication"):
+        _run(db_session, repo, pr)
+
+    retried_review = _run(db_session, repo, pr)
+
+    assert retried_review.github_action_confirmed is True
+    assert len(requests) == 2
+    assert requests[0] == requests[1]
+    assert len(created_reviews) == 1
+
+
+def test_ci_failure_arriving_during_ai_analysis_blocks_final_decision(
+    db_session, repo_and_pr, monkeypatch
+):
+    repo, pr = repo_and_pr
+    posted, _ = _patch_review_dependencies(monkeypatch)
+    _add_ci_revision(
+        db_session,
+        repo,
+        pr,
+        "PASSED",
+        [
+            {
+                "name": "unit-tests",
+                "status": "completed",
+                "conclusion": "success",
+            }
+        ],
+    )
+    ci_events = []
+
+    def fetch_checks(*args, **kwargs):
+        ci_events.append("ci")
+        conclusion = "success" if len(ci_events) == 1 else "failure"
+        return (
+            [
+                {
+                    "identity": "live-check",
+                    "kind": "check_run",
+                    "name": "unit-tests",
+                    "status": "completed",
+                    "conclusion": conclusion,
+                    "sha": pr.head_sha,
+                }
+            ],
+            [],
+            [],
+        )
+
+    def score_during_analysis(*args, **kwargs):
+        ci_events.append("ai")
+        return _valid_ai_scores()
+
+    monkeypatch.setattr(pipeline, "_fetch_ci_checks", fetch_checks)
+    monkeypatch.setattr(
+        gemini_module.gemini_client, "score_dimensions", score_during_analysis
+    )
+
+    review = _run(db_session, repo, pr)
+
+    assert ci_events == ["ci", "ai", "ci"]
+    assert review.decision == m.DecisionStatus.BLOCKED
+    assert review.github_review_state == "REQUEST_CHANGES"
+    assert len(posted) == 1
+    assert posted[0][0][5] == "REQUEST_CHANGES"
+
+
+def test_ci_completion_during_ai_analysis_queues_full_revision_reconciliation(
+    db_session, repo_and_pr, monkeypatch
+):
+    repo, pr = repo_and_pr
+    posted, _ = _patch_review_dependencies(monkeypatch)
+    revision = _add_ci_revision(
+        db_session,
+        repo,
+        pr,
+        "IN_PROGRESS",
+        [
+            {
+                "name": "unit-tests",
+                "status": "in_progress",
+                "conclusion": None,
+            }
+        ],
+    )
+
+    def complete_ci_during_analysis(*args, **kwargs):
+        execution = (
+            db_session.query(m.CIExecution)
+            .filter_by(ci_revision_id=revision.id)
+            .one()
+        )
+        execution.status = "completed"
+        execution.conclusion = "success"
+        revision.state = "PASSED"
+        revision.discovery_complete = True
+        revision.error = None
+        db_session.commit()
+        return _valid_ai_scores()
+
+    monkeypatch.setattr(
+        gemini_module.gemini_client,
+        "score_dimensions",
+        complete_ci_during_analysis,
+    )
+
+    result = _run(db_session, repo, pr)
+
+    assert result is None
+    assert db_session.query(m.Review).filter_by(pull_request_id=pr.id).count() == 0
+    reconciliation = (
+        db_session.query(m.BackgroundJob)
+        .filter_by(job_type="REVIEW", state="QUEUED")
+        .one()
+    )
+    assert reconciliation.payload["head_sha"] == pr.head_sha
+    assert posted == []
+
+    pipeline.process_review_job(db_session, reconciliation.payload)
+
+    review = (
+        db_session.query(m.Review)
+        .filter_by(pull_request_id=pr.id, head_sha=pr.head_sha)
+        .one()
+    )
+    assert review.decision == m.DecisionStatus.APPROVED
+    assert [call[0][5] for call in posted] == ["APPROVE"]
 
 
 def test_failed_ci_blocks_approval_and_lists_provider_and_details(

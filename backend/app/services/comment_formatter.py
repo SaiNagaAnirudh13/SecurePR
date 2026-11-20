@@ -80,7 +80,7 @@ def format_comment(
         "",
         "| | |",
         "|---|---|",
-        "| **AI Analysis** | Completed |",
+        f"| **AI Analysis** | {'Incomplete' if analysis_error else 'Completed'} |",
         f"| **Overall Risk Score** | `{overall_score}/100` ({RISK_LABEL.get(category, category)}) |",
         f"| **CI / Check Status** | {_ci_summary_line(ci_checks, ci_state)} |",
         "| **Review Result** | Published |",

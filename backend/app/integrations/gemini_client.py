@@ -46,6 +46,10 @@ class GeminiUnavailable(Exception):
     pass
 
 
+class GeminiAnalysisError(Exception):
+    pass
+
+
 class GeminiClient:
     def __init__(self):
         self.settings = get_settings()
@@ -92,13 +96,13 @@ class GeminiClient:
             return fallback
         raise GeminiUnavailable("No Gemini models are available for this API key.")
 
-    def score_dimensions(self, changed_files: list[dict]) -> dict | None:
-        """Returns parsed dict or None on any failure (caller must handle gracefully)."""
+    def score_dimensions(self, changed_files: list[dict]) -> dict:
+        """Return validated AI scores or raise instead of silently falling back."""
         try:
             self._ensure_configured()
         except GeminiUnavailable as exc:
             logger.warning("Gemini unavailable, skipping AI scoring: %s", exc)
-            return None
+            raise GeminiAnalysisError(str(exc)) from exc
 
         file_summaries = []
         for f in changed_files[:40]:  # cap payload size
@@ -141,8 +145,15 @@ class GeminiClient:
             validated["summary"] = summary
             return validated
         except Exception as exc:
-            logger.warning("Gemini scoring call failed or returned malformed output: %s", exc)
-            return None
+            logger.warning(
+                "Gemini scoring call failed or returned malformed output: %s",
+                exc,
+                extra={
+                    "failure_reason": f"{type(exc).__name__}: {exc}",
+                    "analysis_failed": True,
+                },
+            )
+            raise GeminiAnalysisError(f"{type(exc).__name__}: {exc}") from exc
 
 
 gemini_client = GeminiClient()

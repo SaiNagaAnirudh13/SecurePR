@@ -330,7 +330,14 @@ def _queue_review_status_update(
 
 
 def _queue_review_reconciliation(
-    db: Session, repo: m.Repository, pr: m.PullRequest, revision: m.CIRevision
+    db: Session,
+    repo: m.Repository,
+    pr: m.PullRequest,
+    revision: m.CIRevision,
+    *,
+    include_missing_review: bool = False,
+    is_reevaluation: bool = False,
+    previous_review_id: str | None = None,
 ) -> None:
     review = (
         db.query(m.Review)
@@ -342,31 +349,37 @@ def _queue_review_reconciliation(
         .order_by(m.Review.created_at.desc())
         .first()
     )
-    if not review:
+    if not review and not include_missing_review:
         return
+    fingerprint_values = {
+        "state": revision.state,
+        "error": revision.error,
+        "required_checks": revision.required_checks or [],
+        "discovery_complete": revision.discovery_complete,
+        "records": _ci_records(db, revision),
+        "review_id": review.id if review else None,
+        "decision": review.decision.value if review else None,
+    }
+    if is_reevaluation:
+        fingerprint_values["is_reevaluation"] = True
+        fingerprint_values["previous_review_id"] = previous_review_id
     fingerprint = hashlib.sha256(
-        json.dumps(
-            {
-                "state": revision.state,
-                "error": revision.error,
-                "required_checks": revision.required_checks or [],
-                "discovery_complete": revision.discovery_complete,
-                "records": _ci_records(db, revision),
-                "review_id": review.id,
-                "decision": review.decision.value,
-            },
-            sort_keys=True,
-        ).encode("utf-8")
+        json.dumps(fingerprint_values, sort_keys=True).encode("utf-8")
     ).hexdigest()
+    reeval_key = (
+        f":reevaluation:{previous_review_id or 'new'}" if is_reevaluation else ""
+    )
     enqueue_job(
         db,
         "REVIEW",
-        f"review-reconcile:{repo.id}:{pr.id}:{revision.head_sha}:{fingerprint}",
+        f"review-reconcile:{repo.id}:{pr.id}:{revision.head_sha}:{fingerprint}{reeval_key}",
         {
             "repository_id": repo.id,
             "pull_request_id": pr.id,
             "installation_id": repo.installation_id,
             "head_sha": revision.head_sha,
+            "is_reevaluation": is_reevaluation,
+            "previous_review_id": previous_review_id,
         },
     )
 
@@ -402,7 +415,7 @@ def _refresh_ci_before_approval(
     installation_id: str,
     revision: m.CIRevision,
 ) -> ci_status.CIStatus:
-    """Recheck GitHub immediately before turning a stored pass into approval."""
+    """Refresh GitHub's exact-revision CI state before calculating a decision."""
     owner, repo_name = repo.full_name.split("/", 1)
     try:
         checks, required_checks, errors = _fetch_ci_checks(
@@ -414,7 +427,7 @@ def _refresh_ci_before_approval(
         )
     except Exception as exc:
         logger.exception(
-            "Final CI verification failed before approval: repository=%s pr=%s sha=%s",
+            "Final CI verification failed before decision: repository=%s pr=%s sha=%s",
             repo.full_name,
             pr.github_pr_number,
             revision.head_sha,
@@ -806,6 +819,7 @@ def _run_analysis_locked(
             item for item in ci_records if item["kind"] != "check_suite"
         ]
 
+    analysis_ci_state = ci_evaluation.state
     analysis_complete = True
     changed_files_error = None
     try:
@@ -832,6 +846,8 @@ def _run_analysis_locked(
             policy_name=policy_doc.get("name", "default"),
         )
     ai_scores = None
+    ai_analysis_error = None
+    ai_failure_reason = None
     if analysis_complete:
         heuristic_scores = risk_engine.compute_deterministic_scores(
             changed_files, ci_execution_records
@@ -841,10 +857,33 @@ def _run_analysis_locked(
         )
         try:
             ai_scores = gemini_client.score_dimensions(changed_files)
-        except Exception:
-            logger.exception("AI risk scoring failed; using deterministic risk scores")
+        except Exception as exc:
+            ai_failure_reason = f"{type(exc).__name__}: {exc}"
+            logger.exception(
+                "AI risk scoring failed: repository=%s pr=%s sha=%s",
+                repo.full_name,
+                pr.github_pr_number,
+                pr.head_sha,
+                extra={
+                    "repository": repo.full_name,
+                    "pr_number": pr.github_pr_number,
+                    "head_sha": pr.head_sha,
+                    "failure_reason": ai_failure_reason,
+                },
+            )
+        if ai_scores is None:
+            ai_analysis_error = (
+                "Gemini analysis failed or returned malformed output; "
+                "manual review is required."
+            )
         blended = risk_engine.blend_with_ai(heuristic_scores, ai_scores)
         assessment = risk_engine.compute_overall(blended)
+        if ai_scores is None:
+            assessment = risk_engine.RiskAssessment(
+                scores=blended,
+                overall_score=assessment.overall_score,
+                category="NOT_EVALUATED",
+            )
     else:
         rationale = (
             "Not evaluated because GitHub did not provide the changed-file list."
@@ -930,35 +969,6 @@ def _run_analysis_locked(
             )
             .first()
         )
-    decision = decision_engine.decide(
-        decision_engine.DecisionInput(
-            overall_score=assessment.overall_score,
-            risk_category=assessment.category,
-            findings=findings,
-            policy_violations=policy_eval.violations,
-            policy_warnings=policy_eval.warnings,
-            requires_human_review_by_policy=policy_eval.requires_human_review,
-            circuit_breaker_tripped=cb_tripped,
-            circuit_breaker_reason=cb_reason,
-            author_eligible=bool(eligibility and eligibility.is_enabled),
-            author_risk_threshold=eligibility.max_risk_threshold
-            if eligibility
-            else None,
-            analysis_complete=analysis_complete,
-            ci_state=ci_evaluation.state,
-            failed_checks=[
-                item
-                for item in ci_execution_records
-                if ci_status.classify_execution(
-                    item.get("status"), item.get("conclusion")
-                )
-                == "failed"
-            ],
-        )
-    )
-    if changed_files_error:
-        decision.reasons.append(changed_files_error)
-
     latest_pr = github_client.get_pull_request(
         installation_id, owner, repo_name, pr.github_pr_number
     )
@@ -1007,6 +1017,11 @@ def _run_analysis_locked(
         )
         return None
 
+    if ci_evaluation.state == "PASSED":
+        ci_evaluation = _refresh_ci_before_approval(
+            db, repo, pr, installation_id, revision
+        )
+
     final_ci_revision = (
         db.query(m.CIRevision)
         .filter(
@@ -1027,6 +1042,52 @@ def _run_analysis_locked(
             discovery_complete=final_ci_revision.discovery_complete,
             required_checks=final_ci_revision.required_checks,
         )
+
+    if analysis_ci_state != "PASSED" and ci_evaluation.state == "PASSED":
+        _queue_review_reconciliation(
+            db,
+            repo,
+            pr,
+            final_ci_revision or revision,
+            include_missing_review=True,
+            is_reevaluation=is_reevaluation,
+            previous_review_id=previous_review_id,
+        )
+        _queue_review_status_update(db, repo, pr, pr.head_sha)
+        db.commit()
+        _log_analysis_timing("total", started_clock, repo, pr)
+        return None
+
+    decision = decision_engine.decide(
+        decision_engine.DecisionInput(
+            overall_score=assessment.overall_score,
+            risk_category=assessment.category,
+            findings=findings,
+            policy_violations=policy_eval.violations,
+            policy_warnings=policy_eval.warnings,
+            requires_human_review_by_policy=policy_eval.requires_human_review,
+            circuit_breaker_tripped=cb_tripped,
+            circuit_breaker_reason=cb_reason,
+            author_eligible=bool(eligibility and eligibility.is_enabled),
+            author_risk_threshold=eligibility.max_risk_threshold
+            if eligibility
+            else None,
+            analysis_complete=analysis_complete and ai_scores is not None,
+            ci_state=ci_evaluation.state,
+            failed_checks=[
+                item
+                for item in ci_execution_records
+                if ci_status.classify_execution(
+                    item.get("status"), item.get("conclusion")
+                )
+                == "failed"
+            ],
+        )
+    )
+    if changed_files_error:
+        decision.reasons.append(changed_files_error)
+    if ai_analysis_error:
+        decision.reasons.append(ai_analysis_error)
 
     review = m.Review(
         pull_request_id=pr.id,
@@ -1091,6 +1152,18 @@ def _run_analysis_locked(
                 content=changed_files_error,
             )
         )
+    if ai_analysis_error:
+        db.add(
+            m.Evidence(
+                review_id=review.id,
+                evidence_type="error",
+                source="gemini",
+                content=(
+                    f"{ai_analysis_error} Failure reason: "
+                    f"{ai_failure_reason or 'Gemini returned no scores.'}"
+                ),
+            )
+        )
     db.add(
         m.Evidence(
             review_id=review.id,
@@ -1128,6 +1201,8 @@ def _run_analysis_locked(
     review.analysis_completed_at = datetime.utcnow()
     if decision.status != m.DecisionStatus.WAITING_FOR_CI:
         review.lifecycle_state = decision.status.value
+    if ai_analysis_error and decision.status == m.DecisionStatus.MANUAL_REVIEW:
+        review.lifecycle_state = "ANALYSIS_FAILED"
 
     dashboard_url = f"{settings.DASHBOARD_ORIGIN}/#/pr/{pr.id}"
     body = format_comment(
@@ -1146,7 +1221,7 @@ def _run_analysis_locked(
         dashboard_url=dashboard_url,
         ci_checks=ci_execution_records,
         ci_state=ci_evaluation.state,
-        analysis_error=changed_files_error,
+        analysis_error=changed_files_error or ai_analysis_error,
     )
     if decision.status == m.DecisionStatus.WAITING_FOR_CI:
         previous_review = (
@@ -1424,7 +1499,7 @@ def _run_analysis_locked(
                         if record["kind"] != "check_suite"
                     ],
                     ci_state="FAILED",
-                    analysis_error=changed_files_error,
+                    analysis_error=changed_files_error or ai_analysis_error,
                 )
                 corrective_marker = (
                     f"<!-- securepr-review:{pr.id}:{review.head_sha}:"
@@ -1635,6 +1710,8 @@ def process_review_job(db: Session, payload: dict) -> None:
         repo,
         pr,
         payload["installation_id"],
+        is_reevaluation=bool(payload.get("is_reevaluation", False)),
+        previous_review_id=payload.get("previous_review_id"),
         expected_head_sha=live_sha,
         trigger="durable_review_job",
     )

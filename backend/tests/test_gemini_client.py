@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.integrations.gemini_client import GeminiClient
+from app.integrations.gemini_client import GeminiAnalysisError, GeminiClient
 
 
 def valid_output():
@@ -40,10 +40,12 @@ def test_gemini_generation_uses_configured_timeout():
     assert calls["request_options"] == {"timeout": 17}
 
 
-def test_gemini_timeout_returns_to_deterministic_fallback():
+def test_gemini_timeout_is_reported_as_analysis_failure():
     class FakeModel:
         def generate_content(self, prompt, request_options):
-            raise TimeoutError("test timeout")
+            raise TimeoutError(
+                "504 Deadline expired before operation could complete"
+            )
 
     client = GeminiClient()
     client.settings = SimpleNamespace(GEMINI_REQUEST_TIMEOUT_SECONDS=17)
@@ -51,7 +53,8 @@ def test_gemini_timeout_returns_to_deterministic_fallback():
     client._model_name = "test-model"
     client._genai = SimpleNamespace(GenerativeModel=lambda name: FakeModel())
 
-    assert client.score_dimensions([]) is None
+    with pytest.raises(GeminiAnalysisError, match="TimeoutError: 504 Deadline expired"):
+        client.score_dimensions([])
 
 
 @pytest.mark.parametrize(
@@ -70,7 +73,7 @@ def test_gemini_timeout_returns_to_deterministic_fallback():
         }),
     ],
 )
-def test_gemini_malformed_output_uses_deterministic_fallback(response):
+def test_gemini_malformed_output_is_reported_as_analysis_failure(response):
     class FakeModel:
         def generate_content(self, prompt, request_options):
             return SimpleNamespace(text=response)
@@ -81,4 +84,5 @@ def test_gemini_malformed_output_uses_deterministic_fallback(response):
     client._model_name = "test-model"
     client._genai = SimpleNamespace(GenerativeModel=lambda name: FakeModel())
 
-    assert client.score_dimensions([]) is None
+    with pytest.raises(GeminiAnalysisError):
+        client.score_dimensions([])
