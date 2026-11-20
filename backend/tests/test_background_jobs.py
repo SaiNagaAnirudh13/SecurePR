@@ -38,8 +38,8 @@ def test_expired_final_attempt_is_marked_failed(tmp_path):
     job = m.BackgroundJob(
         job_type="CI_REFRESH", idempotency_key="refresh:expired",
         payload={}, state="RUNNING", attempts=MAX_ATTEMPTS,
-        available_at=datetime.utcnow() - timedelta(minutes=10),
-        lease_until=datetime.utcnow() - timedelta(minutes=1),
+        available_at=datetime.utcnow() - timedelta(minutes=10),  # noqa: DTZ003
+        lease_until=datetime.utcnow() - timedelta(minutes=1),  # noqa: DTZ003
     )
     session.add(job)
     session.commit()
@@ -63,8 +63,8 @@ def test_expired_running_job_is_reclaimed_after_worker_restart(tmp_path):
             payload={"repository_id": "repo", "head_sha": "sha"},
             state="RUNNING",
             attempts=1,
-            available_at=datetime.utcnow() - timedelta(minutes=10),
-            lease_until=datetime.utcnow() - timedelta(minutes=1),
+            available_at=datetime.utcnow() - timedelta(minutes=10),  # noqa: DTZ003
+            lease_until=datetime.utcnow() - timedelta(minutes=1),  # noqa: DTZ003
         )
         first_session.add(job)
         first_session.commit()
@@ -77,7 +77,7 @@ def test_expired_running_job_is_reclaimed_after_worker_restart(tmp_path):
         assert reclaimed.id == job_id
         assert reclaimed.state == "RUNNING"
         assert reclaimed.attempts == 2
-        assert reclaimed.lease_until > datetime.utcnow()
+        assert reclaimed.lease_until > datetime.utcnow()  # noqa: DTZ003
     engine.dispose()
 
 
@@ -91,7 +91,7 @@ def test_failed_job_can_be_recovered_with_same_idempotency_key(tmp_path):
         payload={"repository_id": "repo", "head_sha": "sha"},
         state="FAILED",
         attempts=MAX_ATTEMPTS,
-        available_at=datetime.utcnow(),
+        available_at=datetime.utcnow(),  # noqa: DTZ003
         last_error="temporary GitHub failure",
     )
     session.add(failed)

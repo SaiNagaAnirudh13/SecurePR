@@ -27,10 +27,10 @@ def enqueue_job(db, job_type: str, idempotency_key: str, payload: dict, availabl
         if existing.state == "FAILED":
             existing.state = "QUEUED"
             existing.attempts = 0
-            existing.available_at = datetime.utcnow()
+            existing.available_at = datetime.utcnow()  # noqa: DTZ003
             existing.lease_until = None
             existing.last_error = None
-            existing.updated_at = datetime.utcnow()
+            existing.updated_at = datetime.utcnow()  # noqa: DTZ003
             db.flush()
         return existing
     job = m.BackgroundJob(
