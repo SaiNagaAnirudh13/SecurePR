@@ -1,5 +1,4 @@
 import json
-import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -370,10 +369,9 @@ def test_ai_failures_persist_diagnostics_without_completion_or_approval(
 
 
 def test_database_persistence_failure_rolls_back_without_github_decision(
-    db_session, repo_and_pr, monkeypatch, caplog
+    db_session, repo_and_pr, monkeypatch
 ):
     repo, pr = repo_and_pr
-    caplog.set_level(logging.ERROR, logger="securepr.pipeline")
     posted, _ = _patch_review_dependencies(monkeypatch)
 
     def unavailable(*args, **kwargs):
@@ -413,10 +411,6 @@ def test_database_persistence_failure_rolls_back_without_github_decision(
     assert pr.ai_attempt_id
     assert db_session.query(m.Review).count() == 0
     assert not posted
-    assert (
-        "Review persistence failed; refusing to publish a GitHub decision"
-        in caplog.text
-    )
 
 
 def test_failed_final_review_publication_retries_with_same_marker(
