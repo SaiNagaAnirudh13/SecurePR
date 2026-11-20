@@ -136,6 +136,7 @@ def test_pull_request_events_queue_waiting_comment_idempotently_and_close_pr(
     assert synchronized["status"] == "accepted"
     pr = db_session.query(m.PullRequest).one()
     assert pr.head_sha == "new-sha"
+    assert pr.ai_state == "AI_PENDING"
     assert (
         db_session.query(m.BackgroundJob)
         .filter(m.BackgroundJob.job_type == "REVIEW_STATUS")

@@ -67,7 +67,8 @@ def postgres_migration_database():
         connection.exec_driver_sql(
             """
             CREATE TABLE reviews (
-                id VARCHAR(36) PRIMARY KEY
+                id VARCHAR(36) PRIMARY KEY,
+                decision VARCHAR(32) NOT NULL DEFAULT 'PENDING'
             )
             """
         )
@@ -137,7 +138,14 @@ def test_postgres_migration_adds_columns_and_preserves_existing_pr(
             )
         )
     }
-    assert {"merged_at", "merge_commit_sha"}.issubset(columns)
+    assert {
+        "merged_at",
+        "merge_commit_sha",
+        "ai_state",
+        "ai_error_code",
+        "ai_retryable_at",
+        "ai_attempt_id",
+    }.issubset(columns)
     assert connection.execute(
         text("SELECT id, title, head_sha FROM pull_requests WHERE id = 'existing-pr'")
     ).one() == ("existing-pr", "Existing PR", "original-sha")
@@ -146,6 +154,7 @@ def test_postgres_migration_adds_columns_and_preserves_existing_pr(
         migrated_pr = session.query(m.PullRequest).filter_by(id="existing-pr").one()
         assert migrated_pr.merged_at is None
         assert migrated_pr.merge_commit_sha is None
+        assert migrated_pr.ai_state == "AI_UNAVAILABLE"
     finally:
         session.close()
 
@@ -177,10 +186,11 @@ def test_postgres_migration_rerun_is_safe(postgres_migration_database):
                 "SELECT COUNT(*) FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "
                 "AND table_name = 'pull_requests' "
-                "AND column_name IN ('merged_at', 'merge_commit_sha')"
+                "AND column_name IN ('merged_at', 'merge_commit_sha', 'ai_state', "
+                "'ai_error_code', 'ai_retryable_at', 'ai_attempt_id')"
             )
         ).scalar_one()
-        == 2
+        == 6
     )
 
 

@@ -54,6 +54,7 @@ def _objects(db_session):
         head_sha="head1",
         base_branch="main",
         state="open",
+        ai_state="AI_COMPLETED",
     )
     db_session.add(pr)
     db_session.flush()
@@ -61,6 +62,7 @@ def _objects(db_session):
         pull_request_id=pr.id,
         head_sha="head1",
         decision=m.DecisionStatus.APPROVED,
+        ai_state="AI_COMPLETED",
         overall_score=20,
         risk_category="LOW",
         github_action_confirmed=True,
@@ -173,6 +175,47 @@ def test_approved_low_risk_requests_github_auto_merge_and_waits_for_confirmation
     assert result.status == "AUTO_MERGE_ENABLED"
     assert result.merge_commit_sha is None
     assert "not yet merged" in result.reason
+
+
+@pytest.mark.parametrize(
+    "ai_state",
+    ["AI_PENDING", "AI_RUNNING", "AI_FAILED", "AI_UNAVAILABLE", "AI_INVALID_RESPONSE"],
+)
+def test_auto_merge_is_blocked_without_completed_ai_analysis(
+    db_session, monkeypatch, ai_state
+):
+    repo, pr, review = _objects(db_session)
+    _enable(monkeypatch)
+    pr.ai_state = ai_state
+    review.ai_state = ai_state
+    called = []
+    monkeypatch.setattr(
+        auto_merge.github_client,
+        "get_pull_request",
+        lambda *args: called.append(True),
+    )
+
+    result = _attempt(db_session, repo, pr, review)
+
+    assert result.status == "NOT_ELIGIBLE"
+    assert called == []
+
+
+def test_auto_merge_is_blocked_when_review_head_sha_is_stale(db_session, monkeypatch):
+    repo, pr, review = _objects(db_session)
+    _enable(monkeypatch)
+    pr.head_sha = "new-head"
+    called = []
+    monkeypatch.setattr(
+        auto_merge.github_client,
+        "get_pull_request",
+        lambda *args: called.append(True),
+    )
+
+    result = _attempt(db_session, repo, pr, review)
+
+    assert result.status == "NOT_ELIGIBLE"
+    assert called == []
 
 
 def test_global_or_repository_opt_out_never_calls_github(db_session, monkeypatch):

@@ -1,5 +1,6 @@
 import os
 from datetime import datetime
+from types import SimpleNamespace
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -14,6 +15,23 @@ from app.api.dashboard import (  # noqa: E402
 )
 from app.core.db import Base  # noqa: E402
 from app.models import models as m  # noqa: E402
+
+
+def test_dashboard_never_reports_approval_when_ai_is_unavailable():
+    pr = SimpleNamespace(
+        ai_state="AI_INVALID_RESPONSE",
+        head_sha="current-sha",
+        merged_at=None,
+    )
+    review = SimpleNamespace(
+        ai_state="AI_COMPLETED",
+        head_sha="current-sha",
+        decision=m.DecisionStatus.APPROVED,
+    )
+    repo = SimpleNamespace(is_auto_merge_enabled=True)
+
+    assert _authoritative_decision(None, pr, review) == "REVIEW_UNAVAILABLE"
+    assert _auto_merge_status(None, repo, pr, review)[0] == "AI_REVIEW_UNAVAILABLE"
 
 
 def test_dashboard_never_exposes_cached_approval_after_current_ci_failure(
@@ -37,6 +55,7 @@ def test_dashboard_never_exposes_cached_approval_after_current_ci_failure(
             repository_id=repo.id,
             github_pr_number=7,
             head_sha="abc123",
+            ai_state="AI_COMPLETED",
             base_branch="main",
             state="open",
         )
@@ -46,6 +65,7 @@ def test_dashboard_never_exposes_cached_approval_after_current_ci_failure(
             pull_request_id=pr.id,
             head_sha=pr.head_sha,
             decision=m.DecisionStatus.APPROVED,
+            ai_state="AI_COMPLETED",
             auto_merge_status="AUTO_MERGE_ENABLED",
         )
         db.add(review)
@@ -110,6 +130,7 @@ def test_dashboard_never_exposes_cached_approval_while_ci_is_pending(
             repository_id=repo.id,
             github_pr_number=7,
             head_sha="abc123",
+            ai_state="AI_COMPLETED",
             base_branch="main",
             state="open",
         )
@@ -119,6 +140,7 @@ def test_dashboard_never_exposes_cached_approval_while_ci_is_pending(
             pull_request_id=pr.id,
             head_sha=pr.head_sha,
             decision=m.DecisionStatus.APPROVED,
+            ai_state="AI_COMPLETED",
         )
         db.add(review)
         db.add(
@@ -161,6 +183,7 @@ def test_review_status_requires_confirmed_publication(tmp_path):
             repository_id=repo.id,
             github_pr_number=7,
             head_sha="abc123",
+            ai_state="AI_COMPLETED",
             state="open",
         )
         db.add(pr)
@@ -168,6 +191,7 @@ def test_review_status_requires_confirmed_publication(tmp_path):
         review = m.Review(
             pull_request_id=pr.id,
             head_sha=pr.head_sha,
+            ai_state="AI_COMPLETED",
             analysis_completed_at=datetime.utcnow(),
         )
         db.add(review)
@@ -211,11 +235,16 @@ def test_review_detail_includes_finding_line_reference(tmp_path):
             repository_id=repo.id,
             github_pr_number=7,
             head_sha="abc123",
+            ai_state="AI_COMPLETED",
             state="open",
         )
         db.add(pr)
         db.flush()
-        review = m.Review(pull_request_id=pr.id, head_sha=pr.head_sha)
+        review = m.Review(
+            pull_request_id=pr.id,
+            head_sha=pr.head_sha,
+            ai_state="AI_COMPLETED",
+        )
         db.add(review)
         db.flush()
         db.add(

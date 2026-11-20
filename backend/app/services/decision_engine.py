@@ -7,9 +7,9 @@ decision is made here using explicit, auditable rules -- never "because the
 AI said so". This module has no dependency on the Gemini client.
 
 Order of evaluation (first matching hard rule wins):
-  1. CI not verified or not passed                       -> WAITING_FOR_CI
+  1. AI analysis unavailable or incomplete                -> WAITING_FOR_AI / REVIEW_UNAVAILABLE
+  2. CI not verified or not passed                       -> WAITING_FOR_CI
      (a discovered failure instead always returns BLOCKED)
-  2. Analysis incomplete / missing required data         -> MANUAL_REVIEW
   3. Any CRITICAL finding                                -> BLOCKED
      (a confirmed secret or destructive SQL statement in the diff is a
      reason to block outright -- there's no reason to make the contributor
@@ -45,6 +45,7 @@ class DecisionInput:
     author_eligible: bool
     author_risk_threshold: int | None
     analysis_complete: bool
+    ai_state: str = "AI_COMPLETED"
     ci_state: str = "UNKNOWN"
     failed_checks: list = field(default_factory=list)
 
@@ -57,6 +58,19 @@ class Decision:
 
 def decide(inp: DecisionInput) -> Decision:
     reasons: list[str] = []
+
+    if inp.ai_state in {"AI_PENDING", "AI_RUNNING"}:
+        return Decision(
+            DecisionStatus.WAITING_FOR_AI,
+            ["AI analysis has not completed; no review decision is available."],
+        )
+    if inp.ai_state != "AI_COMPLETED" or not inp.analysis_complete:
+        return Decision(
+            DecisionStatus.REVIEW_UNAVAILABLE,
+            [
+                "AI analysis could not be completed and validated. No AI approval decision has been made."
+            ],
+        )
 
     if inp.ci_state == "FAILED":
         reasons.append(
@@ -81,12 +95,6 @@ def decide(inp: DecisionInput) -> Decision:
             "missing or incomplete checks are never treated as successful."
         )
         return Decision(DecisionStatus.WAITING_FOR_CI, reasons)
-
-    if not inp.analysis_complete:
-        return Decision(
-            DecisionStatus.MANUAL_REVIEW,
-            ["Analysis did not complete fully; routed to manual review."],
-        )
 
     critical_findings = [
         f

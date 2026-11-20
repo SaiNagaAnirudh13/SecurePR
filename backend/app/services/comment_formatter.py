@@ -9,6 +9,16 @@ DECISION_META = {
     "APPROVED": {"emoji": "✅", "label": "Approved", "color": "🟢"},
     "BLOCKED": {"emoji": "⛔", "label": "Blocked", "color": "🔴"},
     "MANUAL_REVIEW": {"emoji": "🟡", "label": "Manual Review Required", "color": "🟡"},
+    "REVIEW_UNAVAILABLE": {
+        "emoji": "⚠️",
+        "label": "AI Review Not Completed",
+        "color": "🟡",
+    },
+    "WAITING_FOR_AI": {
+        "emoji": "⏳",
+        "label": "Waiting for AI",
+        "color": "⚪",
+    },
     "PENDING": {"emoji": "⏳", "label": "Pending", "color": "⚪"},
 }
 
@@ -44,6 +54,24 @@ RECOMMENDED_ACTION = {
     "change_surface": "Consider splitting this into smaller, independently reviewable PRs.",
 }
 
+AI_FAILURE_REASONS = {
+    "GEMINI_CONFIGURATION_MISSING": "AI provider configuration is missing.",
+    "GEMINI_MODEL_CONFIGURATION_INVALID": "AI model configuration is invalid.",
+    "GEMINI_AUTHENTICATION_FAILED": "Gemini authentication failed; provider configuration must be checked.",
+    "GEMINI_QUOTA_EXCEEDED": "Gemini API quota or rate limit was exceeded.",
+    "GEMINI_PROVIDER_UNAVAILABLE": "Gemini is temporarily unavailable.",
+    "GEMINI_REQUEST_TIMEOUT": "Gemini analysis timed out.",
+    "GEMINI_NETWORK_ERROR": "Gemini could not be reached because of a network error.",
+    "GEMINI_INVALID_RESPONSE": "Gemini returned an invalid or incomplete response.",
+    "PR_FILES_UNAVAILABLE": "The changed files could not be retrieved for AI analysis.",
+}
+
+
+def _ai_failure_reason(error_code: str | None) -> str:
+    if not isinstance(error_code, str):
+        return "Gemini analysis could not be completed."
+    return AI_FAILURE_REASONS.get(error_code, "Gemini analysis could not be completed.")
+
 
 def _score_bar(score: float) -> str:
     filled = max(0, min(10, round(score / 10)))
@@ -68,7 +96,19 @@ def format_comment(
     ci_checks: list[dict] | None = None,
     analysis_error: str | None = None,
     ci_state: str | None = None,
+    ai_state: str | None = None,
+    ai_error_code: str | None = None,
+    ai_retryable_at: datetime | None = None,
 ) -> str:
+    if decision == "REVIEW_UNAVAILABLE":
+        return format_ai_unavailable_comment(
+            ai_state=ai_state or "AI_FAILED",
+            ai_error_code=ai_error_code,
+            ai_retryable_at=ai_retryable_at,
+            ci_checks=ci_checks,
+            ci_state=ci_state,
+        )
+
     meta = DECISION_META.get(decision, {"emoji": "", "label": decision})
     if decision == "BLOCKED" and ci_state == "FAILED":
         meta = {"emoji": "⛔", "label": "BLOCKED: CI Failed", "color": "🔴"}
@@ -201,6 +241,40 @@ def format_comment(
     return "\n".join(lines)
 
 
+def format_ai_unavailable_comment(
+    *,
+    ai_state: str,
+    ai_error_code: str | None,
+    ai_retryable_at: datetime | None,
+    ci_checks: list[dict] | None,
+    ci_state: str | None,
+) -> str:
+    reason = _ai_failure_reason(ai_error_code)
+    lines = [
+        "## SecurePR AI Review — **NOT COMPLETED**",
+        "",
+        "SecurePR received this pull request, but the AI code review could not be completed.",
+        "",
+        f"**AI Review Status:** Not Completed (`{ai_state}`)  ",
+        "**Review Decision:** UNAVAILABLE  ",
+        "**Risk Score:** Not Evaluated  ",
+        f"**CI Status:** {_ci_summary_line(ci_checks, ci_state)}",
+        "",
+        f"**Reason:** {reason}",
+        "",
+        "**No AI approval decision has been made.**",
+        "The PR requires a successful AI analysis before SecurePR can issue its normal final review decision.",
+    ]
+    if ai_retryable_at:
+        lines.extend(
+            [
+                "",
+                f"**Retryable After:** {ai_retryable_at.strftime('%Y-%m-%d %H:%M UTC')}",
+            ]
+        )
+    return "\n".join(lines)
+
+
 def format_review_status_comment(
     *,
     pr_number: int,
@@ -218,6 +292,8 @@ def format_review_status_comment(
     )
     if not is_final:
         title = "SecurePR Review — Waiting for CI"
+    elif review.decision.value == "REVIEW_UNAVAILABLE":
+        title = "SecurePR AI Review — NOT COMPLETED"
     elif review.decision.value == "BLOCKED" and ci_state == "FAILED":
         title = "SecurePR Review — BLOCKED: CI Failed"
     else:
@@ -227,7 +303,9 @@ def format_review_status_comment(
         "",
         f"SecurePR has received PR #{pr_number} at revision `{head_sha}`.",
         (
-            f"Authoritative decision: **{review.decision.value}** "
+            "AI review was not completed; no AI approval decision has been made."
+            if is_final and review.decision.value == "REVIEW_UNAVAILABLE"
+            else f"Authoritative decision: **{review.decision.value}** "
             f"(risk {review.overall_score}/100, {review.risk_category})."
             if is_final
             else "AI analysis and CI verification are being processed; no approval decision is final."
@@ -236,10 +314,25 @@ def format_review_status_comment(
         f"- **CI status:** {ci_state.replace('_', ' ').title()}",
     ]
     if is_final:
-        lines.extend(
-            f"- **Decision reason:** {reason}"
-            for reason in (review.decision_reasons or [])
-        )
+        if review.decision.value == "REVIEW_UNAVAILABLE":
+            lines.extend(
+                [
+                    "- **AI Review Status:** Not Completed",
+                    "- **Review Decision:** UNAVAILABLE",
+                    "- **Risk Score:** Not Evaluated",
+                    f"- **Reason:** {_ai_failure_reason(getattr(review, 'ai_error_code', None))}",
+                ]
+            )
+            retryable_at = getattr(review, "ai_retryable_at", None)
+            if retryable_at:
+                lines.append(
+                    f"- **Retryable After:** {retryable_at.strftime('%Y-%m-%d %H:%M UTC')}"
+                )
+        else:
+            lines.extend(
+                f"- **Decision reason:** {reason}"
+                for reason in (review.decision_reasons or [])
+            )
     if ci_error:
         lines.append(f"- **CI discovery error:** {ci_error}")
     if ci_checks:

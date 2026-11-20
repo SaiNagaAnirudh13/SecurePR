@@ -384,6 +384,7 @@ def _get_or_create_pr(
             title=gh_pr.get("title", ""),
             author_login=gh_pr.get("user", {}).get("login", ""),
             head_sha=gh_pr.get("head", {}).get("sha", ""),
+            ai_state="AI_PENDING",
             base_branch=gh_pr.get("base", {}).get("ref", ""),
             head_branch=gh_pr.get("head", {}).get("ref", ""),
             state=gh_pr.get("state", ""),
@@ -404,10 +405,16 @@ def _get_or_create_pr(
             pr_number,
         )
 
-        pr.head_sha = gh_pr.get("head", {}).get(
+        new_head_sha = gh_pr.get("head", {}).get(
             "sha",
             pr.head_sha,
         )
+        if new_head_sha != pr.head_sha:
+            pr.ai_state = "AI_PENDING"
+            pr.ai_error_code = None
+            pr.ai_retryable_at = None
+            pr.ai_attempt_id = None
+        pr.head_sha = new_head_sha
         pr.title = gh_pr.get("title", pr.title)
         pr.author_login = gh_pr.get("user", {}).get("login", pr.author_login)
         pr.base_branch = gh_pr.get("base", {}).get("ref", pr.base_branch)

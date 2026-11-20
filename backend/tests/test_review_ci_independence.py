@@ -171,7 +171,7 @@ def _valid_ai_scores():
             "verification",
             "policy_compliance",
         )
-    } | {"summary": "test summary"}
+    } | {"summary": "test summary", "findings": []}
 
 
 def _add_ci_revision(db_session, repo, pr, state, checks=(), required=()):
@@ -241,17 +241,19 @@ def test_passed_ci_and_eligible_low_risk_publish_approval(
 
     assert review.decision == m.DecisionStatus.APPROVED
     assert review.lifecycle_state == "APPROVED"
+    assert review.ai_state == pr.ai_state == "AI_COMPLETED"
     assert review.ci_verified_at is not None
     assert len(posted) == 1
     assert posted[0][0][5] == "APPROVE"
     assert posted[0][1]["commit_id"] == pr.head_sha
 
 
-def test_gemini_timeout_requires_manual_review_and_never_approves(
+def test_gemini_timeout_is_unavailable_without_fallback_risk_or_approval(
     db_session, repo_and_pr, monkeypatch
 ):
     repo, pr = repo_and_pr
     posted, _ = _patch_review_dependencies(monkeypatch)
+
     def timeout(*args, **kwargs):
         raise gemini_module.GeminiAnalysisError(
             "DeadlineExceeded: 504 Deadline expired before operation could complete."
@@ -274,22 +276,28 @@ def test_gemini_timeout_requires_manual_review_and_never_approves(
 
     review = _run(db_session, repo, pr)
 
-    assert review.decision == m.DecisionStatus.MANUAL_REVIEW
-    assert review.lifecycle_state == "ANALYSIS_FAILED"
+    assert review.decision == m.DecisionStatus.REVIEW_UNAVAILABLE
+    assert review.lifecycle_state == "REVIEW_UNAVAILABLE"
+    assert review.ai_state == pr.ai_state == "AI_FAILED"
     assert review.risk_category == "NOT_EVALUATED"
+    assert review.overall_score == 0
     assert review.github_review_state == "COMMENT"
     assert review.auto_merge_status is None
     assert len(posted) == 1
     assert posted[0][0][5] == "COMMENT"
-    assert "Gemini analysis failed" in posted[0][0][4]
-    assert "| **AI Analysis** | Incomplete |" in posted[0][0][4]
+    assert "AI Review — **NOT COMPLETED**" in posted[0][0][4]
+    assert "**Review Decision:** UNAVAILABLE" in posted[0][0][4]
+    assert "**Risk Score:** Not Evaluated" in posted[0][0][4]
+    assert "Risk Breakdown" not in posted[0][0][4]
+    assert "504 Deadline expired" not in posted[0][0][4]
+    assert "**No AI approval decision has been made.**" in posted[0][0][4]
     evidence = (
         db_session.query(m.Evidence)
         .filter_by(review_id=review.id, evidence_type="error", source="gemini")
         .one()
     )
-    assert "manual review is required" in evidence.content
-    assert "504 Deadline expired" in evidence.content
+    assert "GEMINI_ANALYSIS_FAILED" in evidence.content
+    assert "504 Deadline expired" not in evidence.content
 
 
 def test_failed_final_review_publication_retries_with_same_marker(
@@ -419,9 +427,7 @@ def test_ci_completion_during_ai_analysis_queues_full_revision_reconciliation(
 
     def complete_ci_during_analysis(*args, **kwargs):
         execution = (
-            db_session.query(m.CIExecution)
-            .filter_by(ci_revision_id=revision.id)
-            .one()
+            db_session.query(m.CIExecution).filter_by(ci_revision_id=revision.id).one()
         )
         execution.status = "completed"
         execution.conclusion = "success"

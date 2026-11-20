@@ -36,8 +36,8 @@ class Settings(BaseSettings):
     # Gemini
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-3.8-flash"
-    GEMINI_FALLBACK_MODEL: str = "gemini-2.0-flash"
     GEMINI_REQUEST_TIMEOUT_SECONDS: int = 20
+    GEMINI_MAX_ATTEMPTS: int = 3
 
     # App
     SECUREPR_ENV: str = "development"

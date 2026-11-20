@@ -19,7 +19,10 @@ def test_health_returns_ok_only_when_database_is_reachable(monkeypatch, tmp_path
         },
     )
 
-    assert main.health()["status"] == "ok"
+    health = main.health()
+    assert health["status"] == "ok"
+    assert health["dependencies"]["gemini"]["reachability"] == "not_checked"
+    assert "api_key" not in health["dependencies"]["gemini"]
 
     monkeypatch.setattr(main, "background_worker_status", lambda: {"REVIEW": False})
     with pytest.raises(HTTPException) as worker_unavailable:

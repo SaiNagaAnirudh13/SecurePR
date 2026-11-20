@@ -792,6 +792,10 @@ def _run_analysis_locked(
             live_sha,
         )
         pr.head_sha = live_sha
+        pr.ai_state = "AI_PENDING"
+        pr.ai_error_code = None
+        pr.ai_retryable_at = None
+        pr.ai_attempt_id = None
         pr.updated_at = datetime.utcnow()
         db.commit()
         return None
@@ -845,49 +849,65 @@ def _run_analysis_locked(
             policy_version=policy_doc.get("version", 1),
             policy_name=policy_doc.get("name", "default"),
         )
+
+    pr.ai_state = "AI_RUNNING"
+    pr.ai_error_code = None
+    pr.ai_retryable_at = None
+    pr.ai_attempt_id = m.gen_uuid()
+    db.commit()
+
     ai_scores = None
     ai_analysis_error = None
-    ai_failure_reason = None
+    ai_error_code = None
     if analysis_complete:
+        try:
+            ai_scores = gemini_client.score_dimensions(changed_files)
+        except Exception as exc:  # noqa: BLE001
+            pr.ai_state = getattr(exc, "ai_state", "AI_FAILED")
+            ai_error_code = getattr(exc, "error_code", "AI_ANALYSIS_FAILED")
+            pr.ai_error_code = ai_error_code
+            pr.ai_retryable_at = getattr(exc, "retryable_at", None)
+            ai_analysis_error = "Gemini analysis could not be completed."
+            logger.error(
+                "AI analysis failed: repository=%s pr=%s sha=%s state=%s error_code=%s exception_type=%s",
+                repo.full_name,
+                pr.github_pr_number,
+                pr.head_sha,
+                pr.ai_state,
+                ai_error_code,
+                type(exc).__name__,
+                extra={
+                    "repository": repo.full_name,
+                    "pr_number": pr.github_pr_number,
+                    "head_sha": pr.head_sha,
+                    "ai_state": pr.ai_state,
+                    "error_code": ai_error_code,
+                    "exception_type": type(exc).__name__,
+                },
+            )
+        else:
+            pr.ai_state = "AI_COMPLETED"
+            pr.ai_error_code = None
+            pr.ai_retryable_at = None
+    else:
+        pr.ai_state = "AI_FAILED"
+        ai_error_code = "PR_FILES_UNAVAILABLE"
+        pr.ai_error_code = ai_error_code
+        pr.ai_retryable_at = None
+        ai_analysis_error = "The changed files could not be retrieved for AI analysis."
+    db.commit()
+
+    if ai_scores is not None:
         heuristic_scores = risk_engine.compute_deterministic_scores(
             changed_files, ci_execution_records
         )
         heuristic_scores["policy_compliance"] = (
             risk_engine.compute_policy_compliance_score(policy_eval.violations)
         )
-        try:
-            ai_scores = gemini_client.score_dimensions(changed_files)
-        except Exception as exc:
-            ai_failure_reason = f"{type(exc).__name__}: {exc}"
-            logger.exception(
-                "AI risk scoring failed: repository=%s pr=%s sha=%s",
-                repo.full_name,
-                pr.github_pr_number,
-                pr.head_sha,
-                extra={
-                    "repository": repo.full_name,
-                    "pr_number": pr.github_pr_number,
-                    "head_sha": pr.head_sha,
-                    "failure_reason": ai_failure_reason,
-                },
-            )
-        if ai_scores is None:
-            ai_analysis_error = (
-                "Gemini analysis failed or returned malformed output; "
-                "manual review is required."
-            )
         blended = risk_engine.blend_with_ai(heuristic_scores, ai_scores)
         assessment = risk_engine.compute_overall(blended)
-        if ai_scores is None:
-            assessment = risk_engine.RiskAssessment(
-                scores=blended,
-                overall_score=assessment.overall_score,
-                category="NOT_EVALUATED",
-            )
     else:
-        rationale = (
-            "Not evaluated because GitHub did not provide the changed-file list."
-        )
+        rationale = "Not evaluated because validated AI analysis is unavailable."
         blended = {
             dimension: risk_engine.DimensionScore(
                 dimension=dimension,
@@ -901,7 +921,7 @@ def _run_analysis_locked(
             scores=blended, overall_score=0, category="NOT_EVALUATED"
         )
 
-    findings: list[dict] = []
+    findings: list[dict] = list(ai_scores.get("findings", [])) if ai_scores else []
     for path in policy_eval.blocked_paths_touched:
         findings.append(
             {
@@ -948,7 +968,7 @@ def _run_analysis_locked(
                 }
             )
 
-    impact_items = impact_simulator.simulate(changed_files) if analysis_complete else []
+    impact_items = impact_simulator.simulate(changed_files) if ai_scores else []
     cb_tripped, cb_reason = (
         circuit_breaker.is_tripped(db, repo.id, pr.author_login)
         if ci_evaluation.state == "PASSED"
@@ -980,6 +1000,10 @@ def _run_analysis_locked(
     if latest_sha != pr.head_sha:
         if isinstance(latest_sha, str) and latest_sha:
             pr.head_sha = latest_sha
+            pr.ai_state = "AI_PENDING"
+            pr.ai_error_code = None
+            pr.ai_retryable_at = None
+            pr.ai_attempt_id = None
             db.commit()
             _ci_revision(db, repo, pr, latest_sha)
             enqueue_job(
@@ -1072,7 +1096,8 @@ def _run_analysis_locked(
             author_risk_threshold=eligibility.max_risk_threshold
             if eligibility
             else None,
-            analysis_complete=analysis_complete and ai_scores is not None,
+            analysis_complete=ai_scores is not None,
+            ai_state=pr.ai_state,
             ci_state=ci_evaluation.state,
             failed_checks=[
                 item
@@ -1095,6 +1120,10 @@ def _run_analysis_locked(
         head_sha=pr.head_sha,
         is_reevaluation=is_reevaluation,
         superseded_review_id=previous_review_id,
+        ai_state=pr.ai_state,
+        ai_error_code=ai_error_code,
+        ai_retryable_at=pr.ai_retryable_at,
+        ai_attempt_id=pr.ai_attempt_id,
         analysis_started_at=started_at,
     )
     db.add(review)
@@ -1125,15 +1154,16 @@ def _run_analysis_locked(
                 patch_excerpt=changed_file.get("patch_excerpt"),
             )
         )
-    for dimension, score in blended.items():
-        db.add(
-            m.Evidence(
-                review_id=review.id,
-                evidence_type="dimension_rationale",
-                source=score.source,
-                content=f"{dimension}: {score.rationale}",
+    if ai_scores:
+        for dimension, score in blended.items():
+            db.add(
+                m.Evidence(
+                    review_id=review.id,
+                    evidence_type="dimension_rationale",
+                    source=score.source,
+                    content=f"{dimension}: {score.rationale}",
+                )
             )
-        )
     if ai_scores and ai_scores.get("summary"):
         db.add(
             m.Evidence(
@@ -1158,10 +1188,7 @@ def _run_analysis_locked(
                 review_id=review.id,
                 evidence_type="error",
                 source="gemini",
-                content=(
-                    f"{ai_analysis_error} Failure reason: "
-                    f"{ai_failure_reason or 'Gemini returned no scores.'}"
-                ),
+                content=f"{ai_analysis_error} Error code: {ai_error_code}.",
             )
         )
     db.add(
@@ -1189,20 +1216,16 @@ def _run_analysis_locked(
     review.risk_category = assessment.category
     review.decision = decision.status
     review.decision_reasons = decision.reasons
-    review.lifecycle_state = (
-        "WAITING_FOR_CI"
-        if decision.status == m.DecisionStatus.WAITING_FOR_CI
-        else "POLICY_EVALUATION"
-    )
+    review.lifecycle_state = decision.status.value
     review.ci_verified_at = (
         datetime.utcnow() if ci_evaluation.state in {"PASSED", "FAILED"} else None
     )
     review.circuit_breaker_active = cb_tripped
     review.analysis_completed_at = datetime.utcnow()
-    if decision.status != m.DecisionStatus.WAITING_FOR_CI:
-        review.lifecycle_state = decision.status.value
-    if ai_analysis_error and decision.status == m.DecisionStatus.MANUAL_REVIEW:
-        review.lifecycle_state = "ANALYSIS_FAILED"
+    if decision.status == m.DecisionStatus.WAITING_FOR_AI:
+        review.lifecycle_state = "WAITING_FOR_AI"
+    elif decision.status == m.DecisionStatus.REVIEW_UNAVAILABLE:
+        review.lifecycle_state = "REVIEW_UNAVAILABLE"
 
     dashboard_url = f"{settings.DASHBOARD_ORIGIN}/#/pr/{pr.id}"
     body = format_comment(
@@ -1222,6 +1245,9 @@ def _run_analysis_locked(
         ci_checks=ci_execution_records,
         ci_state=ci_evaluation.state,
         analysis_error=changed_files_error or ai_analysis_error,
+        ai_state=pr.ai_state,
+        ai_error_code=ai_error_code,
+        ai_retryable_at=pr.ai_retryable_at,
     )
     if decision.status == m.DecisionStatus.WAITING_FOR_CI:
         previous_review = (
@@ -1262,6 +1288,8 @@ def _run_analysis_locked(
         "APPROVED": "APPROVE",
         "BLOCKED": "REQUEST_CHANGES",
         "MANUAL_REVIEW": "COMMENT",
+        "REVIEW_UNAVAILABLE": "COMMENT",
+        "WAITING_FOR_AI": "COMMENT",
     }
     github_event = event_map[decision.status.value]
     publication_type = f"FINAL_{decision.status.value}_{review.id}"
@@ -1576,12 +1604,23 @@ def _run_analysis_locked(
     completion_publication = _publication(
         db, repo, pr, review.head_sha, "COMPLETION", completion_marker
     )
+    if decision.status == m.DecisionStatus.REVIEW_UNAVAILABLE:
+        completion_summary = (
+            f"SecurePR received PR #{pr.github_pr_number}, but AI analysis was **NOT COMPLETED**. "
+            "Review decision: **UNAVAILABLE**. Risk score: **Not Evaluated**. "
+            f"CI status: **{ci_evaluation.state.replace('_', ' ').title()}**. "
+            "**No AI approval decision has been made.** "
+        )
+    else:
+        completion_summary = (
+            f"SecurePR review complete for PR #{pr.github_pr_number}: "
+            f"**{decision.status.value}** "
+            f"(risk {assessment.overall_score}/100, {assessment.category}). "
+            f"{'**Auto-merge:** ' + review.auto_merge_status + ' — ' + (review.auto_merge_failure_reason or 'GitHub confirmed the request.') + '. ' if review.auto_merge_status else ''}"
+        )
     completion_message = (
         f"### SecurePR Review Complete\n\n"
-        f"SecurePR review complete for PR #{pr.github_pr_number}: "
-        f"**{decision.status.value}** "
-        f"(risk {assessment.overall_score}/100, {assessment.category}). "
-        f"{'**Auto-merge:** ' + review.auto_merge_status + ' — ' + (review.auto_merge_failure_reason or 'GitHub confirmed the request.') + '. ' if review.auto_merge_status else ''}"
+        f"{completion_summary}"
         f"[View detailed review]({settings.DASHBOARD_ORIGIN}/#/pr/{pr.id}) "
         f"\n\n{completion_marker}"
     )
@@ -1677,6 +1716,10 @@ def process_review_job(db: Session, payload: dict) -> None:
             live_sha,
         )
         pr.head_sha = live_sha
+        pr.ai_state = "AI_PENDING"
+        pr.ai_error_code = None
+        pr.ai_retryable_at = None
+        pr.ai_attempt_id = None
         pr.state = "open"
         _ci_revision(db, repo, pr, live_sha)
         db.commit()

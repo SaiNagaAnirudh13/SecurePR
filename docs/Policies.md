@@ -68,7 +68,9 @@ auto-merge; it does not invoke the immediate merge endpoint.
 
 The deterministic decision engine enforces the following:
 
-1. Incomplete changed-file analysis routes to `MANUAL_REVIEW`.
+1. AI must complete and pass response validation for the exact PR head SHA.
+   Missing, failed, unavailable, or invalid AI analysis produces
+   `REVIEW_UNAVAILABLE`, no risk score, and no approval decision.
 2. Critical findings and blocked-path policy violations block.
 3. Any known CI failure or configured hard policy violation blocks.
 4. An active circuit breaker, an ineligible author, an excessive risk score,

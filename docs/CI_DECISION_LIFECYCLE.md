@@ -7,14 +7,22 @@ decisions. A risk score is never sufficient to approve a pull request.
 
 ```text
 RECEIVED
-  -> ANALYZING
-  -> WAITING_FOR_CI
-       -> CI_VERIFIED -> POLICY_EVALUATION -> APPROVED
-                                        -> MANUAL_REVIEW
-                                        -> BLOCKED
-       -> BLOCKED (a discovered CI failure)
-  -> ANALYSIS_FAILED -> MANUAL_REVIEW
+  -> AI_PENDING -> AI_RUNNING
+       -> AI_COMPLETED -> WAITING_FOR_CI
+                       -> CI_VERIFIED -> POLICY_EVALUATION -> APPROVED
+                                                        -> MANUAL_REVIEW
+                                                        -> BLOCKED
+                       -> BLOCKED (a discovered CI failure)
+       -> AI_FAILED / AI_UNAVAILABLE / AI_INVALID_RESPONSE
+                       -> REVIEW_UNAVAILABLE
 ```
+
+AI availability is the first decision gate. Gemini must return a complete,
+schema-valid analysis for the exact current PR head SHA before any risk-based
+decision is possible. An AI failure publishes an explicit `UNAVAILABLE`
+result, no risk score, and the independently observed CI state; it never
+falls back to heuristic-only risk or approval. The selected Gemini model is
+used as configured; SecurePR does not silently select a substitute model.
 
 `UNKNOWN`, `UNAVAILABLE`, incomplete discovery, missing required checks,
 pending executions, and terminal non-success conclusions remain
@@ -39,10 +47,10 @@ incomplete pagination remain non-approvable; polling and webhook events
 reconcile the current revision.
 
 Gemini timeouts, unavailable responses, and malformed output are recorded as
-analysis failures. Heuristic scores may be retained as evidence, but they
-cannot substitute for valid AI analysis: the risk category is not evaluated,
-the review is routed to manual review, and it cannot request approval or
-auto-merge. The decision uses the latest CI state for the exact current PR
+explicit AI lifecycle failures. No heuristic score is published as the AI
+result: the risk category and score are not evaluated, and the review becomes
+`REVIEW_UNAVAILABLE`. It cannot request approval or auto-merge. The decision
+uses the latest CI state for the exact current PR
 head SHA; if CI turns green while the initial analysis is running, a new full
 review is queued so policy evaluation runs against that verified state. A
 later review/webhook retry can recover a failed durable job using its existing
