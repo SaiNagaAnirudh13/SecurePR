@@ -48,6 +48,9 @@ def postgres_migration_database():
     connection = engine.connect()
     with connection.begin():
         connection.exec_driver_sql(
+            "CREATE TABLE repositories (id VARCHAR(36) PRIMARY KEY)"
+        )
+        connection.exec_driver_sql(
             """
             CREATE TABLE pull_requests (
                 id VARCHAR(36) PRIMARY KEY,
