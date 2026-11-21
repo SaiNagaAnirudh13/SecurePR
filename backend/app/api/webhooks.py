@@ -918,6 +918,7 @@ async def github_webhook(
                     repository_id,
                     pr_number,
                     head_sha=synchronized_sha,
+                    operation="auto-merge-cancellation",
                 ):
                     db.commit()
                     db.expire_all()

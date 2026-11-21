@@ -5,7 +5,7 @@ import threading
 from datetime import datetime, timedelta
 
 from sqlalchemy import and_, or_, update
-from sqlalchemy.exc import DataError, IntegrityError, ProgrammingError
+from sqlalchemy.exc import DBAPIError, DataError, IntegrityError, OperationalError, ProgrammingError
 
 from app.core.db import get_session_factory
 from app.models import models as m
@@ -17,12 +17,34 @@ MAX_ATTEMPTS = 5
 LEASE_SECONDS = 300
 POLL_SECONDS = 1
 NON_RETRYABLE_DATABASE_ERRORS = (DataError, IntegrityError, ProgrammingError)
+TRANSIENT_DATABASE_SQLSTATES = {
+    "40001",
+    "40P01",
+    "55P03",
+    "57014",
+}
+
+
+def _is_transient_database_error(exc: Exception) -> bool:
+    if not isinstance(exc, DBAPIError):
+        return False
+    if exc.connection_invalidated:
+        return True
+    original = exc.orig
+    sqlstate = getattr(original, "sqlstate", None) or getattr(
+        original, "pgcode", None
+    )
+    if sqlstate:
+        return sqlstate in TRANSIENT_DATABASE_SQLSTATES or sqlstate.startswith("08")
+    return isinstance(exc, OperationalError)
 
 
 def _record_job_failure(
     db, job, exc: Exception, *, expected_lease_token: int | None = None
 ) -> bool:
-    non_retryable_database_error = isinstance(exc, NON_RETRYABLE_DATABASE_ERRORS)
+    non_retryable_database_error = isinstance(exc, NON_RETRYABLE_DATABASE_ERRORS) or (
+        isinstance(exc, DBAPIError) and not _is_transient_database_error(exc)
+    )
     now = datetime.utcnow()
     if job.attempts >= MAX_ATTEMPTS or non_retryable_database_error:
         state = "FAILED"
@@ -159,9 +181,11 @@ class _Worker:
                 ),
             )
             .order_by(m.BackgroundJob.available_at, m.BackgroundJob.created_at)
+            .with_for_update(skip_locked=True)
             .first()
         )
         if not candidate:
+            db.rollback()
             return None
 
         old_state = candidate.state

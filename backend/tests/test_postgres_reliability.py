@@ -4,13 +4,14 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.engine import make_url
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 
 import run as run_module
@@ -23,22 +24,6 @@ pytestmark = pytest.mark.skipif(
     not POSTGRES_URL,
     reason="TEST_POSTGRES_URL is required for PostgreSQL reliability tests",
 )
-
-
-@pytest.fixture
-def lock_session(monkeypatch):
-    url = make_url(POSTGRES_URL)
-    if url.host not in {"localhost", "127.0.0.1", "::1"}:
-        pytest.fail("TEST_POSTGRES_URL must point to a local PostgreSQL test server.")
-    engine = create_engine(url, future=True)
-    monkeypatch.setattr(pipeline, "_dedicated_lock_engine", None)
-    session = Session(bind=engine, future=True)
-    yield session
-    session.close()
-    if pipeline._dedicated_lock_engine is not None:
-        pipeline._dedicated_lock_engine.dispose()
-    monkeypatch.setattr(pipeline, "_dedicated_lock_engine", None)
-    engine.dispose()
 
 
 @pytest.fixture
@@ -64,6 +49,7 @@ def isolated_job_sessions():
             m.Repository.__table__,
             m.PullRequest.__table__,
             m.BackgroundJob.__table__,
+            m.RevisionOperation.__table__,
         ],
     )
     factory = sessionmaker(bind=engine, future=True)
@@ -76,90 +62,160 @@ def isolated_job_sessions():
         admin_engine.dispose()
 
 
-def _lock_identity(repository_id: str, pr_number: int) -> int:
-    import hashlib
-
-    resource_id = hashlib.sha256(f"{repository_id}:{pr_number}".encode()).hexdigest()
-    resource = f"securepr:review:{resource_id}"
-    return int.from_bytes(
-        hashlib.sha256(resource.encode("utf-8")).digest()[:8],
-        byteorder="big",
-        signed=True,
+def _create_pull_request(db, head_sha="sha-one"):
+    repo = m.Repository(
+        github_repo_id=f"repo-{uuid4()}",
+        owner_login="octo",
+        name="widgets",
+        full_name=f"octo/widgets-{uuid4().hex[:8]}",
+        installation_id="99",
     )
+    db.add(repo)
+    db.flush()
+    pr = m.PullRequest(
+        repository_id=repo.id,
+        github_pr_number=17,
+        head_sha=head_sha,
+        state="open",
+    )
+    db.add(pr)
+    db.commit()
+    return repo, pr
 
 
-def test_concurrent_workers_serialize_same_pull_request(lock_session):
-    repository_id = str(uuid4())
+def test_simultaneous_workers_cannot_claim_same_revision_operation(
+    isolated_job_sessions,
+):
+    with isolated_job_sessions() as db:
+        repo, pr = _create_pull_request(db)
+        repository_id, pr_number, pull_request_id = (
+            repo.id,
+            pr.github_pr_number,
+            pr.id,
+        )
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def owner():
+        with isolated_job_sessions() as db:
+            with pipeline._revision_finalization_lock(
+                db,
+                repository_id,
+                pr_number,
+                head_sha="sha-one",
+                operation="review-analysis",
+            ):
+                entered.set()
+                assert release.wait(timeout=5)
+
+    def contender():
+        assert entered.wait(timeout=5)
+        with isolated_job_sessions() as db:
+            with pytest.raises(pipeline.RevisionLockUnavailable):
+                with pipeline._revision_finalization_lock(
+                    db,
+                    repository_id,
+                    pr_number,
+                    head_sha="sha-one",
+                    operation="review-analysis",
+                ):
+                    pytest.fail("A second worker claimed an active operation.")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        owner_future = pool.submit(owner)
+        contender_future = pool.submit(contender)
+        contender_future.result(timeout=10)
+        release.set()
+        owner_future.result(timeout=10)
+
+    with isolated_job_sessions() as db:
+        operation = (
+            db.query(m.RevisionOperation)
+            .filter_by(
+                repository_id=repository_id,
+                pull_request_id=pull_request_id,
+                head_sha="sha-one",
+                operation="review-analysis",
+            )
+            .one()
+        )
+        assert operation.state == "COMPLETED"
+        assert operation.lease_until is None
+
+
+def test_different_pr_revisions_can_be_processed_concurrently(isolated_job_sessions):
+    with isolated_job_sessions() as db:
+        repo, pr = _create_pull_request(db)
+        repository_id, pr_number = repo.id, pr.github_pr_number
+
+    barrier = threading.Barrier(2)
     active = 0
     max_active = 0
     guard = threading.Lock()
-    barrier = threading.Barrier(2)
 
-    def worker():
+    def process(sha):
         nonlocal active, max_active
-        with Session(bind=lock_session.get_bind(), future=True) as db:
-            barrier.wait(timeout=5)
+        with isolated_job_sessions() as db:
             with pipeline._revision_finalization_lock(
-                db, repository_id, 17, head_sha="sha-one"
+                db,
+                repository_id,
+                pr_number,
+                head_sha=sha,
+                operation="review-analysis",
             ):
                 with guard:
                     active += 1
                     max_active = max(max_active, active)
-                time.sleep(0.15)
+                barrier.wait(timeout=5)
                 with guard:
                     active -= 1
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        list(pool.map(lambda _index: worker(), range(2)))
+        list(pool.map(process, ("sha-one", "sha-two")))
 
-    assert max_active == 1
-    assert isinstance(pipeline._dedicated_lock_engine.pool, NullPool)
+    assert max_active == 2
+    with isolated_job_sessions() as db:
+        assert (
+            db.query(m.RevisionOperation)
+            .filter_by(repository_id=repository_id, operation="review-analysis")
+            .count()
+            == 2
+        )
 
 
-def test_lock_timeout_is_bounded_and_lock_can_be_reacquired(lock_session, monkeypatch):
-    repository_id = str(uuid4())
-    monkeypatch.setattr(pipeline, "LOCK_WAIT_SECONDS", 0.15)
-    monkeypatch.setattr(pipeline, "LOCK_POLL_SECONDS", 0.01)
-    other = Session(bind=lock_session.get_bind(), future=True)
-    started = time.monotonic()
-    try:
-        with (
-            pipeline._revision_finalization_lock(
-                lock_session, repository_id, 18, head_sha="sha-one"
-            ),
-            pytest.raises(pipeline.RevisionLockUnavailable),
-            pipeline._revision_finalization_lock(
-                other, repository_id, 18, head_sha="sha-one"
-            ),
-        ):
-            pytest.fail("A concurrent worker bypassed the held lock.")
-        assert time.monotonic() - started < 2
+def test_revision_operation_failure_releases_lease_for_job_retry(
+    isolated_job_sessions,
+):
+    with isolated_job_sessions() as db:
+        repo, pr = _create_pull_request(db)
+        repository_id, pr_number = repo.id, pr.github_pr_number
+        with pytest.raises(RuntimeError, match="transient database conflict"):
+            with pipeline._revision_finalization_lock(
+                db,
+                repository_id,
+                pr_number,
+                head_sha="sha-one",
+                operation="review-analysis",
+            ):
+                raise RuntimeError("transient database conflict")
+
+        operation = db.query(m.RevisionOperation).one()
+        assert operation.state == "QUEUED"
+        assert operation.available_at <= datetime.utcnow() + timedelta(seconds=1)
+
         with pipeline._revision_finalization_lock(
-            other, repository_id, 18, head_sha="sha-one"
+            db,
+            repository_id,
+            pr_number,
+            head_sha="sha-one",
+            operation="review-analysis",
         ):
             pass
-    finally:
-        other.close()
 
-
-def test_lock_is_released_after_exception_without_leaking_session_lock(lock_session):
-    repository_id = str(uuid4())
-    with (
-        pytest.raises(RuntimeError, match="simulated review failure"),
-        pipeline._revision_finalization_lock(
-            lock_session, repository_id, 19, head_sha="sha-one"
-        ),
-    ):
-        raise RuntimeError("simulated review failure")
-
-    key = _lock_identity(repository_id, 19)
-    with pipeline._lock_engine(lock_session).connect() as connection:
-        assert connection.execute(
-            text("SELECT pg_try_advisory_lock(:key)"), {"key": key}
-        ).scalar_one()
-        assert connection.execute(
-            text("SELECT pg_advisory_unlock(:key)"), {"key": key}
-        ).scalar_one()
+        db.refresh(operation)
+        assert operation.state == "COMPLETED"
+        assert operation.attempts == 2
 
 
 def test_migration_lock_is_released_after_exception_and_wait_is_bounded(
@@ -216,6 +272,38 @@ def test_concurrent_job_claim_is_atomic(isolated_job_sessions):
         claimed = list(pool.map(lambda _index: claim(), range(2)))
 
     assert sum(job_id is not None for job_id in claimed) == 1
+
+
+def test_transient_database_job_failure_is_rescheduled(isolated_job_sessions):
+    with isolated_job_sessions() as db:
+        job = m.BackgroundJob(
+            job_type="REVIEW",
+            idempotency_key=f"retry:{uuid4()}",
+            payload={"head_sha": "sha-one"},
+        )
+        db.add(job)
+        db.commit()
+
+        claimed = background_jobs._Worker("REVIEW")._claim(db)
+        assert claimed is not None
+        recorded = background_jobs._record_job_failure(
+            db,
+            claimed,
+            OperationalError("SELECT 1", {}, Exception("deadlock detected")),
+            expected_lease_token=claimed.lease_token,
+        )
+        assert recorded
+
+        db.refresh(claimed)
+        assert claimed.state == "QUEUED"
+        assert claimed.available_at > datetime.utcnow()
+        claimed.available_at = datetime.utcnow() - timedelta(seconds=1)
+        db.commit()
+        retried = background_jobs._Worker("REVIEW")._claim(db)
+
+        assert retried is not None
+        assert retried.id == claimed.id
+        assert retried.attempts == 2
 
 
 def test_concurrent_duplicate_enqueues_preserve_idempotency(isolated_job_sessions):

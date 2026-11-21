@@ -52,6 +52,12 @@ def postgres_lifecycle_migration():
     connection = engine.connect()
     with connection.begin():
         connection.exec_driver_sql(
+            "CREATE TABLE repositories (id VARCHAR(36) PRIMARY KEY)"
+        )
+        connection.exec_driver_sql(
+            "CREATE TABLE pull_requests (id VARCHAR(36) PRIMARY KEY)"
+        )
+        connection.exec_driver_sql(
             """
             CREATE TABLE reviews (
                 id VARCHAR(36) PRIMARY KEY,
@@ -245,8 +251,13 @@ def test_postgres_metadata_migration_recovers_after_missing_policy_table(
     assert "policy_revision" in columns
     assert (
         connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-        == "20261121_01"
+        == "20261121_02"
     )
+    assert connection.execute(
+        text(
+            "SELECT to_regclass('revision_operations') IS NOT NULL"
+        )
+    ).scalar_one()
 
 
 def test_production_startup_repeats_migrations_and_releases_lock(monkeypatch):
@@ -296,7 +307,7 @@ def test_production_startup_repeats_migrations_and_releases_lock(monkeypatch):
                     text("SELECT version_num FROM alembic_version")
                 ).scalar_one()
                 == first_revision
-                == "20261121_01"
+                == "20261121_02"
             )
 
         with engine.connect() as connection:

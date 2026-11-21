@@ -3,18 +3,15 @@
 import hashlib
 import json
 import logging
-import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Iterator, cast
 
 import requests
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
-from sqlalchemy.pool import NullPool
 
 from app.core.config import get_settings
 from app.integrations.ai_provider import AIAnalysisResult, AIInvalidResponse
@@ -44,32 +41,139 @@ CI_FETCH_ERRORS = (
     RuntimeError,
 )
 settings = get_settings()
-
-_fallback_revision_locks: dict[tuple[str, int], threading.RLock] = {}
-_fallback_revision_locks_guard = threading.Lock()
-_dedicated_lock_engine = None
-_dedicated_lock_engine_guard = threading.Lock()
-LOCK_WAIT_SECONDS = 10
-LOCK_POLL_SECONDS = 0.1
+REVISION_OPERATION_LEASE_SECONDS = 300
 
 
 class RevisionLockUnavailable(TimeoutError):
-    """Raised when another worker owns the revision lock beyond the wait budget."""
+    """Raised when another worker currently owns a revision operation."""
 
 
-def _lock_engine(db: Session):
-    global _dedicated_lock_engine
-    with _dedicated_lock_engine_guard:
-        if _dedicated_lock_engine is None:
-            bind = db.get_bind()
-            database_url = bind.url if isinstance(bind, Engine) else bind.engine.url
-            _dedicated_lock_engine = create_engine(
-                database_url,
-                poolclass=NullPool,
-                pool_pre_ping=True,
-                future=True,
+def _claim_revision_operation(
+    db: Session,
+    repository_id: str,
+    pr_number: int,
+    head_sha: str | None,
+    operation: str,
+) -> tuple[str, str, str]:
+    """Claim a revision operation in a short row-locking transaction."""
+    try:
+        pr = (
+            db.query(m.PullRequest)
+            .filter(
+                m.PullRequest.repository_id == repository_id,
+                m.PullRequest.github_pr_number == pr_number,
             )
-        return _dedicated_lock_engine
+            .with_for_update()
+            .first()
+        )
+        if pr is None:
+            raise RuntimeError(
+                "Cannot claim a revision operation for a missing pull request."
+            )
+        revision_sha = head_sha or pr.head_sha
+        if not revision_sha:
+            raise RuntimeError(
+                "Cannot claim a revision operation without a commit SHA."
+            )
+
+        identity = {
+            "repository_id": repository_id,
+            "pull_request_id": pr.id,
+            "head_sha": revision_sha,
+            "operation": operation,
+        }
+        if db.get_bind().dialect.name == "postgresql":
+            db.execute(
+                pg_insert(m.RevisionOperation)
+                .values(id=m.gen_uuid(), **identity)
+                .on_conflict_do_nothing(
+                    index_elements=[
+                        m.RevisionOperation.repository_id,
+                        m.RevisionOperation.pull_request_id,
+                        m.RevisionOperation.head_sha,
+                        m.RevisionOperation.operation,
+                    ]
+                )
+            )
+        else:
+            try:
+                with db.begin_nested():
+                    db.add(m.RevisionOperation(**identity))
+                    db.flush()
+            except IntegrityError:
+                pass
+
+        revision_operation = (
+            db.query(m.RevisionOperation)
+            .filter_by(**identity)
+            .with_for_update()
+            .one()
+        )
+        now = datetime.utcnow()
+        if (
+            revision_operation.state == "RUNNING"
+            and revision_operation.lease_until
+            and revision_operation.lease_until > now
+        ):
+            raise RevisionLockUnavailable(
+                "Another worker is processing this PR revision operation."
+            )
+        if revision_operation.available_at > now:
+            raise RevisionLockUnavailable(
+                "This PR revision operation is waiting for its retry backoff."
+            )
+
+        owner_token = m.gen_uuid()
+        revision_operation.state = "RUNNING"
+        revision_operation.owner_token = owner_token
+        revision_operation.attempts += 1
+        revision_operation.lease_until = now + timedelta(
+            seconds=REVISION_OPERATION_LEASE_SECONDS
+        )
+        revision_operation.updated_at = now
+        db.commit()
+        return cast(str, revision_operation.id), owner_token, revision_sha
+    except Exception:
+        db.rollback()
+        raise
+
+
+def _finish_revision_operation(
+    db: Session,
+    operation_id: str,
+    owner_token: str,
+    error: Exception | None = None,
+) -> None:
+    try:
+        revision_operation = (
+            db.query(m.RevisionOperation)
+            .filter(m.RevisionOperation.id == operation_id)
+            .with_for_update()
+            .first()
+        )
+        if (
+            revision_operation is None
+            or revision_operation.state != "RUNNING"
+            or revision_operation.owner_token != owner_token
+        ):
+            db.rollback()
+            logger.warning(
+                "Revision operation lease expired before completion: operation_id=%s",
+                operation_id,
+            )
+            return
+
+        now = datetime.utcnow()
+        revision_operation.state = "QUEUED" if error else "COMPLETED"
+        revision_operation.owner_token = None
+        revision_operation.lease_until = None
+        revision_operation.last_error = str(error)[:4000] if error else None
+        revision_operation.available_at = now
+        revision_operation.updated_at = now
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
 
 @contextmanager
@@ -79,187 +183,94 @@ def _revision_finalization_lock(
     pr_number: int,
     *,
     head_sha: str | None = None,
+    operation: str = "review-finalization",
     job_id: str | None = None,
     retry_count: int = 0,
 ) -> Iterator[None]:
-    """Serialize a PR revision without retaining a pooled connection or transaction."""
-    lock_key = (repository_id, pr_number)
-    dialect = db.get_bind().dialect.name
-    if dialect not in ("mssql", "postgresql"):
-        with _fallback_revision_locks_guard:
-            local_lock = _fallback_revision_locks.setdefault(
-                lock_key, threading.RLock()
-            )
-        with local_lock:
-            yield
-        return
-
-    resource_id = hashlib.sha256(
-        f"{repository_id}:{pr_number}".encode("utf-8")
-    ).hexdigest()
-    resource = f"securepr:review:{resource_id}"
-    connection = (
-        _lock_engine(db).connect().execution_options(isolation_level="AUTOCOMMIT")
-    )
-    acquired = False
-    acquisition_result = "error"
-    release_result = "not_acquired"
-    started = time.monotonic()
+    """Hold only a durable lease; row-lock transactions end before yielding."""
     fields = {
         "repository_id": repository_id,
         "pr_number": pr_number,
         "head_sha": head_sha or "unknown",
+        "operation": operation,
         "job_id": job_id or "unknown",
         "retry_count": retry_count,
     }
+    db.commit()
+    operation_id, owner_token, claimed_sha = _claim_revision_operation(
+        db, repository_id, pr_number, head_sha, operation
+    )
+    fields["head_sha"] = claimed_sha
+    logger.info(
+        "PR revision operation claimed: repository_id=%(repository_id)s "
+        "pr_number=%(pr_number)s head_sha=%(head_sha)s operation=%(operation)s "
+        "job_id=%(job_id)s retry_count=%(retry_count)s",
+        fields,
+        extra=fields,
+    )
     try:
-        if dialect == "postgresql":
-            resource_key = int.from_bytes(
-                hashlib.sha256(resource.encode("utf-8")).digest()[:8],
-                byteorder="big",
-                signed=True,
-            )
-            deadline = started + LOCK_WAIT_SECONDS
-            while True:
-                acquired = bool(
-                    connection.execute(
-                        text("SELECT pg_try_advisory_lock(:resource_key)"),
-                        {"resource_key": resource_key},
-                    ).scalar_one()
-                )
-                if acquired or time.monotonic() >= deadline:
-                    break
-                time.sleep(LOCK_POLL_SECONDS)
-            acquisition_result = "acquired" if acquired else "timeout"
-            if not acquired:
-                raise RevisionLockUnavailable(
-                    "Timed out waiting for the PR revision finalization lock."
-                )
-        else:
-            result = connection.execute(
-                text(
-                    """
-                    DECLARE @lock_result int;
-                    EXEC @lock_result = sys.sp_getapplock
-                        @Resource = :resource,
-                        @LockMode = 'Exclusive',
-                        @LockOwner = 'Session',
-                        @LockTimeout = 10000;
-                    SELECT @lock_result;
-                    """
-                ),
-                {"resource": resource},
-            ).scalar()
-            if result is None or result < 0:
-                acquisition_result = "timeout"
-                raise RuntimeError(
-                    f"Could not acquire PR review lock (sp_getapplock={result})"
-                )
-            acquired = True
-            acquisition_result = "acquired"
-        logger.info(
-            "PR revision lock acquired: repository_id=%(repository_id)s "
-            "pr_number=%(pr_number)s head_sha=%(head_sha)s job_id=%(job_id)s "
-            "wait_duration_ms=%(wait_duration_ms)s acquisition_result=%(acquisition_result)s "
-            "retry_count=%(retry_count)s",
-            {
-                **fields,
-                "wait_duration_ms": round((time.monotonic() - started) * 1000),
-                "acquisition_result": acquisition_result,
-            },
-            extra={
-                **fields,
-                "wait_duration_ms": round((time.monotonic() - started) * 1000),
-                "acquisition_result": acquisition_result,
-            },
-        )
         yield
-    except Exception:
-        if not acquired:
-            logger.exception(
-                "PR revision lock acquisition failed: repository_id=%s pr_number=%s "
-                "head_sha=%s job_id=%s wait_duration_ms=%s acquisition_result=%s retry_count=%s",
-                repository_id,
-                pr_number,
-                head_sha or "unknown",
-                job_id or "unknown",
-                round((time.monotonic() - started) * 1000),
-                acquisition_result,
-                retry_count,
-                extra={
-                    **fields,
-                    "wait_duration_ms": round((time.monotonic() - started) * 1000),
-                    "acquisition_result": acquisition_result,
-                },
-            )
+    except Exception as exc:
+        db.rollback()
+        _finish_revision_operation(db, operation_id, owner_token, exc)
         raise
-    finally:
-        if acquired:
-            try:
-                if dialect == "postgresql":
-                    unlocked = connection.execute(
-                        text("SELECT pg_advisory_unlock(:resource_key)"),
-                        {"resource_key": resource_key},
-                    ).scalar_one()
-                    if not unlocked:
-                        raise RuntimeError(
-                            "PostgreSQL reported that this connection did not own the PR lock."
-                        )
-                else:
-                    released = connection.execute(
-                        text(
-                            """
-                            DECLARE @lock_result int;
-                            EXEC @lock_result = sys.sp_releaseapplock
-                                @Resource = :resource,
-                                @LockOwner = 'Session';
-                            SELECT @lock_result;
-                            """
-                        ),
-                        {"resource": resource},
-                    ).scalar()
-                    if released is None or released < 0:
-                        raise RuntimeError(
-                            f"SQL Server failed to release the PR lock: {released}"
-                        )
-                release_result = "released"
-            except Exception:
-                release_result = "failed_connection_invalidated"
-                connection.invalidate()
-                logger.exception(
-                    "PR revision lock release failed: repository_id=%s pr_number=%s "
-                    "head_sha=%s job_id=%s release_result=%s retry_count=%s",
-                    repository_id,
-                    pr_number,
-                    head_sha or "unknown",
-                    job_id or "unknown",
-                    release_result,
-                    retry_count,
-                    extra={
-                        **fields,
-                        "release_result": release_result,
-                    },
-                )
-        connection.close()
+    else:
+        db.commit()
+        _finish_revision_operation(db, operation_id, owner_token)
         logger.info(
-            "PR revision lock released: repository_id=%s pr_number=%s head_sha=%s "
-            "job_id=%s wait_duration_ms=%s acquisition_result=%s release_result=%s "
-            "retry_count=%s",
+            "PR revision operation completed: repository_id=%s pr_number=%s "
+            "head_sha=%s operation=%s job_id=%s retry_count=%s",
             repository_id,
             pr_number,
-            head_sha or "unknown",
+            claimed_sha,
+            operation,
             job_id or "unknown",
-            round((time.monotonic() - started) * 1000),
-            acquisition_result,
-            release_result,
             retry_count,
-            extra={
-                **fields,
-                "wait_duration_ms": round((time.monotonic() - started) * 1000),
-                "acquisition_result": acquisition_result,
-                "release_result": release_result,
-            },
+            extra=fields,
         )
+
+
+def _verify_latest_pr_revision(
+    db: Session,
+    repo: m.Repository,
+    pr: m.PullRequest,
+    installation_id: str,
+    expected_sha: str,
+) -> tuple[bool, str | None]:
+    """Verify GitHub first, then confirm the local revision under a short row lock."""
+    db.commit()
+    owner, repo_name = repo.full_name.split("/", 1)
+    latest_pr = github_client.get_pull_request(
+        installation_id, owner, repo_name, cast(int, pr.github_pr_number)
+    )
+    latest_sha = latest_pr.get("head_sha")
+    if latest_pr.get("state") != "open" or latest_sha != expected_sha:
+        return False, latest_sha if isinstance(latest_sha, str) else None
+
+    return _confirm_pr_revision_in_database(db, pr, expected_sha), latest_sha
+
+
+def _confirm_pr_revision_in_database(
+    db: Session, pr: m.PullRequest, expected_sha: str
+) -> bool:
+    db.commit()
+    try:
+        current_pr = (
+            db.query(m.PullRequest)
+            .filter(m.PullRequest.id == pr.id)
+            .with_for_update()
+            .first()
+        )
+        current = bool(
+            current_pr
+            and current_pr.state == "open"
+            and current_pr.head_sha == expected_sha
+        )
+        db.commit()
+        return current
+    except Exception:
+        db.rollback()
+        raise
 
 
 def _log_analysis_timing(
@@ -745,6 +756,8 @@ def _publish_existing_review(
             if isinstance(latest_sha, str) and latest_sha and latest_sha != pr.head_sha:
                 _queue_current_revision(db, repo, pr, installation_id, latest_sha)
             return
+        if not _confirm_pr_revision_in_database(db, pr, review_head_sha):
+            return
         result = github_client.post_review(
             installation_id,
             owner,
@@ -868,6 +881,11 @@ def run_analysis(
         repository_id,
         pr_number,
         head_sha=cast(str | None, expected_head_sha or pr.head_sha),
+        operation=(
+            f"review-analysis-reevaluation:{previous_review_id or 'initial'}"
+            if is_reevaluation
+            else "review-analysis"
+        ),
         job_id=job_id,
         retry_count=retry_count,
     ):
@@ -1399,6 +1417,22 @@ def _run_analysis_locked(
     if ai_analysis_error:
         decision.reasons.append(ai_analysis_error)
 
+    current_revision, latest_sha = _verify_latest_pr_revision(
+        db, repo, pr, installation_id, cast(str, pr.head_sha)
+    )
+    if not current_revision:
+        if latest_sha and latest_sha != pr.head_sha:
+            _queue_current_revision(db, repo, pr, installation_id, latest_sha)
+        logger.info(
+            "Discarding review decision for a stale PR revision: repository=%s "
+            "pr=%s reviewed_sha=%s current_sha=%s",
+            repo.full_name,
+            pr_number,
+            pr.head_sha,
+            latest_sha or "unknown",
+        )
+        return None
+
     review = m.Review(
         pull_request_id=pr.id,
         policy_id=policy_id,
@@ -1681,6 +1715,8 @@ def _run_analysis_locked(
                     _queue_current_revision(db, repo, pr, installation_id, latest_sha)
                 else:
                     db.commit()
+                return None
+            if not _confirm_pr_revision_in_database(db, pr, review_head_sha):
                 return None
             result = github_client.post_review(
                 installation_id,
@@ -2358,6 +2394,7 @@ def process_review_status_job(db: Session, payload: dict) -> None:
         cast(str, repo.id),
         cast(int, pr.github_pr_number),
         head_sha=payload.get("head_sha"),
+        operation="review-status-publication",
         job_id=payload.get("_job_id"),
         retry_count=payload.get("_retry_count", 0),
     ):
@@ -2409,6 +2446,7 @@ def process_auto_merge_cancel_job(db: Session, payload: dict) -> None:
         cast(str, repo.id),
         cast(int, pr.github_pr_number),
         head_sha=cast(str | None, pr.head_sha),
+        operation="auto-merge-cancellation",
         job_id=payload.get("_job_id"),
         retry_count=payload.get("_retry_count", 0),
     ):
@@ -2562,6 +2600,15 @@ def _publish_review_status_comment(
         db, repo, pr, payload["head_sha"], "WAITING", marker
     )
     db.commit()
+    current_revision, latest_sha = _verify_latest_pr_revision(
+        db, repo, pr, payload["installation_id"], payload["head_sha"]
+    )
+    if not current_revision:
+        if latest_sha and latest_sha != payload["head_sha"]:
+            _queue_current_revision(
+                db, repo, pr, payload["installation_id"], latest_sha
+            )
+        return
     result = github_client.post_issue_comment(
         payload["installation_id"],
         owner,

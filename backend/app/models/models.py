@@ -409,6 +409,49 @@ class BackgroundJob(Base):
     )
 
 
+class RevisionOperation(Base):
+    """Lease for one operation on an immutable pull-request revision."""
+
+    __tablename__ = "revision_operations"
+    id = Column(String(36), primary_key=True, default=gen_uuid)
+    repository_id = Column(
+        String(36), ForeignKey("repositories.id"), nullable=False
+    )
+    pull_request_id = Column(
+        String(36), ForeignKey("pull_requests.id"), nullable=False
+    )
+    head_sha = Column(String(64), nullable=False)
+    operation = Column(String(128), nullable=False)
+    state = Column(
+        String(16), nullable=False, default="QUEUED", server_default=text("'QUEUED'")
+    )
+    attempts = Column(Integer, nullable=False, default=0, server_default=text("0"))
+    owner_token = Column(String(36), nullable=True)
+    available_at = Column(
+        DateTime, nullable=False, default=datetime.utcnow, server_default=func.now()
+    )
+    lease_until = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
+    updated_at = Column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "repository_id",
+            "pull_request_id",
+            "head_sha",
+            "operation",
+            name="uq_revision_operation_identity",
+        ),
+        Index("ix_revision_operations_lease", "state", "available_at", "lease_until"),
+    )
+
+
 class CIRevision(Base):
     """Latest CI discovery state for one immutable PR revision."""
 
