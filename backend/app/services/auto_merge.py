@@ -89,6 +89,140 @@ def _is_permission_error(message: str) -> bool:
     )
 
 
+def _is_clean_status_error(result: dict) -> bool:
+    payload = result.get("payload")
+    if not isinstance(payload, dict):
+        return False
+
+    def messages(value):
+        if isinstance(value, dict):
+            for nested in value.values():
+                yield from messages(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                yield from messages(nested)
+        elif isinstance(value, str):
+            yield value
+
+    return any(
+        message.strip().casefold() == "pull request is in clean status"
+        or message.strip().casefold().startswith(
+            "pull request is in clean status:"
+        )
+        for message in messages(payload)
+    )
+
+
+def _clean_status_merge_fallback(
+    *,
+    db,
+    repo,
+    pr,
+    review,
+    installation_id,
+    owner,
+    repo_name,
+    pr_number,
+    base_branch,
+    review_sha,
+    merge_method,
+    policy_revision,
+    original_result,
+):
+    try:
+        fallback_pr = github_client.get_pull_request(
+            installation_id, owner, repo_name, pr_number
+        )
+        fallback_caps = github_client.get_auto_merge_capabilities(
+            installation_id, owner, repo_name, pr_number
+        )
+        fallback_checks = github_client.get_check_runs(
+            installation_id, owner, repo_name, review_sha
+        )
+        fallback_statuses = github_client.get_commit_statuses(
+            installation_id, owner, repo_name, review_sha
+        )
+        fallback_required = github_client.get_required_status_checks(
+            installation_id, owner, repo_name, base_branch
+        )
+    except GITHUB_VERIFICATION_ERRORS as exc:
+        return AutoMergeResult(
+            "VERIFICATION_UNAVAILABLE",
+            f"GitHub clean-status fallback could not revalidate the PR: {exc}",
+            response_status=original_result.get("status_code"),
+            response_payload=original_result.get("payload"),
+        )
+    fallback_eligibility = saved_eligibility(db, repo, pr)
+    fallback_ci = ci_status.evaluate_ci_status(
+        fallback_checks + fallback_statuses,
+        required_checks=fallback_required,
+        discovery_complete=True,
+    )
+    fallback_repo = (fallback_caps.get("payload") or {}).get("repository") or {}
+    fallback_github_pr = fallback_repo.get("pullRequest") or {}
+    authorized = (
+        fallback_caps.get("succeeded")
+        and fallback_eligibility is not None
+        and fallback_eligibility.is_enabled
+        and 0 <= fallback_eligibility.max_risk_threshold <= 100
+        and review.overall_score <= fallback_eligibility.max_risk_threshold
+        and fallback_eligibility.policy_revision == policy_revision
+        and fallback_repo.get("autoMergeAllowed")
+        and fallback_github_pr.get("state") == "OPEN"
+        and not fallback_github_pr.get("isDraft")
+        and fallback_github_pr.get("headRefOid") == review_sha
+        and fallback_github_pr.get("reviewDecision")
+        not in ("REVIEW_REQUIRED", "REVIEW_PENDING", "CHANGES_REQUESTED")
+        and fallback_pr.get("state") == "open"
+        and fallback_pr.get("head_sha") == review_sha
+        and fallback_pr.get("base_ref") == base_branch
+        and fallback_pr.get("mergeable") is True
+        and fallback_pr.get("mergeable_state") == "clean"
+        and fallback_ci.state == "PASSED"
+    )
+    if not authorized:
+        return AutoMergeResult(
+            "NOT_ELIGIBLE",
+            "GitHub clean-status fallback failed live authorization or safety revalidation.",
+            response_status=original_result.get("status_code"),
+            response_payload=original_result.get("payload"),
+        )
+    fallback_merge = github_client.merge_pull_request(
+        installation_id,
+        owner,
+        repo_name,
+        pr_number,
+        review_sha,
+        merge_method,
+    )
+    if fallback_merge.get("succeeded"):
+        fallback_payload = fallback_merge.get("payload") or {}
+        fallback_verified = github_client.get_pull_request(
+            installation_id, owner, repo_name, pr_number
+        )
+        if (
+            fallback_payload.get("merged") is True
+            and fallback_verified.get("merged") is True
+        ):
+            return AutoMergeResult(
+                "MERGED",
+                "GitHub confirmed the clean-status fallback merge.",
+                merge_commit_sha=(
+                    fallback_verified.get("merge_commit_sha")
+                    or fallback_payload.get("sha")
+                ),
+                response_status=fallback_merge.get("status_code"),
+                response_payload=fallback_payload,
+                policy_revision=policy_revision,
+            )
+    return AutoMergeResult(
+        "FAILED",
+        "GitHub clean-status fallback did not confirm an actual merge.",
+        response_status=fallback_merge.get("status_code"),
+        response_payload=fallback_merge.get("payload"),
+    )
+
+
 def _capabilities_pull_request(response: dict) -> dict:
     payload = response.get("payload")
     repository = payload.get("repository") if isinstance(payload, dict) else None
@@ -308,6 +442,13 @@ def attempt(
         live_pr = github_client.get_pull_request(
             installation_id, owner, repo_name, pr_number
         )
+        if live_pr.get("merged") is True:
+            return AutoMergeResult(
+                "MERGED",
+                "GitHub reports that the PR is already merged.",
+                merge_commit_sha=live_pr.get("merge_commit_sha"),
+                policy_revision=eligibility.policy_revision,
+            )
         if live_pr.get("state") != "open":
             return AutoMergeResult("NOT_ELIGIBLE", "PR is no longer open.")
         if (
@@ -351,13 +492,33 @@ def attempt(
                 required_checks=required_checks,
             )
         if live_ci.state != "PASSED":
-            return AutoMergeResult(
-                "CI_PENDING",
-                f"Required CI verification is {live_ci.state.lower()}; auto-merge was not requested.",
-                ci_state=live_ci.state,
-                ci_checks=ci_checks,
-                required_checks=required_checks,
-            )
+            if live_ci.state == "FAILED":
+                return AutoMergeResult(
+                    "CI_FAILED",
+                    "At least one applicable CI check failed on the reviewed SHA.",
+                    ci_state=live_ci.state,
+                    ci_checks=ci_checks,
+                    required_checks=required_checks,
+                )
+            discovered_names = {
+                check.get("name") or check.get("context")
+                for check in ci_checks
+                if isinstance(check, dict)
+            }
+            missing_required = [
+                check.get("context") or check.get("name")
+                for check in required_checks
+                if isinstance(check, dict)
+                and (check.get("context") or check.get("name")) not in discovered_names
+            ]
+            if missing_required:
+                return AutoMergeResult(
+                    "CI_PENDING",
+                    "A required CI check is missing and has not reported for the reviewed SHA.",
+                    ci_state=live_ci.state,
+                    ci_checks=ci_checks,
+                    required_checks=required_checks,
+                )
 
         breaker_tripped, breaker_reason = circuit_breaker.is_tripped(
             db, repository_id, author_login
@@ -422,26 +583,17 @@ def attempt(
             )
 
         mergeable_state = live_pr.get("mergeable_state")
-        if mergeable_state != "clean":
-            state_reasons = {
-                "dirty": "GitHub reports merge conflicts.",
-                "behind": "The PR branch is behind its base branch.",
-                "blocked": "GitHub reports additional branch-protection requirements are unmet.",
-                "unstable": "GitHub reports one or more status checks are unsuccessful.",
-            }
+        if mergeable_state == "dirty":
             return AutoMergeResult(
                 "WAITING_FOR_GITHUB",
-                state_reasons.get(
-                    mergeable_state,
-                    f"GitHub reports merge state '{mergeable_state or 'unknown'}'; "
-                    "waiting for a clean merge state.",
-                ),
+                "GitHub reports merge conflicts.",
             )
         if live_pr.get("mergeable") is not True:
-            return AutoMergeResult(
-                "WAITING_FOR_GITHUB",
-                "GitHub reports that the PR is not currently mergeable.",
-            )
+            if mergeable_state != "unknown":
+                return AutoMergeResult(
+                    "WAITING_FOR_GITHUB",
+                    "GitHub reports that the PR is not currently mergeable.",
+                )
 
         method_field = {
             "MERGE": "mergeCommitAllowed",
@@ -452,20 +604,6 @@ def attempt(
             return AutoMergeResult(
                 "MERGE_METHOD_UNAVAILABLE",
                 f"GitHub repository settings do not allow the configured {merge_method} merge method.",
-            )
-
-        auto_merge_request = github_pr.get("autoMergeRequest")
-        if auto_merge_request:
-            if auto_merge_request.get("mergeMethod") == merge_method:
-                return AutoMergeResult(
-                    "AUTO_MERGE_ENABLED",
-                    f"GitHub already has {merge_method} auto-merge enabled for this PR.",
-                    response_payload=auto_merge_request,
-                    policy_revision=policy_revision,
-                )
-            return AutoMergeResult(
-                "AUTO_MERGE_CONFLICT",
-                "GitHub already has an auto-merge request using a different merge method.",
             )
 
         pull_request_id = github_pr.get("id")
@@ -490,18 +628,32 @@ def attempt(
             final_live_pr = github_client.get_pull_request(
                 installation_id, owner, repo_name, pr_number
             )
+            final_capabilities = github_client.get_auto_merge_capabilities(
+                installation_id, owner, repo_name, pr_number
+            )
         except GITHUB_VERIFICATION_ERRORS as exc:
             return AutoMergeResult(
                 "VERIFICATION_UNAVAILABLE",
                 f"GitHub could not revalidate the PR immediately before auto-merge: {exc}",
                 ci_state="UNAVAILABLE",
             )
+        if final_live_pr.get("merged") is True:
+            if final_live_pr.get("head_sha") != review_sha:
+                return AutoMergeResult(
+                    "NOT_ELIGIBLE",
+                    "GitHub reports a merge for a different PR head SHA.",
+                )
+            return AutoMergeResult(
+                "MERGED",
+                "GitHub reports that the PR was already merged.",
+                merge_commit_sha=final_live_pr.get("merge_commit_sha"),
+                policy_revision=policy_revision,
+            )
         if (
             final_live_pr.get("state") != "open"
             or final_live_pr.get("head_sha") != review_sha
             or final_live_pr.get("base_ref") != base_branch
-            or final_live_pr.get("mergeable") is not True
-            or final_live_pr.get("mergeable_state") != "clean"
+            or final_live_pr.get("mergeable_state") == "dirty"
         ):
             return AutoMergeResult(
                 "NOT_ELIGIBLE",
@@ -514,13 +666,14 @@ def attempt(
             discovery_complete=True,
         )
         if final_ci.state != "PASSED":
-            return AutoMergeResult(
-                "CI_FAILED" if final_ci.state == "FAILED" else "CI_PENDING",
-                "The final live CI verification did not pass for the reviewed SHA.",
-                ci_state=final_ci.state,
-                ci_checks=final_ci_checks,
-                required_checks=final_required_checks,
-            )
+            if final_ci.state == "FAILED":
+                return AutoMergeResult(
+                    "CI_FAILED",
+                    "The final live CI verification failed for the reviewed SHA.",
+                    ci_state=final_ci.state,
+                    ci_checks=final_ci_checks,
+                    required_checks=final_required_checks,
+                )
         current_pr = (
             db.query(m.PullRequest)
             .filter(m.PullRequest.id == pr.id)
@@ -556,7 +709,210 @@ def attempt(
                 "NOT_ELIGIBLE",
                 "The latest saved dashboard risk threshold does not authorize this review.",
             )
+
+        if not final_capabilities.get("succeeded"):
+            message = _failure_message(final_capabilities)
+            if _is_permission_error(message):
+                return AutoMergeResult(
+                    "PERMISSION_MISSING",
+                    f"GitHub App cannot verify final merge requirements: {message}",
+                    response_status=final_capabilities.get("status_code"),
+                    response_payload=final_capabilities.get("payload"),
+                )
+            return AutoMergeResult(
+                "VERIFICATION_UNAVAILABLE",
+                f"Could not revalidate GitHub merge requirements: {message}",
+                response_status=final_capabilities.get("status_code"),
+                response_payload=final_capabilities.get("payload"),
+            )
+        final_repository = (
+            (final_capabilities.get("payload") or {}).get("repository") or {}
+        )
+        final_github_pr = final_repository.get("pullRequest") or {}
+        if (
+            not final_repository.get("autoMergeAllowed")
+            or final_github_pr.get("headRefOid") != review_sha
+            or final_github_pr.get("state") != "OPEN"
+            or final_github_pr.get("isDraft")
+        ):
+            return AutoMergeResult(
+                "NOT_ELIGIBLE",
+                "Final GitHub revalidation rejected the open, non-draft PR or repository policy.",
+            )
+        final_review_decision = final_github_pr.get("reviewDecision")
+        if final_review_decision in ("REVIEW_REQUIRED", "REVIEW_PENDING", "CHANGES_REQUESTED"):
+            if final_review_decision == "CHANGES_REQUESTED":
+                return AutoMergeResult(
+                    "REVIEW_BLOCKED",
+                    "GitHub has an outstanding change-request review.",
+                )
+        else:
+            final_review_decision = "APPROVED"
+
         db.commit()
+        all_requirements_met = (
+            final_ci.state == "PASSED"
+            and final_review_decision == "APPROVED"
+            and final_live_pr.get("mergeable") is True
+            and final_live_pr.get("mergeable_state") == "clean"
+        )
+        if all_requirements_met:
+            merge_result = github_client.merge_pull_request(
+                installation_id,
+                owner,
+                repo_name,
+                pr_number,
+                review_sha,
+                merge_method,
+            )
+            if merge_result.get("succeeded"):
+                payload = merge_result.get("payload") or {}
+                if payload.get("merged") is not True:
+                    return AutoMergeResult(
+                        "FAILED",
+                        "GitHub merge API succeeded without confirming an actual merge.",
+                        response_status=merge_result.get("status_code"),
+                        response_payload=payload,
+                    )
+                verified = github_client.get_pull_request(
+                    installation_id, owner, repo_name, pr_number
+                )
+                if verified.get("merged") is not True:
+                    return AutoMergeResult(
+                        "VERIFICATION_UNAVAILABLE",
+                        "GitHub merge response was received, but the merged state could not be verified.",
+                        response_status=merge_result.get("status_code"),
+                        response_payload=payload,
+                    )
+                return AutoMergeResult(
+                    "MERGED",
+                    "GitHub confirmed that the PR was merged.",
+                    merge_commit_sha=(
+                        verified.get("merge_commit_sha") or payload.get("sha")
+                    ),
+                    response_status=merge_result.get("status_code"),
+                    response_payload=payload,
+                    policy_revision=policy_revision,
+                )
+            message = _failure_message(merge_result)
+            if _is_permission_error(message):
+                return AutoMergeResult(
+                    "PERMISSION_MISSING",
+                    f"GitHub App is missing permission to merge the PR: {message}",
+                    response_status=merge_result.get("status_code"),
+                    response_payload=merge_result.get("payload"),
+                )
+            if not _is_clean_status_error(merge_result):
+                return AutoMergeResult(
+                    "FAILED",
+                    f"GitHub rejected the immediate merge: {message}",
+                    response_status=merge_result.get("status_code"),
+                    response_payload=merge_result.get("payload"),
+                )
+            # GitHub classified the PR as clean before the merge endpoint call.
+            try:
+                fallback_pr = github_client.get_pull_request(
+                    installation_id, owner, repo_name, pr_number
+                )
+                fallback_caps = github_client.get_auto_merge_capabilities(
+                    installation_id, owner, repo_name, pr_number
+                )
+                fallback_checks = github_client.get_check_runs(
+                    installation_id, owner, repo_name, review_sha
+                )
+                fallback_statuses = github_client.get_commit_statuses(
+                    installation_id, owner, repo_name, review_sha
+                )
+                fallback_required = github_client.get_required_status_checks(
+                    installation_id, owner, repo_name, base_branch
+                )
+            except GITHUB_VERIFICATION_ERRORS as exc:
+                return AutoMergeResult(
+                    "VERIFICATION_UNAVAILABLE",
+                    f"GitHub clean-status fallback could not revalidate the PR: {exc}",
+                    response_status=merge_result.get("status_code"),
+                    response_payload=merge_result.get("payload"),
+                )
+            fallback_eligibility = saved_eligibility(db, repo, pr)
+            fallback_ci = ci_status.evaluate_ci_status(
+                fallback_checks + fallback_statuses,
+                required_checks=fallback_required,
+                discovery_complete=True,
+            )
+            fallback_repo = (
+                (fallback_caps.get("payload") or {}).get("repository") or {}
+            )
+            fallback_github_pr = fallback_repo.get("pullRequest") or {}
+            fallback_authorized = (
+                fallback_caps.get("succeeded")
+                and fallback_eligibility is not None
+                and fallback_eligibility.is_enabled
+                and 0 <= fallback_eligibility.max_risk_threshold <= 100
+                and review.overall_score <= fallback_eligibility.max_risk_threshold
+                and fallback_eligibility.policy_revision == policy_revision
+                and fallback_repo.get("autoMergeAllowed")
+                and fallback_github_pr.get("state") == "OPEN"
+                and not fallback_github_pr.get("isDraft")
+                and fallback_github_pr.get("headRefOid") == review_sha
+                and fallback_github_pr.get("reviewDecision")
+                not in ("REVIEW_REQUIRED", "REVIEW_PENDING", "CHANGES_REQUESTED")
+                and fallback_pr.get("state") == "open"
+                and fallback_pr.get("head_sha") == review_sha
+                and fallback_pr.get("base_ref") == base_branch
+                and fallback_pr.get("mergeable") is True
+                and fallback_pr.get("mergeable_state") == "clean"
+                and fallback_ci.state == "PASSED"
+            )
+            if not fallback_authorized:
+                return AutoMergeResult(
+                    "NOT_ELIGIBLE",
+                    "GitHub clean-status fallback failed live authorization or safety revalidation.",
+                    response_status=merge_result.get("status_code"),
+                    response_payload=merge_result.get("payload"),
+                )
+            fallback_merge = github_client.merge_pull_request(
+                installation_id,
+                owner,
+                repo_name,
+                pr_number,
+                review_sha,
+                merge_method,
+            )
+            if fallback_merge.get("succeeded"):
+                fallback_payload = fallback_merge.get("payload") or {}
+                fallback_verified = github_client.get_pull_request(
+                    installation_id, owner, repo_name, pr_number
+                )
+                if (
+                    fallback_payload.get("merged") is True
+                    and fallback_verified.get("merged") is True
+                ):
+                    return AutoMergeResult(
+                        "MERGED",
+                        "GitHub confirmed the clean-status fallback merge.",
+                        merge_commit_sha=(
+                            fallback_verified.get("merge_commit_sha")
+                            or fallback_payload.get("sha")
+                        ),
+                        response_status=fallback_merge.get("status_code"),
+                        response_payload=fallback_payload,
+                        policy_revision=policy_revision,
+                    )
+            return AutoMergeResult(
+                "FAILED",
+                "GitHub clean-status fallback did not confirm an actual merge.",
+                response_status=fallback_merge.get("status_code"),
+                response_payload=fallback_merge.get("payload"),
+            )
+        else:
+            if final_ci.state == "FAILED":
+                return AutoMergeResult(
+                    "CI_FAILED",
+                    "GitHub CI verification failed during final revalidation.",
+                    ci_state=final_ci.state,
+                    ci_checks=final_ci_checks,
+                    required_checks=final_required_checks,
+                )
         result = github_client.enable_pull_request_auto_merge(
             installation_id, pull_request_id, merge_method
         )
@@ -568,6 +924,22 @@ def attempt(
                     f"GitHub App is missing permission to enable auto-merge: {message}",
                     response_status=result.get("status_code"),
                     response_payload=result.get("payload"),
+                )
+            if _is_clean_status_error(result):
+                return _clean_status_merge_fallback(
+                    db=db,
+                    repo=repo,
+                    pr=pr,
+                    review=review,
+                    installation_id=installation_id,
+                    owner=owner,
+                    repo_name=repo_name,
+                    pr_number=pr_number,
+                    base_branch=base_branch,
+                    review_sha=review_sha,
+                    merge_method=merge_method,
+                    policy_revision=policy_revision,
+                    original_result=result,
                 )
             return AutoMergeResult(
                 "FAILED",

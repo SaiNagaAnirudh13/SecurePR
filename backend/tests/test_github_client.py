@@ -312,6 +312,29 @@ def test_disable_auto_merge_uses_graphql_pull_request_node_id(monkeypatch):
     assert "disablePullRequestAutoMerge" in calls[0][1]["json"]["query"]
 
 
+def test_immediate_merge_uses_expected_head_sha(monkeypatch):
+    client = github_module.GitHubClient()
+    monkeypatch.setattr(client, "_headers", lambda *args, **kwargs: {})
+    calls = []
+
+    def fake_put(*args, **kwargs):
+        calls.append((args, kwargs))
+        return FakeResponse({"merged": True, "sha": "merge-commit"})
+
+    monkeypatch.setattr(github_module.requests, "put", fake_put)
+
+    result = client.merge_pull_request(
+        "42", "octo", "widgets", 4, "head1", "SQUASH"
+    )
+
+    assert result["succeeded"] is True
+    assert result["payload"]["merged"] is True
+    assert calls[0][1]["json"] == {
+        "sha": "head1",
+        "merge_method": "squash",
+    }
+
+
 def test_required_checks_combine_branch_protection_and_rulesets(monkeypatch):
     client = github_module.GitHubClient()
     monkeypatch.setattr(client, "_headers", lambda *args, **kwargs: {})

@@ -650,6 +650,35 @@ class GitHubClient:
             installation_id, mutation, {"pullRequestId": pull_request_id}
         )
 
+    def merge_pull_request(
+        self,
+        installation_id: str,
+        owner: str,
+        repo: str,
+        pr_number: int,
+        expected_head_sha: str,
+        merge_method: str,
+    ) -> dict:
+        """Call GitHub's immediate merge endpoint with an SHA guard."""
+        resp = requests.put(
+            f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}/merge",
+            headers=self._headers(installation_id),
+            json={
+                "sha": expected_head_sha,
+                "merge_method": merge_method.lower(),
+            },
+            timeout=20,
+        )
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = {"message": resp.text}
+        return {
+            "succeeded": resp.ok,
+            "status_code": resp.status_code,
+            "payload": payload,
+        }
+
     def post_review(
         self,
         installation_id: str,
@@ -740,10 +769,12 @@ class GitHubClient:
         data = resp.json()
         return {
             "state": data.get("state"),
+            "merged": data.get("merged") is True,
             "mergeable": data.get("mergeable"),
             "mergeable_state": data.get("mergeable_state"),
             "head_sha": (data.get("head") or {}).get("sha"),
             "base_ref": (data.get("base") or {}).get("ref"),
+            "merge_commit_sha": data.get("merge_commit_sha"),
         }
 
     def _find_marked_record(

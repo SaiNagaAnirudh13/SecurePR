@@ -164,6 +164,15 @@ def _github_ok(monkeypatch, *, mergeable_state="clean", review_decision="APPROVE
             },
         },
     )
+    monkeypatch.setattr(
+        auto_merge.github_client,
+        "merge_pull_request",
+        lambda *args: {
+            "succeeded": True,
+            "status_code": 200,
+            "payload": {"merged": True, "sha": "merge-commit-sha"},
+        },
+    )
 
 
 def _attempt(db_session, repo, pr, review):
@@ -177,18 +186,156 @@ def _attempt(db_session, repo, pr, review):
     )
 
 
-def test_approved_low_risk_requests_github_auto_merge_and_waits_for_confirmation(
+def _set_blocked_github_pr(monkeypatch):
+    monkeypatch.setattr(
+        auto_merge.github_client,
+        "get_pull_request",
+        lambda *args: {
+            "state": "open",
+            "merged": False,
+            "mergeable": True,
+            "mergeable_state": "blocked",
+            "head_sha": "head1",
+            "base_ref": "main",
+        },
+    )
+
+
+def test_approved_low_risk_is_merged_immediately_without_manual_interaction(
     db_session, monkeypatch
 ):
     repo, pr, review = _objects(db_session)
     _enable(monkeypatch)
     _github_ok(monkeypatch)
+    calls = iter(
+        (
+            {
+                "state": "open",
+                "merged": False,
+                "mergeable": True,
+                "mergeable_state": "clean",
+                "head_sha": "head1",
+                "base_ref": "main",
+            },
+            {
+                "state": "open",
+                "merged": False,
+                "mergeable": True,
+                "mergeable_state": "clean",
+                "head_sha": "head1",
+                "base_ref": "main",
+            },
+            {
+                "state": "closed",
+                "merged": True,
+                "mergeable": True,
+                "mergeable_state": "clean",
+                "head_sha": "head1",
+                "base_ref": "main",
+                "merge_commit_sha": "merge-commit-sha",
+            },
+        )
+    )
+    monkeypatch.setattr(
+        auto_merge.github_client,
+        "get_pull_request",
+        lambda *args: next(calls),
+    )
 
     result = _attempt(db_session, repo, pr, review)
 
-    assert result.status == "AUTO_MERGE_ENABLED"
-    assert result.merge_commit_sha is None
-    assert "not yet merged" in result.reason
+    assert result.status == "MERGED"
+    assert result.merge_commit_sha == "merge-commit-sha"
+
+
+def test_clean_status_error_refetches_and_falls_back_to_immediate_merge(
+    db_session, monkeypatch
+):
+    repo, pr, review = _objects(db_session)
+    _enable(monkeypatch)
+    _github_ok(monkeypatch)
+    _set_blocked_github_pr(monkeypatch)
+    monkeypatch.setattr(
+        auto_merge.github_client,
+        "enable_pull_request_auto_merge",
+        lambda *args: {
+            "succeeded": False,
+            "status_code": 422,
+            "payload": {"message": "Pull request is in clean status"},
+        },
+    )
+    monkeypatch.setattr(
+        auto_merge.github_client,
+        "merge_pull_request",
+        lambda *args: {
+            "succeeded": True,
+            "status_code": 200,
+            "payload": {"merged": True, "sha": "clean-fallback-sha"},
+        },
+    )
+    calls = iter(
+        (
+            {"state": "open", "mergeable": True, "mergeable_state": "blocked",
+             "head_sha": "head1", "base_ref": "main", "merged": False},
+            {"state": "open", "mergeable": True, "mergeable_state": "blocked",
+             "head_sha": "head1", "base_ref": "main", "merged": False},
+            {"state": "open", "mergeable": True, "mergeable_state": "clean",
+             "head_sha": "head1", "base_ref": "main", "merged": False},
+            {"state": "closed", "mergeable": True, "mergeable_state": "clean",
+             "head_sha": "head1", "base_ref": "main", "merged": True,
+             "merge_commit_sha": "clean-fallback-sha"},
+        )
+    )
+    monkeypatch.setattr(
+        auto_merge.github_client,
+        "get_pull_request",
+        lambda *args: next(calls),
+    )
+
+    result = _attempt(db_session, repo, pr, review)
+
+    assert result.status == "MERGED"
+    assert result.merge_commit_sha == "clean-fallback-sha"
+
+
+def test_already_merged_pr_is_idempotent_and_calls_no_merge_operation(
+    db_session, monkeypatch
+):
+    repo, pr, review = _objects(db_session)
+    _enable(monkeypatch)
+    _github_ok(monkeypatch)
+    monkeypatch.setattr(
+        auto_merge.github_client,
+        "get_pull_request",
+        lambda *args: {
+            "state": "closed",
+            "merged": True,
+            "mergeable": True,
+            "mergeable_state": "clean",
+            "head_sha": "head1",
+            "base_ref": "main",
+            "merge_commit_sha": "already-merged-sha",
+        },
+    )
+    merge_calls = []
+    enable_calls = []
+    monkeypatch.setattr(
+        auto_merge.github_client,
+        "merge_pull_request",
+        lambda *args: merge_calls.append(args),
+    )
+    monkeypatch.setattr(
+        auto_merge.github_client,
+        "enable_pull_request_auto_merge",
+        lambda *args: enable_calls.append(args),
+    )
+
+    result = _attempt(db_session, repo, pr, review)
+
+    assert result.status == "MERGED"
+    assert result.merge_commit_sha == "already-merged-sha"
+    assert merge_calls == []
+    assert enable_calls == []
 
 
 @pytest.mark.parametrize(
@@ -263,6 +410,7 @@ def test_saved_threshold_is_enforced(db_session, monkeypatch):
     repo, pr, review = _objects(db_session)
     _enable(monkeypatch)
     _github_ok(monkeypatch)
+    _set_blocked_github_pr(monkeypatch)
     review.overall_score = 45
     eligibility = db_session.query(m.AutoApprovalEligibility).one()
     eligibility.max_risk_threshold = 39
@@ -344,6 +492,7 @@ def test_policy_revision_change_during_activation_cancels_request(
     repo, pr, review = _objects(db_session)
     _enable(monkeypatch)
     _github_ok(monkeypatch)
+    _set_blocked_github_pr(monkeypatch)
     cancellations = []
 
     def revoke_during_activation(*_args):
@@ -426,6 +575,7 @@ def test_head_change_after_enable_is_cancelled_and_never_reported_as_enabled(
     repo, pr, review = _objects(db_session)
     _enable(monkeypatch)
     _github_ok(monkeypatch)
+    _set_blocked_github_pr(monkeypatch)
     original_get_pr = auto_merge.github_client.get_pull_request
     reads = []
     cancellations = []
@@ -552,7 +702,7 @@ def test_revoking_saved_configuration_cancels_and_audits_pending_merge(
         ),
     ],
 )
-def test_ci_pending_or_failed_never_requests_auto_merge(
+def test_ci_pending_enables_auto_merge_but_failed_ci_never_requests_it(
     db_session, monkeypatch, records, state
 ):
     repo, pr, review = _objects(db_session)
@@ -565,13 +715,33 @@ def test_ci_pending_or_failed_never_requests_auto_merge(
     monkeypatch.setattr(
         auto_merge.github_client,
         "enable_pull_request_auto_merge",
-        lambda *args: requests.append(True),
+        lambda *args: (
+            requests.append(True)
+            or {
+                "succeeded": True,
+                "status_code": 200,
+                "payload": {
+                    "enablePullRequestAutoMerge": {
+                        "pullRequest": {
+                            "autoMergeRequest": {
+                                "enabledAt": "2026-01-01T00:00:00Z",
+                                "mergeMethod": "SQUASH",
+                            }
+                        }
+                    }
+                },
+            }
+        ),
     )
 
     result = _attempt(db_session, repo, pr, review)
 
-    assert result.status == state
-    assert requests == []
+    if state == "CI_PENDING":
+        assert result.status == "AUTO_MERGE_ENABLED"
+        assert len(requests) == 1
+    else:
+        assert result.status == state
+        assert requests == []
 
 
 def test_missing_required_check_does_not_allow_auto_merge(db_session, monkeypatch):
@@ -672,6 +842,7 @@ def test_missing_permission_and_mutation_rejection_are_recorded(
     repo, pr, review = _objects(db_session)
     _enable(monkeypatch)
     _github_ok(monkeypatch)
+    _set_blocked_github_pr(monkeypatch)
     monkeypatch.setattr(
         auto_merge.github_client,
         "get_auto_merge_capabilities",
@@ -687,6 +858,7 @@ def test_missing_permission_and_mutation_rejection_are_recorded(
     assert result.response_status == 403
 
     _github_ok(monkeypatch)
+    _set_blocked_github_pr(monkeypatch)
     monkeypatch.setattr(
         auto_merge.github_client,
         "enable_pull_request_auto_merge",
@@ -704,6 +876,7 @@ def test_mutation_must_confirm_enabled_at(db_session, monkeypatch):
     repo, pr, review = _objects(db_session)
     _enable(monkeypatch)
     _github_ok(monkeypatch)
+    _set_blocked_github_pr(monkeypatch)
     monkeypatch.setattr(
         auto_merge.github_client,
         "enable_pull_request_auto_merge",

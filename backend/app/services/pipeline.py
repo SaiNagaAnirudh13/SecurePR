@@ -1800,7 +1800,10 @@ def _run_analysis_locked(
             "DISABLED_DASHBOARD_CONFIGURATION",
         ):
             review.auto_merge_attempted_at = datetime.utcnow()
-        if merge_result.status != "AUTO_MERGE_ENABLED":
+        if merge_result.status == "MERGED":
+            review.auto_merged_at = datetime.utcnow()
+            review.auto_merge_failure_reason = None
+        elif merge_result.status != "AUTO_MERGE_ENABLED":
             review.auto_merge_failure_reason = merge_result.reason
         db.add(
             m.GithubAction(
@@ -1809,7 +1812,7 @@ def _run_analysis_locked(
                 request_payload={"method": settings.AUTO_MERGE_METHOD},
                 response_status=merge_result.response_status,
                 response_payload=merge_result.response_payload,
-                succeeded=merge_result.status == "AUTO_MERGE_ENABLED",
+                succeeded=merge_result.status in ("AUTO_MERGE_ENABLED", "MERGED"),
             )
         )
         db.add(
