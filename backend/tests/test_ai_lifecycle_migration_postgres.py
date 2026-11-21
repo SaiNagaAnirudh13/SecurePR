@@ -275,7 +275,9 @@ def test_production_startup_repeats_migrations_and_releases_lock(monkeypatch):
             config.attributes["connection"] = connection
             command.stamp(config, "20261120_04")
 
-        settings = SimpleNamespace(DATABASE_URL=str(scoped_url))
+        settings = SimpleNamespace(
+            DATABASE_URL=scoped_url.render_as_string(hide_password=False)
+        )
         monkeypatch.setattr(run_module, "get_settings", lambda: settings)
         monkeypatch.setattr(
             run_module, "validate_production_settings", lambda _settings: None

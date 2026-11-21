@@ -16,17 +16,17 @@ jobs:
         image: postgres:16
         env:
           POSTGRES_DB: securepr_test
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: securepr_test
+          POSTGRES_USER: securepr_ci
+          POSTGRES_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U postgres -d securepr_test"
+          --health-cmd "pg_isready -U securepr_ci -d securepr_test"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
     env:
-      TEST_POSTGRES_URL: postgresql+psycopg2://postgres:securepr_test@127.0.0.1:5432/securepr_test
+      TEST_POSTGRES_URL: postgresql+psycopg2://securepr_ci:${{ github.run_id }}-${{ github.run_attempt }}@127.0.0.1:5432/securepr_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
