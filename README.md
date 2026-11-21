@@ -30,7 +30,7 @@ SecurePR/
 │   │   ├── schemas/            Pydantic request/response schemas
 │   │   ├── services/           risk engine, policy engine, circuit breaker,
 │   │   │                       impact simulator, decision engine, pipeline
-│   │   └── integrations/       GitHub App client, Gemini client
+│   │   └── integrations/       GitHub App client, Groq client
 │   ├── tests/                 pytest unit tests
 │   ├── run.py                  cloud-platform entry point (uses PORT)
 │   ├── requirements.txt
@@ -69,7 +69,7 @@ SecurePR/
 
 ## Design notes worth knowing before you run this
 
-- **AI review is a required decision prerequisite.** Gemini must return
+- **AI review is a required decision prerequisite.** Groq must return
   validated risk dimensions, explanations, and findings for the exact PR head
   SHA. The deterministic decision engine applies CI and repository policy to
   that completed analysis. If AI fails or returns invalid data, SecurePR
@@ -84,12 +84,12 @@ SecurePR/
   and AI analysis are valid for the exact head SHA does the policy engine
   evaluate risk and eligibility. See
   [`docs/CI_DECISION_LIFECYCLE.md`](docs/CI_DECISION_LIFECYCLE.md).
-- **Gemini model selection is explicit.** SecurePR uses only the configured
-  `GEMINI_MODEL`; an unavailable model or provider failure produces an
+- **Groq model selection is explicit.** SecurePR uses only the configured
+  `GROQ_MODEL`; an unavailable model or provider failure produces an
   unavailable review instead of silently switching models or substituting
   deterministic scores.
-- **Guarded GitHub auto-merge.** It is disabled globally by default and
-  requires per-repository opt-in. Before requesting GitHub auto-merge,
+- **Guarded GitHub auto-merge.** Only a saved dashboard policy for the exact
+  GitHub account and repository can authorize it. Before requesting GitHub auto-merge,
   SecurePR rechecks the reviewed commit, CI, branch protection, required
   reviews, GitHub settings, and permissions. SecurePR never performs an
   immediate or force merge. See
@@ -135,7 +135,7 @@ venv\Scripts\activate
 pip install -r requirements-dev.txt
 pytest -q
 ruff check --select E9,F63,F7,F82 app tests
-mypy --ignore-missing-imports --follow-imports=skip app/services/ci_status.py app/services/comment_formatter.py app/integrations/gemini_client.py
+mypy --ignore-missing-imports --follow-imports=skip app/services/ci_status.py app/services/comment_formatter.py app/integrations/groq_client.py
 pip-audit -r requirements.txt
 ```
 

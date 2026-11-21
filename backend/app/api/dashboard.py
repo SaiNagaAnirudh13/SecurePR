@@ -1,11 +1,12 @@
+import logging
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.core.auth import get_current_operator, require_admin
-from app.core.config import get_settings
+from app.core.auth import OperatorIdentity, get_current_operator, require_admin
 from app.core.db import get_db
 from app.models import models as m
 from app.schemas.schemas import (
@@ -13,17 +14,18 @@ from app.schemas.schemas import (
     CircuitBreakerTripRequest,
     EligibilityUpdate,
     ReevaluateRequest,
-    RepositoryAutoMergeUpdate,
 )
-from app.services import ci_status, policy_engine
+from app.services import auto_merge, ci_status, policy_engine
 from app.services import circuit_breaker as cb_service
-from app.services.pipeline import run_analysis
+from app.services.background_jobs import enqueue_job
+from app.services.pipeline import RevisionLockUnavailable, run_analysis
 
 router = APIRouter(
     prefix="/api",
     tags=["dashboard"],
     dependencies=[Depends(get_current_operator)],
 )
+logger = logging.getLogger("securepr.dashboard")
 
 
 def _latest_review_for_pr(
@@ -53,14 +55,42 @@ def _auto_merge_status(
             "AI_REVIEW_UNAVAILABLE",
             "A validated AI analysis for the current PR revision is required.",
         )
-    settings = get_settings()
-    if not settings.AUTO_MERGE_ENABLED:
-        return "DISABLED_GLOBAL", "Auto-merge is disabled by SecurePR configuration."
-    if not repo.is_auto_merge_enabled:
+    eligibility = auto_merge.saved_eligibility(db, repo, pr)
+    if not eligibility:
         return (
-            "DISABLED_REPOSITORY",
-            "Auto-merge is disabled for this repository in SecurePR settings.",
+            "DASHBOARD_CONFIGURATION_MISSING",
+            "No valid saved dashboard configuration exists for this repository and GitHub account.",
         )
+    if not eligibility.is_enabled:
+        cancellation_job = (
+            db.query(m.BackgroundJob)
+            .filter(
+                m.BackgroundJob.idempotency_key
+                == (
+                    f"cancel-auto-merge-policy:{repo.id}:{pr.id}:"
+                    f"{eligibility.policy_revision}"
+                )
+            )
+            .first()
+        )
+        if cancellation_job and cancellation_job.state in ("QUEUED", "RUNNING"):
+            return (
+                "CANCELLATION_PENDING",
+                "Saved authorization is disabled; GitHub auto-merge cancellation is pending verification.",
+            )
+        if cancellation_job and cancellation_job.state == "FAILED":
+            return (
+                "CANCELLATION_UNVERIFIED",
+                "Saved authorization is disabled, but GitHub cancellation could not be verified.",
+            )
+        return (
+            "DISABLED_DASHBOARD_CONFIGURATION",
+            "Auto-approval is disabled in the saved dashboard configuration.",
+        )
+    if not 0 <= eligibility.max_risk_threshold <= 100:
+        return "NOT_ELIGIBLE", "The saved dashboard risk threshold is invalid."
+    if review.overall_score > eligibility.max_risk_threshold:
+        return "NOT_ELIGIBLE", "Risk exceeds the saved dashboard threshold."
     ci_summary = _ci_status_summary(db, pr.id, pr.head_sha or "")
     if ci_summary["state"] == "FAILED":
         return (
@@ -317,7 +347,6 @@ def overview(db: Session = Depends(get_db)):
                 "owner_login": r.owner_login,
                 "is_active": r.is_active,
                 "pr_count": pr_count,
-                "is_auto_merge_enabled": r.is_auto_merge_enabled,
                 "last_analysis_at": last_review.created_at if last_review else None,
             }
         )
@@ -373,35 +402,9 @@ def list_repositories(db: Session = Depends(get_db)):
                 "owner_login": r.owner_login,
                 "is_active": r.is_active,
                 "pr_count": pr_count,
-                "is_auto_merge_enabled": r.is_auto_merge_enabled,
             }
         )
     return out
-
-
-@router.get("/auto-merge/config")
-def auto_merge_configuration():
-    settings = get_settings()
-    return {
-        "enabled_by_securepr": settings.AUTO_MERGE_ENABLED,
-        "low_risk_only": settings.AUTO_MERGE_LOW_RISK_ONLY,
-        "merge_method": settings.AUTO_MERGE_METHOD,
-    }
-
-
-@router.post("/repositories/auto-merge", dependencies=[Depends(require_admin)])
-def set_repository_auto_merge(
-    req: RepositoryAutoMergeUpdate, db: Session = Depends(get_db)
-):
-    repo = db.query(m.Repository).filter(m.Repository.id == req.repository_id).first()
-    if not repo:
-        raise HTTPException(404, "Repository not found")
-    repo.is_auto_merge_enabled = req.is_enabled
-    db.commit()
-    return {
-        "repository_id": repo.id,
-        "is_auto_merge_enabled": repo.is_auto_merge_enabled,
-    }
 
 
 @router.get("/repositories/{repo_id}/authors")
@@ -503,6 +506,8 @@ def list_prs(repo_id: str, db: Session = Depends(get_db)):
                 "ai_error_code": pr.ai_error_code,
                 "ai_retryable_at": pr.ai_retryable_at,
                 "ai_attempt_id": pr.ai_attempt_id,
+                "ai_provider": latest.ai_provider if latest else None,
+                "ai_model": latest.ai_model if latest else None,
                 "ci_status": _ci_status_summary(db, pr.id, pr.head_sha or ""),
                 "changed_files_count": files_count or 0,
                 "findings_count": findings_count or 0,
@@ -592,10 +597,6 @@ def get_pull_request(pr_id: str, db: Session = Depends(get_db)):
         "current_head_sha": pr.head_sha,
         "auto_merge_status": merge_status,
         "auto_merge_blocker": merge_blocker,
-        "auto_merge_enabled_for_repository": repo.is_auto_merge_enabled
-        if repo
-        else False,
-        "auto_merge_enabled_by_securepr": get_settings().AUTO_MERGE_ENABLED,
         "merged_at": pr.merged_at,
         "merge_commit_sha": pr.merge_commit_sha,
         "review_publications": _publication_statuses(
@@ -606,6 +607,8 @@ def get_pull_request(pr_id: str, db: Session = Depends(get_db)):
         "ai_error_code": pr.ai_error_code,
         "ai_retryable_at": pr.ai_retryable_at,
         "ai_attempt_id": pr.ai_attempt_id,
+        "ai_provider": latest.ai_provider if latest else None,
+        "ai_model": latest.ai_model if latest else None,
         "head_sha": pr.head_sha,
         "ci_status": _ci_status_summary(db, pr.id, pr.head_sha or ""),
     }
@@ -629,6 +632,8 @@ def list_reviews(pr_id: str, db: Session = Depends(get_db)):
             "ai_error_code": r.ai_error_code,
             "ai_retryable_at": r.ai_retryable_at,
             "ai_attempt_id": r.ai_attempt_id,
+            "ai_provider": r.ai_provider,
+            "ai_model": r.ai_model,
             "head_sha": r.head_sha,
             "lifecycle_state": r.lifecycle_state,
             "auto_merge_status": r.auto_merge_status,
@@ -752,6 +757,10 @@ def get_review(review_id: str, db: Session = Depends(get_db)):
         "ai_error_code": review.ai_error_code,
         "ai_retryable_at": review.ai_retryable_at,
         "ai_attempt_id": review.ai_attempt_id,
+        "ai_provider": review.ai_provider,
+        "ai_model": review.ai_model,
+        "ai_input_tokens": review.ai_input_tokens,
+        "ai_output_tokens": review.ai_output_tokens,
         "risk_category": review.risk_category,
         "decision": review.decision.value,
         "decision_reasons": review.decision_reasons,
@@ -820,14 +829,42 @@ def reevaluate(req: ReevaluateRequest, db: Session = Depends(get_db)):
     if not repo.installation_id:
         raise HTTPException(409, "Repository GitHub App installation is unavailable")
     latest = _latest_review_for_pr(db, pr.id)
-    review = run_analysis(
-        db,
-        repo,
-        pr,
-        repo.installation_id,
-        is_reevaluation=True,
-        previous_review_id=latest.id if latest else None,
-    )
+    try:
+        review = run_analysis(
+            db,
+            repo,
+            pr,
+            repo.installation_id,
+            is_reevaluation=True,
+            previous_review_id=latest.id if latest else None,
+        )
+    except RevisionLockUnavailable:
+        idempotency_key = (
+            f"dashboard-reevaluation:{repo.id}:{pr.id}:{pr.head_sha}:"
+            f"{latest.id if latest else 'initial'}"
+        )
+        job = enqueue_job(
+            db,
+            "REVIEW",
+            idempotency_key,
+            {
+                "repository_id": repo.id,
+                "pull_request_id": pr.id,
+                "installation_id": repo.installation_id,
+                "head_sha": pr.head_sha,
+                "is_reevaluation": True,
+                "previous_review_id": latest.id if latest else None,
+            },
+        )
+        db.commit()
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "QUEUED",
+                "job_id": job.id,
+                "message": "Another review is finalizing; this reevaluation was queued.",
+            },
+        )
     if not review:
         raise HTTPException(
             409, "Pull request changed or is no longer available for review"
@@ -917,9 +954,38 @@ def list_eligibility(repo_id: str, db: Session = Depends(get_db)):
     return out
 
 
-@router.post("/repositories/eligibility", dependencies=[Depends(require_admin)])
-def set_eligibility(req: EligibilityUpdate, db: Session = Depends(get_db)):
-    user = db.query(m.User).filter(m.User.github_login == req.user_login).first()
+@router.post("/repositories/eligibility")
+def set_eligibility(
+    req: EligibilityUpdate,
+    operator: OperatorIdentity = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    repo = db.query(m.Repository).filter(m.Repository.id == req.repository_id).first()
+    if not repo or not repo.is_active:
+        raise HTTPException(404, "Active repository not found")
+    if (
+        not repo.owner_login
+        or not repo.name
+        or repo.full_name.casefold() != f"{repo.owner_login}/{repo.name}".casefold()
+    ):
+        raise HTTPException(409, "Repository ownership metadata is inconsistent")
+    known_author = (
+        db.query(m.PullRequest.id)
+        .filter(
+            m.PullRequest.repository_id == repo.id,
+            func.lower(m.PullRequest.author_login) == req.user_login.casefold(),
+        )
+        .first()
+    )
+    if not known_author:
+        raise HTTPException(
+            400, "The GitHub account must be a pull-request author in this repository."
+        )
+    user = (
+        db.query(m.User)
+        .filter(func.lower(m.User.github_login) == req.user_login.casefold())
+        .first()
+    )
     if not user:
         user = m.User(github_login=req.user_login)
         db.add(user)
@@ -932,16 +998,73 @@ def set_eligibility(req: EligibilityUpdate, db: Session = Depends(get_db)):
         )
         .first()
     )
+    previous_enabled = bool(row and row.is_enabled)
+    previous_threshold = row.max_risk_threshold if row else None
+    policy_changed = (
+        row is None
+        or bool(row.is_enabled) != req.is_enabled
+        or row.max_risk_threshold != req.max_risk_threshold
+    )
     if not row:
         row = m.AutoApprovalEligibility(
-            repository_id=req.repository_id, user_id=user.id
+            repository_id=req.repository_id, user_id=user.id, policy_revision=0
         )
         db.add(row)
+    if policy_changed:
+        row.policy_revision = (row.policy_revision or 0) + 1
     row.is_enabled = req.is_enabled
     row.max_risk_threshold = req.max_risk_threshold
-    row.updated_by = req.updated_by
+    row.updated_by = operator.user_id
+    authorization_revoked = previous_enabled and (
+        not req.is_enabled
+        or (
+            previous_threshold is not None
+            and req.max_risk_threshold < previous_threshold
+        )
+    )
+    if authorization_revoked or not req.is_enabled:
+        affected_pull_requests = (
+            db.query(m.PullRequest)
+            .filter(
+                m.PullRequest.repository_id == repo.id,
+                func.lower(m.PullRequest.author_login) == user.github_login.casefold(),
+                m.PullRequest.state == "open",
+            )
+            .all()
+        )
+        cancellations_queued = 0
+        for pull_request in affected_pull_requests:
+            cancellation_job = enqueue_job(
+                db,
+                "AUTO_MERGE_CANCEL",
+                (
+                    f"cancel-auto-merge-policy:{repo.id}:{pull_request.id}:"
+                    f"{row.policy_revision}"
+                ),
+                {
+                    "repository_id": repo.id,
+                    "pull_request_id": pull_request.id,
+                    "installation_id": repo.installation_id,
+                    "policy_revision": row.policy_revision,
+                },
+            )
+            if cancellation_job.state in ("QUEUED", "RUNNING"):
+                cancellations_queued += 1
+    else:
+        cancellations_queued = 0
     db.commit()
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "repository_id": repo.id,
+        "repository": repo.full_name,
+        "user_login": user.github_login,
+        "is_enabled": row.is_enabled,
+        "max_risk_threshold": row.max_risk_threshold,
+        "policy_revision": row.policy_revision,
+        "auto_merge_cancellations_queued": cancellations_queued,
+        "updated_by": row.updated_by,
+        "updated_at": row.updated_at,
+    }
 
 
 # --------------------------------------------------------------------- Impact

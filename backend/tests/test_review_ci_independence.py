@@ -1,7 +1,7 @@
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -11,12 +11,19 @@ from sqlalchemy.orm import sessionmaker
 
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
-from app.api.webhooks import _handle_check_event  # noqa: E402
-from app.core.db import Base  # noqa: E402
-from app.integrations import gemini_client as gemini_module  # noqa: E402
-from app.integrations import github_client as github_module  # noqa: E402
-from app.models import models as m  # noqa: E402
-from app.services import pipeline  # noqa: E402
+from app.api.webhooks import _handle_check_event
+from app.core.db import Base
+from app.integrations import github_client as github_module
+from app.integrations import groq_client as groq_module
+from app.integrations.ai_provider import (
+    AIAnalysisResult,
+    AIInvalidResponse,
+    AIUnavailable,
+)
+from app.models import models as m
+from app.services import pipeline
+
+UTC_TZ = timezone(timedelta(0))
 
 
 @pytest.fixture()
@@ -120,9 +127,9 @@ def _patch_review_dependencies(
         lambda *args, **kwargs: {"succeeded": True, "status_code": 200, "payload": {}},
     )
     monkeypatch.setattr(
-        gemini_module.gemini_client,
+        groq_module.groq_client,
         "score_dimensions",
-        lambda *args, **kwargs: _valid_ai_scores(),
+        lambda *args, **kwargs: _provider_result(),
     )
     monkeypatch.setattr(
         pipeline.policy_engine,
@@ -147,8 +154,8 @@ def _patch_review_dependencies(
     )
     if auto_merge_result is None:
         auto_merge_result = SimpleNamespace(
-            status="DISABLED_GLOBAL",
-            reason="Auto-merge is disabled by SecurePR configuration.",
+            status="DASHBOARD_CONFIGURATION_MISSING",
+            reason="No saved dashboard configuration authorizes auto-merge.",
             response_status=None,
             response_payload=None,
             merge_commit_sha=None,
@@ -174,6 +181,14 @@ def _valid_ai_scores():
             "policy_compliance",
         )
     } | {"summary": "test summary", "findings": []}
+
+
+def _provider_result(analysis=None):
+    return AIAnalysisResult(
+        analysis=analysis or _valid_ai_scores(),
+        provider="groq",
+        model="openai/gpt-oss-120b",
+    )
 
 
 def _add_ci_revision(db_session, repo, pr, state, checks=(), required=()):
@@ -220,9 +235,9 @@ def test_passed_ci_and_eligible_low_risk_publish_approval(
     repo, pr = repo_and_pr
     posted, _ = _patch_review_dependencies(monkeypatch)
     monkeypatch.setattr(
-        gemini_module.gemini_client,
+        groq_module.groq_client,
         "score_dimensions",
-        lambda *args, **kwargs: _valid_ai_scores(),
+        lambda *args, **kwargs: _provider_result(),
     )
     _add_ci_revision(
         db_session,
@@ -251,18 +266,21 @@ def test_passed_ci_and_eligible_low_risk_publish_approval(
     assert posted[0][1]["commit_id"] == pr.head_sha
 
 
-def test_gemini_timeout_is_unavailable_without_fallback_risk_or_approval(
+def test_groq_timeout_is_unavailable_without_fallback_risk_or_approval(
     db_session, repo_and_pr, monkeypatch
 ):
     repo, pr = repo_and_pr
     posted, _ = _patch_review_dependencies(monkeypatch)
 
     def timeout(*args, **kwargs):
-        raise gemini_module.GeminiAnalysisError(
-            "DeadlineExceeded: 504 Deadline expired before operation could complete."
+        raise AIUnavailable(
+            "Groq analysis could not be completed.",
+            error_code="GROQ_REQUEST_TIMEOUT",
+            retryable_at=datetime.now(UTC_TZ).replace(tzinfo=None)
+            + timedelta(seconds=30),
         )
 
-    monkeypatch.setattr(gemini_module.gemini_client, "score_dimensions", timeout)
+    monkeypatch.setattr(groq_module.groq_client, "score_dimensions", timeout)
     _add_ci_revision(
         db_session,
         repo,
@@ -281,7 +299,7 @@ def test_gemini_timeout_is_unavailable_without_fallback_risk_or_approval(
 
     assert review.decision == m.DecisionStatus.REVIEW_UNAVAILABLE
     assert review.lifecycle_state == "REVIEW_UNAVAILABLE"
-    assert review.ai_state == pr.ai_state == "AI_FAILED"
+    assert review.ai_state == pr.ai_state == "AI_UNAVAILABLE"
     assert review.analysis_completed_at is None
     assert review.risk_category == "NOT_EVALUATED"
     assert review.overall_score == 0
@@ -297,18 +315,18 @@ def test_gemini_timeout_is_unavailable_without_fallback_risk_or_approval(
     assert "**No AI approval decision has been made.**" in posted[0][0][4]
     evidence = (
         db_session.query(m.Evidence)
-        .filter_by(review_id=review.id, evidence_type="error", source="gemini")
+        .filter_by(review_id=review.id, evidence_type="error", source="ai_provider")
         .one()
     )
-    assert "GEMINI_ANALYSIS_FAILED" in evidence.content
+    assert "GROQ_REQUEST_TIMEOUT" in evidence.content
     assert "504 Deadline expired" not in evidence.content
 
 
 @pytest.mark.parametrize(
     ("failure_kind", "expected_state", "expected_error_code", "has_retry_time"),
     [
-        ("quota", "AI_UNAVAILABLE", "GEMINI_QUOTA_EXCEEDED", True),
-        ("malformed", "AI_INVALID_RESPONSE", "GEMINI_INVALID_RESPONSE", False),
+        ("quota", "AI_UNAVAILABLE", "GROQ_QUOTA_EXCEEDED", True),
+        ("malformed", "AI_INVALID_RESPONSE", "GROQ_INVALID_RESPONSE", False),
     ],
 )
 def test_ai_failures_persist_diagnostics_without_completion_or_approval(
@@ -322,18 +340,18 @@ def test_ai_failures_persist_diagnostics_without_completion_or_approval(
 ):
     repo, pr = repo_and_pr
     posted, _ = _patch_review_dependencies(monkeypatch)
-    retryable_at = datetime.utcnow() + timedelta(minutes=5)
+    retryable_at = datetime.now(UTC_TZ).replace(tzinfo=None) + timedelta(minutes=5)
 
     def fail_analysis(*args, **kwargs):
         if failure_kind == "quota":
-            raise gemini_module.GeminiUnavailable(
-                "Gemini quota exhausted.",
-                error_code="GEMINI_QUOTA_EXCEEDED",
+            raise AIUnavailable(
+                "Groq quota exhausted.",
+                error_code="GROQ_QUOTA_EXCEEDED",
                 retryable_at=retryable_at,
             )
-        raise gemini_module.GeminiInvalidResponse("Gemini response was malformed.")
+        raise AIInvalidResponse("Groq response was malformed.")
 
-    monkeypatch.setattr(gemini_module.gemini_client, "score_dimensions", fail_analysis)
+    monkeypatch.setattr(groq_module.groq_client, "score_dimensions", fail_analysis)
     _add_ci_revision(
         db_session,
         repo,
@@ -375,12 +393,12 @@ def test_database_persistence_failure_rolls_back_without_github_decision(
     posted, _ = _patch_review_dependencies(monkeypatch)
 
     def unavailable(*args, **kwargs):
-        raise gemini_module.GeminiUnavailable(
-            "Gemini is unavailable.",
-            error_code="GEMINI_UNAVAILABLE",
+        raise AIUnavailable(
+            "Groq is unavailable.",
+            error_code="GROQ_UNAVAILABLE",
         )
 
-    monkeypatch.setattr(gemini_module.gemini_client, "score_dimensions", unavailable)
+    monkeypatch.setattr(groq_module.groq_client, "score_dimensions", unavailable)
     _add_ci_revision(
         db_session,
         repo,
@@ -407,7 +425,7 @@ def test_database_persistence_failure_rolls_back_without_github_decision(
     db_session.rollback()
     db_session.refresh(pr)
     assert pr.ai_state == "AI_UNAVAILABLE"
-    assert pr.ai_error_code == "GEMINI_UNAVAILABLE"
+    assert pr.ai_error_code == "GROQ_UNAVAILABLE"
     assert pr.ai_attempt_id
     assert db_session.query(m.Review).count() == 0
     assert not posted
@@ -419,9 +437,9 @@ def test_failed_final_review_publication_retries_with_same_marker(
     repo, pr = repo_and_pr
     _patch_review_dependencies(monkeypatch)
     monkeypatch.setattr(
-        gemini_module.gemini_client,
+        groq_module.groq_client,
         "score_dimensions",
-        lambda *args, **kwargs: _valid_ai_scores(),
+        lambda *args, **kwargs: _provider_result(),
     )
     _add_ci_revision(
         db_session,
@@ -503,11 +521,11 @@ def test_ci_failure_arriving_during_ai_analysis_blocks_final_decision(
 
     def score_during_analysis(*args, **kwargs):
         ci_events.append("ai")
-        return _valid_ai_scores()
+        return _provider_result()
 
     monkeypatch.setattr(pipeline, "_fetch_ci_checks", fetch_checks)
     monkeypatch.setattr(
-        gemini_module.gemini_client, "score_dimensions", score_during_analysis
+        groq_module.groq_client, "score_dimensions", score_during_analysis
     )
 
     review = _run(db_session, repo, pr)
@@ -548,10 +566,10 @@ def test_ci_completion_during_ai_analysis_queues_full_revision_reconciliation(
         revision.discovery_complete = True
         revision.error = None
         db_session.commit()
-        return _valid_ai_scores()
+        return _provider_result()
 
     monkeypatch.setattr(
-        gemini_module.gemini_client,
+        groq_module.groq_client,
         "score_dimensions",
         complete_ci_during_analysis,
     )
@@ -870,9 +888,9 @@ def test_repeated_same_revision_review_does_not_repeat_ai_or_publish(
     )
     ai_calls = []
     monkeypatch.setattr(
-        gemini_module.gemini_client,
+        groq_module.groq_client,
         "score_dimensions",
-        lambda *args, **kwargs: ai_calls.append(True),
+        lambda *args, **kwargs: ai_calls.append(True) or _provider_result(),
     )
 
     first = _run(db_session, repo, pr)

@@ -55,22 +55,22 @@ RECOMMENDED_ACTION = {
 }
 
 AI_FAILURE_REASONS = {
-    "GEMINI_CONFIGURATION_MISSING": "AI provider configuration is missing.",
-    "GEMINI_MODEL_CONFIGURATION_INVALID": "AI model configuration is invalid.",
-    "GEMINI_AUTHENTICATION_FAILED": "Gemini authentication failed; provider configuration must be checked.",
-    "GEMINI_QUOTA_EXCEEDED": "Gemini API quota or rate limit was exceeded.",
-    "GEMINI_PROVIDER_UNAVAILABLE": "Gemini is temporarily unavailable.",
-    "GEMINI_REQUEST_TIMEOUT": "Gemini analysis timed out.",
-    "GEMINI_NETWORK_ERROR": "Gemini could not be reached because of a network error.",
-    "GEMINI_INVALID_RESPONSE": "Gemini returned an invalid or incomplete response.",
+    "GROQ_CONFIGURATION_MISSING": "AI provider configuration is missing.",
+    "GROQ_MODEL_CONFIGURATION_INVALID": "AI model configuration is invalid.",
+    "GROQ_AUTHENTICATION_FAILED": "Groq authentication failed; provider configuration must be checked.",
+    "GROQ_QUOTA_EXCEEDED": "Groq API quota or rate limit was exceeded.",
+    "GROQ_PROVIDER_UNAVAILABLE": "Groq is temporarily unavailable.",
+    "GROQ_REQUEST_TIMEOUT": "Groq analysis timed out.",
+    "GROQ_NETWORK_ERROR": "Groq could not be reached because of a network error.",
+    "GROQ_INVALID_RESPONSE": "Groq returned an invalid or incomplete response.",
     "PR_FILES_UNAVAILABLE": "The changed files could not be retrieved for AI analysis.",
 }
 
 
 def _ai_failure_reason(error_code: str | None) -> str:
     if not isinstance(error_code, str):
-        return "Gemini analysis could not be completed."
-    return AI_FAILURE_REASONS.get(error_code, "Gemini analysis could not be completed.")
+        return "Groq analysis could not be completed."
+    return AI_FAILURE_REASONS.get(error_code, "Groq analysis could not be completed.")
 
 
 def _score_bar(score: float) -> str:
@@ -397,14 +397,18 @@ def format_auto_merge_comment(
             f"{commit}"
         )
     headings = {
-        "DISABLED_GLOBAL": "Auto-merge disabled by SecurePR",
-        "DISABLED_REPOSITORY": "Auto-merge disabled for this repository in SecurePR",
+        "DISABLED_DASHBOARD_CONFIGURATION": "Auto-approval disabled in the saved dashboard configuration",
+        "DASHBOARD_CONFIGURATION_MISSING": "Saved dashboard configuration required",
+        "NOT_ELIGIBLE": "Saved dashboard configuration or review requirements not met",
         "GITHUB_AUTO_MERGE_DISABLED": "GitHub repository auto-merge is disabled",
         "PERMISSION_MISSING": "GitHub App permission missing",
         "CI_PENDING": "Waiting for required CI",
         "CI_FAILED": "Auto-merge blocked by failed CI",
+        "BRANCH_PROTECTION_UNAVAILABLE": "Required branch protection could not be verified",
         "REQUIRED_REVIEW_PENDING": "Waiting for required GitHub review",
         "AUTO_MERGE_ENABLED": "GitHub auto-merge enabled",
+        "CANCELLATION_PENDING": "GitHub auto-merge cancellation pending verification",
+        "CANCELLATION_UNVERIFIED": "Stale auto-merge cancellation could not be verified",
         "MERGED": "Pull request merged",
     }
     heading = headings.get(status, "Auto-merge unavailable")

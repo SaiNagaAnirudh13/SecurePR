@@ -1,10 +1,10 @@
 """
 Decision Engine.
 
-This is THE deterministic gate. The AI model (Gemini) contributes risk
+This is THE deterministic gate. The AI model (Groq) contributes risk
 scores and findings as inputs, but every approve/block/manual-review
 decision is made here using explicit, auditable rules -- never "because the
-AI said so". This module has no dependency on the Gemini client.
+AI said so". This module has no dependency on the Groq client.
 
 Order of evaluation (first matching hard rule wins):
   1. AI analysis unavailable or incomplete                -> WAITING_FOR_AI / REVIEW_UNAVAILABLE

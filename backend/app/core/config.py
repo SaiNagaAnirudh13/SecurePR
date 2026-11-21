@@ -33,11 +33,9 @@ class Settings(BaseSettings):
     GITHUB_PRIVATE_KEY_PATH: str = "./secrets/github-app-private-key.pem"
     GITHUB_WEBHOOK_SECRET: str = ""
 
-    # Gemini
-    GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-3.8-flash"
-    GEMINI_REQUEST_TIMEOUT_SECONDS: int = 20
-    GEMINI_MAX_ATTEMPTS: int = 3
+    # AI provider
+    GROQ_API_KEY: str = ""
+    GROQ_MODEL: str = "openai/gpt-oss-120b"
 
     # App
     SECUREPR_ENV: str = "development"
@@ -72,9 +70,7 @@ class Settings(BaseSettings):
     CI_FALLBACK_MAX_POLLS: int = 10
     CI_FALLBACK_POLL_INTERVAL_SECONDS: int = 30
 
-    # Auto-merge settings
-    AUTO_MERGE_ENABLED: bool = False
-    AUTO_MERGE_LOW_RISK_ONLY: bool = True
+    # GitHub merge method is operational configuration, not authorization.
     AUTO_MERGE_METHOD: str = "SQUASH"
 
 

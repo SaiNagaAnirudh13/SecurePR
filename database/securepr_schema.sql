@@ -46,18 +46,10 @@ BEGIN
         default_branch     NVARCHAR(255) NOT NULL CONSTRAINT DF_repositories_branch DEFAULT 'main',
         installation_id    NVARCHAR(64) NULL,
         is_active          BIT NOT NULL CONSTRAINT DF_repositories_active DEFAULT 1,
-        is_auto_merge_enabled BIT NOT NULL CONSTRAINT DF_repositories_auto_merge DEFAULT 0,
         created_at         DATETIME2 NOT NULL CONSTRAINT DF_repositories_created DEFAULT SYSUTCDATETIME(),
         CONSTRAINT UQ_repositories_github_repo_id UNIQUE (github_repo_id),
         CONSTRAINT UQ_repositories_full_name UNIQUE (full_name)
     );
-END
-GO
-
-IF COL_LENGTH('dbo.repositories', 'is_auto_merge_enabled') IS NULL
-BEGIN
-    ALTER TABLE dbo.repositories ADD is_auto_merge_enabled BIT NOT NULL
-        CONSTRAINT DF_repositories_auto_merge DEFAULT 0;
 END
 GO
 
@@ -168,12 +160,21 @@ BEGIN
         user_id              UNIQUEIDENTIFIER NOT NULL,
         is_enabled           BIT NOT NULL CONSTRAINT DF_eligibility_enabled DEFAULT 0,
         max_risk_threshold   INT NOT NULL CONSTRAINT DF_eligibility_threshold DEFAULT 39,
+        policy_revision      BIGINT NOT NULL CONSTRAINT DF_eligibility_revision DEFAULT 0,
         updated_by           NVARCHAR(255) NULL,
         updated_at           DATETIME2 NOT NULL CONSTRAINT DF_eligibility_updated DEFAULT SYSUTCDATETIME(),
         CONSTRAINT FK_eligibility_repo FOREIGN KEY (repository_id) REFERENCES dbo.repositories(id),
         CONSTRAINT FK_eligibility_user FOREIGN KEY (user_id) REFERENCES dbo.users(id),
         CONSTRAINT UQ_eligibility_repo_user UNIQUE (repository_id, user_id)
     );
+END
+GO
+
+IF COL_LENGTH('dbo.auto_approval_eligibility', 'policy_revision') IS NULL
+BEGIN
+    ALTER TABLE dbo.auto_approval_eligibility
+        ADD policy_revision BIGINT NOT NULL
+            CONSTRAINT DF_eligibility_revision_upgrade DEFAULT 0;
 END
 GO
 
@@ -209,6 +210,7 @@ BEGIN
         github_review_state       NVARCHAR(32) NULL,
         github_action_confirmed   BIT NOT NULL CONSTRAINT DF_rv_gh_confirmed DEFAULT 0,
         auto_merge_status         NVARCHAR(48) NULL,
+        auto_merge_policy_revision BIGINT NULL,
         auto_merge_attempted_at   DATETIME2 NULL,
         auto_merged_at            DATETIME2 NULL,
         merge_commit_sha          NVARCHAR(64) NULL,
@@ -280,6 +282,11 @@ GO
 IF COL_LENGTH('dbo.reviews', 'auto_merge_status') IS NULL
 BEGIN
     ALTER TABLE dbo.reviews ADD auto_merge_status NVARCHAR(48) NULL;
+END
+GO
+IF COL_LENGTH('dbo.reviews', 'auto_merge_policy_revision') IS NULL
+BEGIN
+    ALTER TABLE dbo.reviews ADD auto_merge_policy_revision BIGINT NULL;
 END
 GO
 IF COL_LENGTH('dbo.reviews', 'auto_merge_attempted_at') IS NULL
@@ -486,6 +493,7 @@ BEGIN
         payload            NVARCHAR(MAX) NOT NULL,
         state              NVARCHAR(16) NOT NULL CONSTRAINT DF_jobs_state DEFAULT 'QUEUED',
         attempts           INT NOT NULL CONSTRAINT DF_jobs_attempts DEFAULT 0,
+        lease_token        BIGINT NOT NULL CONSTRAINT DF_jobs_lease_token DEFAULT 0,
         available_at       DATETIME2 NOT NULL CONSTRAINT DF_jobs_available DEFAULT SYSUTCDATETIME(),
         lease_until        DATETIME2 NULL,
         last_error         NVARCHAR(MAX) NULL,
@@ -496,6 +504,12 @@ BEGIN
     );
     CREATE INDEX IX_background_jobs_dispatch
         ON dbo.background_jobs(job_type, state, available_at);
+END
+GO
+IF COL_LENGTH('dbo.background_jobs', 'lease_token') IS NULL
+BEGIN
+    ALTER TABLE dbo.background_jobs ADD lease_token BIGINT NOT NULL
+        CONSTRAINT DF_jobs_lease_token_upgrade DEFAULT 0;
 END
 GO
 

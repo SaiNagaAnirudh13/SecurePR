@@ -2,10 +2,6 @@
   "name": "default",
   "version": 3,
   "description": "Dynamic GitHub CI discovery with no globally required check names.",
-  "auto_approval_risk_threshold": 39,
-  "auto_merge_allowed_risk_categories": [
-    "LOW"
-  ],
   "block_on_ci_failure": true,
   "blocked_paths": [
     "**/secrets/**",

@@ -6,6 +6,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
@@ -23,7 +24,7 @@ from sqlalchemy import (
     true,
 )
 from sqlalchemy import Enum as SAEnum
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.db import Base
 
@@ -85,9 +86,6 @@ class Repository(Base):
     )
     installation_id = Column(String(64))
     is_active = Column(Boolean, default=True, nullable=False, server_default=true())
-    is_auto_merge_enabled = Column(
-        Boolean, default=False, nullable=False, server_default=false()
-    )
     created_at = Column(
         DateTime, default=datetime.utcnow, nullable=False, server_default=func.now()
     )
@@ -224,6 +222,9 @@ class AutoApprovalEligibility(Base):
     max_risk_threshold = Column(
         Integer, default=39, nullable=False, server_default=text("39")
     )
+    policy_revision: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
     updated_by = Column(String(255))
     updated_at = Column(
         DateTime,
@@ -316,6 +317,10 @@ class Review(Base):
     ai_error_code = Column(String(64), nullable=True)
     ai_retryable_at = Column(DateTime, nullable=True)
     ai_attempt_id = Column(String(36), nullable=True)
+    ai_provider = Column(String(32), nullable=True)
+    ai_model = Column(String(128), nullable=True)
+    ai_input_tokens = Column(Integer, nullable=True)
+    ai_output_tokens = Column(Integer, nullable=True)
     ci_verified_at = Column(DateTime, nullable=True)
     circuit_breaker_active = Column(
         Boolean, default=False, nullable=False, server_default=false()
@@ -328,6 +333,9 @@ class Review(Base):
     # Kept separate from the immutable SecurePR decision: GitHub may reject a
     # merge for branch-protection, permissions, or a race after approval.
     auto_merge_status = Column(String(48), nullable=True)
+    auto_merge_policy_revision: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
     auto_merge_attempted_at = Column(DateTime, nullable=True)
     auto_merged_at = Column(DateTime, nullable=True)
     merge_commit_sha = Column(String(64), nullable=True)
@@ -377,6 +385,9 @@ class BackgroundJob(Base):
         String(16), nullable=False, default="QUEUED", server_default=text("'QUEUED'")
     )
     attempts = Column(Integer, nullable=False, default=0, server_default=text("0"))
+    lease_token = Column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
     available_at = Column(
         DateTime, nullable=False, default=datetime.utcnow, server_default=func.now()
     )

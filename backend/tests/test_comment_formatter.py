@@ -94,7 +94,7 @@ def test_failed_ci_status_comment_has_the_authoritative_blocked_decision():
         score_policy_compliance=5,
         github_action_confirmed=True,
         github_review_state="COMMENT",
-        auto_merge_status="DISABLED_GLOBAL",
+        auto_merge_status="DISABLED_DASHBOARD_CONFIGURATION",
         decision_reasons=[
             "Approval is blocked because CI failed for the reviewed revision."
         ],
@@ -194,14 +194,14 @@ def test_ai_failure_message_never_contains_fallback_risk_or_approval():
         ci_checks=[],
         ci_state="IN_PROGRESS",
         ai_state="AI_INVALID_RESPONSE",
-        ai_error_code="GEMINI_INVALID_RESPONSE",
+        ai_error_code="GROQ_INVALID_RESPONSE",
     )
 
     assert "SecurePR AI Review — **NOT COMPLETED**" in body
     assert "**Review Decision:** UNAVAILABLE" in body
     assert "**Risk Score:** Not Evaluated" in body
     assert "**CI Status:** ⏳ In progress" in body
-    assert "**Reason:** Gemini returned an invalid or incomplete response." in body
+    assert "**Reason:** Groq returned an invalid or incomplete response." in body
     assert "**No AI approval decision has been made.**" in body
     assert "Risk Breakdown" not in body
     assert "APPROVED" not in body

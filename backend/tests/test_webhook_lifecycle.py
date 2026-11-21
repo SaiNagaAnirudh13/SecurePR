@@ -104,6 +104,9 @@ def test_pull_request_events_queue_waiting_comment_idempotently_and_close_pr(
     monkeypatch.setattr(
         webhooks.settings, "GITHUB_WEBHOOK_SECRET", "test-webhook-secret"
     )
+    monkeypatch.setattr(
+        webhooks.auto_merge, "cancel_pending_auto_merge", lambda **kwargs: False
+    )
 
     first = _deliver(_payload(), "delivery-1", db_session)
     duplicate = _deliver(_payload(), "delivery-1", db_session)
@@ -151,6 +154,38 @@ def test_pull_request_events_queue_waiting_comment_idempotently_and_close_pr(
     )
     assert closed["status"] == "accepted"
     assert pr.state == "closed"
+
+
+def test_synchronize_does_not_queue_review_when_old_auto_merge_cannot_be_cancelled(
+    db_session, monkeypatch
+):
+    monkeypatch.setattr(
+        webhooks.settings, "GITHUB_WEBHOOK_SECRET", "test-webhook-secret"
+    )
+    monkeypatch.setattr(
+        webhooks.auto_merge, "cancel_pending_auto_merge", lambda **kwargs: False
+    )
+    _deliver(_payload(), "delivery-before-push", db_session)
+    monkeypatch.setattr(
+        webhooks.auto_merge,
+        "cancel_pending_auto_merge",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("GitHub unavailable")),
+    )
+
+    with pytest.raises(HTTPException) as unavailable:
+        _deliver(
+            _payload(action="synchronize", head_sha="new-sha"),
+            "delivery-cancel-failed",
+            db_session,
+        )
+
+    assert unavailable.value.status_code == 503
+    assert (
+        db_session.query(m.BackgroundJob)
+        .filter(m.BackgroundJob.idempotency_key.endswith(":new-sha"))
+        .count()
+        == 0
+    )
 
 
 def test_missing_installation_information_is_rejected(db_session, monkeypatch):

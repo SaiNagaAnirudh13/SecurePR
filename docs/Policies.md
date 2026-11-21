@@ -14,9 +14,7 @@ policy rules does not require application-code changes.
 
 | Field | Meaning |
 |---|---|
-| `auto_approval_risk_threshold` | Default maximum overall risk score for eligible authors. A per-author dashboard threshold may be lower. |
 | `block_on_ci_failure` | Legacy field retained for compatibility. CI failure always blocks approval; this setting cannot disable the hard CI gate. |
-| `auto_merge_allowed_risk_categories` | Risk categories eligible for repository auto-merge. Defaults to `LOW`; the global low-risk-only setting can further restrict it. |
 | `blocked_paths` | Glob patterns that create a hard policy violation when changed. |
 | `human_review_required_paths` | Glob patterns that route an otherwise-eligible change to manual review. |
 | `max_files_for_auto_approval` | Maximum changed-file count eligible for automatic approval. |
@@ -57,12 +55,12 @@ blocks regardless of `block_on_ci_failure`. CI transitions reconcile the
 decision for that revision; if a prior SecurePR approval is no longer valid,
 SecurePR attempts to dismiss it and records the outcome.
 
-Auto-merge is separately guarded and remains disabled by default. It requires
-a fresh live CI re-check in which at least one execution exists and every
-discovered and required check is `PASSED`, plus the exact reviewed SHA,
-GitHub auto-merge setting, configured method, App permissions, and GitHub
-review/branch-protection eligibility. SecurePR requests GitHub's protected
-auto-merge; it does not invoke the immediate merge endpoint.
+Auto-merge is authorized only by the saved dashboard configuration for the
+exact GitHub account and repository. It requires validated AI analysis, the
+exact current reviewed SHA, a fresh live CI re-check in which every discovered
+and required check is `PASSED`, GitHub's auto-merge setting, configured
+method, App permissions, and GitHub review/branch-protection eligibility.
+Policy files cannot independently enable or alter this authorization.
 
 ## Conditions that prevent automatic approval
 

@@ -75,6 +75,24 @@ def postgres_migration_database():
         )
         connection.exec_driver_sql(
             """
+            CREATE TABLE background_jobs (
+                id VARCHAR(36) PRIMARY KEY,
+                job_type VARCHAR(32) NOT NULL,
+                state VARCHAR(16) NOT NULL DEFAULT 'QUEUED'
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE auto_approval_eligibility (
+                id VARCHAR(36) PRIMARY KEY,
+                is_enabled BOOLEAN NOT NULL DEFAULT false,
+                max_risk_threshold INTEGER NOT NULL DEFAULT 39
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            """
             CREATE TABLE ci_revisions (
                 id VARCHAR(36) PRIMARY KEY
             )
@@ -114,6 +132,19 @@ def postgres_migration_database():
             text(
                 "INSERT INTO reviews (id, decision, lifecycle_state) "
                 "VALUES ('existing-review', 'PENDING', 'RECEIVED')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO background_jobs (id, job_type, state) "
+                "VALUES ('existing-job', 'REVIEW', 'QUEUED')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO auto_approval_eligibility "
+                "(id, is_enabled, max_risk_threshold) "
+                "VALUES ('existing-policy', true, 39)"
             )
         )
 
@@ -178,6 +209,21 @@ def test_postgres_migration_adds_columns_and_preserves_existing_pr(
             "SELECT decision, lifecycle_state FROM reviews WHERE id = 'existing-review'"
         )
     ).one() == ("PENDING", "RECEIVED")
+    assert (
+        connection.execute(
+            text("SELECT lease_token FROM background_jobs WHERE id = 'existing-job'")
+        ).scalar_one()
+        == 0
+    )
+    assert (
+        connection.execute(
+            text(
+                "SELECT policy_revision FROM auto_approval_eligibility "
+                "WHERE id = 'existing-policy'"
+            )
+        ).scalar_one()
+        == 0
+    )
     state_lengths = connection.execute(
         text(
             "SELECT column_name, character_maximum_length "
@@ -290,6 +336,23 @@ def test_postgres_migration_rerun_is_safe(postgres_migration_database):
             )
         ).scalar_one()
         == 6
+    )
+    assert (
+        connection.execute(
+            text(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND ((table_name = 'reviews' AND column_name = 'auto_merge_policy_revision') "
+                "OR (table_name = 'auto_approval_eligibility' AND column_name = 'policy_revision'))"
+            )
+        ).scalar_one()
+        == 2
+    )
+    assert (
+        connection.execute(
+            text("SELECT lease_token FROM background_jobs WHERE id = 'existing-job'")
+        ).scalar_one()
+        == 0
     )
 
 

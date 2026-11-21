@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ReviewSummary(BaseModel):
@@ -19,10 +19,9 @@ class ReviewSummary(BaseModel):
 
 class EligibilityUpdate(BaseModel):
     repository_id: str
-    user_login: str
+    user_login: str = Field(min_length=1, max_length=39)
     is_enabled: bool
-    max_risk_threshold: int = 39
-    updated_by: str = "dashboard"
+    max_risk_threshold: int = Field(default=39, ge=0, le=100)
 
 
 class CircuitBreakerTripRequest(BaseModel):
@@ -44,8 +43,3 @@ class CircuitBreakerResumeRequest(BaseModel):
 class ReevaluateRequest(BaseModel):
     pull_request_id: str
     actor: str = "dashboard"
-
-
-class RepositoryAutoMergeUpdate(BaseModel):
-    repository_id: str
-    is_enabled: bool

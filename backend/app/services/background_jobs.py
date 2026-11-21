@@ -12,25 +12,52 @@ from app.models import models as m
 
 logger = logging.getLogger("securepr.jobs")
 
-JOB_TYPES = ("REVIEW", "CI_REFRESH", "CI_NOTIFY", "REVIEW_STATUS")
+JOB_TYPES = ("REVIEW", "CI_REFRESH", "CI_NOTIFY", "REVIEW_STATUS", "AUTO_MERGE_CANCEL")
 MAX_ATTEMPTS = 5
 LEASE_SECONDS = 300
 POLL_SECONDS = 1
 NON_RETRYABLE_DATABASE_ERRORS = (DataError, IntegrityError, ProgrammingError)
 
 
-def _record_job_failure(db, job, exc: Exception) -> None:
+def _record_job_failure(
+    db, job, exc: Exception, *, expected_lease_token: int | None = None
+) -> bool:
     non_retryable_database_error = isinstance(exc, NON_RETRYABLE_DATABASE_ERRORS)
-    job.last_error = str(exc)[:4000]
-    job.lease_until = None
-    job.updated_at = datetime.utcnow()
+    now = datetime.utcnow()
     if job.attempts >= MAX_ATTEMPTS or non_retryable_database_error:
-        job.state = "FAILED"
+        state = "FAILED"
+        available_at = job.available_at
     else:
-        job.state = "QUEUED"
+        state = "QUEUED"
         delay = min(2**job.attempts, 60)
-        job.available_at = datetime.utcnow() + timedelta(seconds=delay)
+        available_at = now + timedelta(seconds=delay)
+    if expected_lease_token is None:
+        job.last_error = str(exc)[:4000]
+        job.lease_until = None
+        job.updated_at = now
+        job.state = state
+        job.available_at = available_at
+    else:
+        result = db.execute(
+            update(m.BackgroundJob)
+            .where(
+                m.BackgroundJob.id == job.id,
+                m.BackgroundJob.state == "RUNNING",
+                m.BackgroundJob.lease_token == expected_lease_token,
+            )
+            .values(
+                state=state,
+                last_error=str(exc)[:4000],
+                lease_until=None,
+                available_at=available_at,
+                updated_at=now,
+            )
+        )
+        if result.rowcount != 1:
+            db.rollback()
+            return False
     db.commit()
+    return True
 
 
 def enqueue_job(
@@ -153,6 +180,7 @@ class _Worker:
             .values(
                 state="RUNNING",
                 attempts=m.BackgroundJob.attempts + 1,
+                lease_token=m.BackgroundJob.lease_token + 1,
                 lease_until=now + timedelta(seconds=LEASE_SECONDS),
                 updated_at=now,
             )
@@ -168,13 +196,24 @@ class _Worker:
         from app.services import pipeline
 
         if self.job_type == "REVIEW":
-            pipeline.process_review_job(db, job.payload)
+            payload = dict(job.payload or {})
+            payload["_job_id"] = job.id
+            payload["_retry_count"] = max(job.attempts - 1, 0)
+            pipeline.process_review_job(db, payload)
         elif self.job_type == "CI_REFRESH":
             pipeline.process_ci_refresh_job(db, job.payload)
         elif self.job_type == "CI_NOTIFY":
             pipeline.process_ci_notification_job(db, job.payload)
         elif self.job_type == "REVIEW_STATUS":
-            pipeline.process_review_status_job(db, job.payload)
+            payload = dict(job.payload or {})
+            payload["_job_id"] = job.id
+            payload["_retry_count"] = max(job.attempts - 1, 0)
+            pipeline.process_review_status_job(db, payload)
+        elif self.job_type == "AUTO_MERGE_CANCEL":
+            payload = dict(job.payload or {})
+            payload["_job_id"] = job.id
+            payload["_retry_count"] = max(job.attempts - 1, 0)
+            pipeline.process_auto_merge_cancel_job(db, payload)
 
     def _log_job(self, db, job, status: str, failure_reason: str | None = None) -> None:
         payload = job.payload or {}
@@ -250,7 +289,7 @@ class _Worker:
             .filter(
                 m.Evidence.review_id == review.id,
                 m.Evidence.evidence_type == "error",
-                m.Evidence.source == "gemini",
+                m.Evidence.source == "ai_provider",
             )
             .first()
         )
@@ -259,6 +298,25 @@ class _Worker:
             if evidence
             else "AI analysis failed; manual review required."
         )
+
+    def _ai_retry_at(self, db, job) -> datetime | None:
+        if job.job_type != "REVIEW":
+            return None
+        payload = job.payload or {}
+        pr = (
+            db.query(m.PullRequest)
+            .filter(m.PullRequest.id == payload.get("pull_request_id"))
+            .first()
+        )
+        if (
+            not pr
+            or pr.head_sha != payload.get("head_sha")
+            or pr.ai_state != "AI_UNAVAILABLE"
+            or pr.ai_retryable_at is None
+            or pr.ai_retryable_at <= datetime.utcnow()
+        ):
+            return None
+        return pr.ai_retryable_at
 
     def _run(self):
         session_factory = get_session_factory()
@@ -270,16 +328,73 @@ class _Worker:
                     db.close()
                     self._stop.wait(POLL_SECONDS)
                     continue
+                claimed_lease_token = job.lease_token
                 try:
                     self._log_job(db, job, "RUNNING")
                     self._run_job(db, job)
+                    db.refresh(job)
+                    if job.state != "RUNNING" or job.lease_token != claimed_lease_token:
+                        logger.warning(
+                            "Discarded completed work from a stale job lease: "
+                            "job_id=%s lease_token=%s current_lease_token=%s "
+                            "job_state=%s",
+                            job.id,
+                            claimed_lease_token,
+                            job.lease_token,
+                            job.state,
+                            extra={
+                                "job_id": job.id,
+                                "lease_token": claimed_lease_token,
+                                "current_lease_token": job.lease_token,
+                                "job_state": job.state,
+                            },
+                        )
+                        self._log_job(db, job, "STALE_WORKER")
+                        continue
                     failure_reason = self._analysis_failure_reason(db, job)
-                    job.state = "COMPLETED"
-                    job.last_error = None
-                    job.lease_until = None
-                    job.updated_at = datetime.utcnow()
+                    retry_at = self._ai_retry_at(db, job)
+                    values: dict[str, object] = {
+                        "state": "QUEUED" if retry_at else "COMPLETED",
+                        "last_error": failure_reason if retry_at else None,
+                        "lease_until": None,
+                        "updated_at": datetime.utcnow(),
+                    }
+                    if retry_at:
+                        values["attempts"] = 0
+                        values["available_at"] = retry_at
+                    completed = db.execute(
+                        update(m.BackgroundJob)
+                        .where(
+                            m.BackgroundJob.id == job.id,
+                            m.BackgroundJob.state == "RUNNING",
+                            m.BackgroundJob.lease_token == claimed_lease_token,
+                        )
+                        .values(**values)
+                    )
+                    if completed.rowcount != 1:
+                        db.rollback()
+                        job = (
+                            db.query(m.BackgroundJob)
+                            .filter(m.BackgroundJob.id == job.id)
+                            .first()
+                        )
+                        if job:
+                            self._log_job(db, job, "STALE_WORKER")
+                        continue
                     db.commit()
-                    self._log_job(db, job, "COMPLETED", failure_reason)
+                    job = (
+                        db.query(m.BackgroundJob)
+                        .filter(m.BackgroundJob.id == job.id)
+                        .first()
+                    )
+                    if not job:
+                        raise RuntimeError("Completed background job disappeared.")
+                    self._log_job(
+                        db,
+                        job,
+                        "RESCHEDULED" if retry_at else "COMPLETED",
+                        failure_reason,
+                    )
                 except Exception as exc:
                     db.rollback()
                     job = (
@@ -287,8 +402,37 @@ class _Worker:
                         .filter(m.BackgroundJob.id == job.id)
                         .first()
                     )
-                    if job:
-                        _record_job_failure(db, job, exc)
+                    failure_recorded = bool(
+                        job
+                        and _record_job_failure(
+                            db,
+                            job,
+                            exc,
+                            expected_lease_token=claimed_lease_token,
+                        )
+                    )
+                    job = (
+                        db.query(m.BackgroundJob)
+                        .filter(m.BackgroundJob.id == job.id)
+                        .first()
+                        if job
+                        else None
+                    )
+                    if not failure_recorded and job:
+                        logger.warning(
+                            "Discarded failure from a stale job lease: job_id=%s "
+                            "lease_token=%s current_lease_token=%s job_state=%s",
+                            job.id,
+                            claimed_lease_token,
+                            job.lease_token,
+                            job.state,
+                            extra={
+                                "job_id": job.id,
+                                "lease_token": claimed_lease_token,
+                                "current_lease_token": job.lease_token,
+                                "job_state": job.state,
+                            },
+                        )
                     logger.exception(
                         "Background job failed%s",
                         " with a non-retryable database error"

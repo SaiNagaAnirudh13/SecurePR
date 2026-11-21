@@ -140,18 +140,23 @@ For at least one PR from the scenarios above, open the actual comment on GitHub 
 
 ## 9. Auto-merge scenarios
 
-Only in a disposable test environment, enable `AUTO_MERGE_ENABLED=true`,
-restart the backend, and opt in only the test repository using the dashboard
-or the documented database setting. Production stays disabled unless the
-approved deployment configuration says otherwise.
+Only in a disposable test environment, save an enabled account/repository
+configuration with a deliberate risk threshold in the dashboard. The saved
+dashboard configuration is the only user authorization source; do not use
+environment variables or direct database edits to enable auto-approval or
+auto-merge. Production remains disabled until its dashboard configuration and
+all backend safety gates are verified.
 
 - A: low risk + all discovered and required checks passed: expect SecurePR to request GitHub auto-merge, and report it enabled only after GitHub confirms.
-- B: disable the SecurePR global or repository flag: expect the exact SecurePR-disabled status and no GitHub request.
+- B: disable or remove the saved dashboard configuration: expect the exact dashboard-disabled/missing status and no GitHub request.
 - C: configure GitHub repository auto-merge off: expect `GITHUB_AUTO_MERGE_DISABLED`.
 - D: remove required GitHub App permissions: expect `PERMISSION_MISSING` with the API reason and no merge request.
 - E: CI pending/failed, required review missing, branch protection blocked, or configured method unavailable: expect the exact blocker and no request.
 - F: simulate a GitHub rejection of the GraphQL mutation: expect failure recorded accurately; do not report enabled or merged.
 - G: verify `MERGED` appears only after GitHub confirms the merge through a webhook.
+- H: disable stale-approval dismissal on the base branch: expect branch-protection failure and no auto-merge request.
+- I: push a new head during auto-merge activation: expect a verified cancellation; if cancellation cannot be verified, expect an explicit failure and no success status.
+- J: make cancellation fail on a `synchronize` webhook: expect a retryable 503 and no review job for the new head.
 
 Run automated tests with `cd backend; venv\Scripts\python -m pytest`.
 

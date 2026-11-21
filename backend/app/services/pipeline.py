@@ -7,15 +7,19 @@ import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Iterator
+from typing import Iterator, cast
 
-from sqlalchemy import text
+import requests
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
+from sqlalchemy.pool import NullPool
 
 from app.core.config import get_settings
-from app.integrations.gemini_client import gemini_client
+from app.integrations.ai_provider import AIAnalysisResult, AIInvalidResponse
 from app.integrations.github_client import github_client
+from app.integrations.groq_client import groq_client
 from app.models import models as m
 from app.services import (
     auto_merge,
@@ -33,17 +37,52 @@ from app.services.comment_formatter import (
 )
 
 logger = logging.getLogger("securepr.pipeline")
+CI_FETCH_ERRORS = (
+    requests.RequestException,
+    TimeoutError,
+    ValueError,
+    RuntimeError,
+)
 settings = get_settings()
 
 _fallback_revision_locks: dict[tuple[str, int], threading.RLock] = {}
 _fallback_revision_locks_guard = threading.Lock()
+_dedicated_lock_engine = None
+_dedicated_lock_engine_guard = threading.Lock()
+LOCK_WAIT_SECONDS = 10
+LOCK_POLL_SECONDS = 0.1
+
+
+class RevisionLockUnavailable(TimeoutError):
+    """Raised when another worker owns the revision lock beyond the wait budget."""
+
+
+def _lock_engine(db: Session):
+    global _dedicated_lock_engine
+    with _dedicated_lock_engine_guard:
+        if _dedicated_lock_engine is None:
+            bind = db.get_bind()
+            database_url = bind.url if isinstance(bind, Engine) else bind.engine.url
+            _dedicated_lock_engine = create_engine(
+                database_url,
+                poolclass=NullPool,
+                pool_pre_ping=True,
+                future=True,
+            )
+        return _dedicated_lock_engine
 
 
 @contextmanager
 def _revision_finalization_lock(
-    db: Session, repository_id: str, pr_number: int
+    db: Session,
+    repository_id: str,
+    pr_number: int,
+    *,
+    head_sha: str | None = None,
+    job_id: str | None = None,
+    retry_count: int = 0,
 ) -> Iterator[None]:
-    """Serialize review creation/publication for one PR across app workers."""
+    """Serialize a PR revision without retaining a pooled connection or transaction."""
     lock_key = (repository_id, pr_number)
     dialect = db.get_bind().dialect.name
     if dialect not in ("mssql", "postgresql"):
@@ -59,8 +98,20 @@ def _revision_finalization_lock(
         f"{repository_id}:{pr_number}".encode("utf-8")
     ).hexdigest()
     resource = f"securepr:review:{resource_id}"
-    connection = db.get_bind().connect()
+    connection = (
+        _lock_engine(db).connect().execution_options(isolation_level="AUTOCOMMIT")
+    )
     acquired = False
+    acquisition_result = "error"
+    release_result = "not_acquired"
+    started = time.monotonic()
+    fields = {
+        "repository_id": repository_id,
+        "pr_number": pr_number,
+        "head_sha": head_sha or "unknown",
+        "job_id": job_id or "unknown",
+        "retry_count": retry_count,
+    }
     try:
         if dialect == "postgresql":
             resource_key = int.from_bytes(
@@ -68,11 +119,22 @@ def _revision_finalization_lock(
                 byteorder="big",
                 signed=True,
             )
-            connection.execute(text("SET LOCAL lock_timeout = '30s'"))
-            connection.execute(
-                text("SELECT pg_advisory_lock(:resource_key)"),
-                {"resource_key": resource_key},
-            )
+            deadline = started + LOCK_WAIT_SECONDS
+            while True:
+                acquired = bool(
+                    connection.execute(
+                        text("SELECT pg_try_advisory_lock(:resource_key)"),
+                        {"resource_key": resource_key},
+                    ).scalar_one()
+                )
+                if acquired or time.monotonic() >= deadline:
+                    break
+                time.sleep(LOCK_POLL_SECONDS)
+            acquisition_result = "acquired" if acquired else "timeout"
+            if not acquired:
+                raise RevisionLockUnavailable(
+                    "Timed out waiting for the PR revision finalization lock."
+                )
         else:
             result = connection.execute(
                 text(
@@ -82,28 +144,69 @@ def _revision_finalization_lock(
                         @Resource = :resource,
                         @LockMode = 'Exclusive',
                         @LockOwner = 'Session',
-                        @LockTimeout = 30000;
+                        @LockTimeout = 10000;
                     SELECT @lock_result;
                     """
                 ),
                 {"resource": resource},
             ).scalar()
             if result is None or result < 0:
+                acquisition_result = "timeout"
                 raise RuntimeError(
                     f"Could not acquire PR review lock (sp_getapplock={result})"
                 )
-        acquired = True
+            acquired = True
+            acquisition_result = "acquired"
+        logger.info(
+            "PR revision lock acquired: repository_id=%(repository_id)s "
+            "pr_number=%(pr_number)s head_sha=%(head_sha)s job_id=%(job_id)s "
+            "wait_duration_ms=%(wait_duration_ms)s acquisition_result=%(acquisition_result)s "
+            "retry_count=%(retry_count)s",
+            {
+                **fields,
+                "wait_duration_ms": round((time.monotonic() - started) * 1000),
+                "acquisition_result": acquisition_result,
+            },
+            extra={
+                **fields,
+                "wait_duration_ms": round((time.monotonic() - started) * 1000),
+                "acquisition_result": acquisition_result,
+            },
+        )
         yield
+    except Exception:
+        if not acquired:
+            logger.exception(
+                "PR revision lock acquisition failed: repository_id=%s pr_number=%s "
+                "head_sha=%s job_id=%s wait_duration_ms=%s acquisition_result=%s retry_count=%s",
+                repository_id,
+                pr_number,
+                head_sha or "unknown",
+                job_id or "unknown",
+                round((time.monotonic() - started) * 1000),
+                acquisition_result,
+                retry_count,
+                extra={
+                    **fields,
+                    "wait_duration_ms": round((time.monotonic() - started) * 1000),
+                    "acquisition_result": acquisition_result,
+                },
+            )
+        raise
     finally:
         if acquired:
             try:
                 if dialect == "postgresql":
-                    connection.execute(
+                    unlocked = connection.execute(
                         text("SELECT pg_advisory_unlock(:resource_key)"),
                         {"resource_key": resource_key},
-                    )
+                    ).scalar_one()
+                    if not unlocked:
+                        raise RuntimeError(
+                            "PostgreSQL reported that this connection did not own the PR lock."
+                        )
                 else:
-                    connection.execute(
+                    released = connection.execute(
                         text(
                             """
                             DECLARE @lock_result int;
@@ -114,14 +217,49 @@ def _revision_finalization_lock(
                             """
                         ),
                         {"resource": resource},
-                    )
+                    ).scalar()
+                    if released is None or released < 0:
+                        raise RuntimeError(
+                            f"SQL Server failed to release the PR lock: {released}"
+                        )
+                release_result = "released"
             except Exception:
+                release_result = "failed_connection_invalidated"
+                connection.invalidate()
                 logger.exception(
-                    "PR review lock release failed: repository_id=%s pr_number=%s",
+                    "PR revision lock release failed: repository_id=%s pr_number=%s "
+                    "head_sha=%s job_id=%s release_result=%s retry_count=%s",
                     repository_id,
                     pr_number,
+                    head_sha or "unknown",
+                    job_id or "unknown",
+                    release_result,
+                    retry_count,
+                    extra={
+                        **fields,
+                        "release_result": release_result,
+                    },
                 )
         connection.close()
+        logger.info(
+            "PR revision lock released: repository_id=%s pr_number=%s head_sha=%s "
+            "job_id=%s wait_duration_ms=%s acquisition_result=%s release_result=%s "
+            "retry_count=%s",
+            repository_id,
+            pr_number,
+            head_sha or "unknown",
+            job_id or "unknown",
+            round((time.monotonic() - started) * 1000),
+            acquisition_result,
+            release_result,
+            retry_count,
+            extra={
+                **fields,
+                "wait_duration_ms": round((time.monotonic() - started) * 1000),
+                "acquisition_result": acquisition_result,
+                "release_result": release_result,
+            },
+        )
 
 
 def _log_analysis_timing(
@@ -144,6 +282,49 @@ def _log_analysis_timing(
             "head_sha": pr.head_sha,
         },
     )
+
+
+def _queue_current_revision(
+    db: Session,
+    repo: m.Repository,
+    pr: m.PullRequest,
+    installation_id: str,
+    head_sha: str,
+) -> None:
+    pr.head_sha = head_sha
+    pr.ai_state = "AI_PENDING"
+    pr.ai_error_code = None
+    pr.ai_retryable_at = None
+    pr.ai_attempt_id = None
+    pr.updated_at = datetime.utcnow()  # noqa: DTZ003
+    db.commit()
+    _ci_revision(db, repo, pr, head_sha)
+    enqueue_job(
+        db,
+        "REVIEW",
+        f"review:{repo.id}:{pr.id}:{head_sha}",
+        {
+            "repository_id": repo.id,
+            "pull_request_id": pr.id,
+            "installation_id": installation_id,
+            "head_sha": head_sha,
+        },
+    )
+    enqueue_job(
+        db,
+        "CI_REFRESH",
+        f"ci-initial:{repo.id}:{pr.id}:{head_sha}",
+        {
+            "repository_id": repo.id,
+            "pull_request_id": pr.id,
+            "installation_id": installation_id,
+            "head_sha": head_sha,
+            "event_name": "pull_request",
+            "reason": "initial",
+        },
+    )
+    _queue_review_status_update(db, repo, pr, head_sha)
+    db.commit()
 
 
 def _get_or_create_policy_row(db: Session, repo: m.Repository, policy_doc: dict) -> str:
@@ -288,7 +469,7 @@ def _queue_review_status_update(
         .filter(
             m.Review.pull_request_id == pr.id,
             m.Review.head_sha == head_sha,
-            m.Review.is_ci_wait_placeholder == False,  # noqa: E712
+            m.Review.is_ci_wait_placeholder == False,
         )
         .order_by(m.Review.created_at.desc())
         .first()
@@ -418,6 +599,7 @@ def _refresh_ci_before_approval(
 ) -> ci_status.CIStatus:
     """Refresh GitHub's exact-revision CI state before calculating a decision."""
     owner, repo_name = repo.full_name.split("/", 1)
+    db.commit()
     try:
         checks, required_checks, errors = _fetch_ci_checks(
             installation_id,
@@ -426,7 +608,7 @@ def _refresh_ci_before_approval(
             revision.head_sha,
             pr.base_branch,
         )
-    except Exception as exc:
+    except CI_FETCH_ERRORS as exc:
         logger.exception(
             "Final CI verification failed before decision: repository=%s pr=%s sha=%s",
             repo.full_name,
@@ -524,12 +706,13 @@ def _publish_existing_review(
         )
         .first()
     )
+    review_id = review.id
     if not body_row:
         raise RuntimeError(
-            f"Review {review.id} has no persisted GitHub publication body."
+            f"Review {review_id} has no persisted GitHub publication body."
         )
     if review.github_review_state not in ("APPROVE", "COMMENT", "REQUEST_CHANGES"):
-        raise RuntimeError(f"Review {review.id} has no valid GitHub review event.")
+        raise RuntimeError(f"Review {review_id} has no valid GitHub review event.")
 
     if review.github_review_state == "APPROVE":
         revision = _ci_revision(db, repo, pr, review.head_sha)
@@ -545,25 +728,38 @@ def _publish_existing_review(
     publication_type = f"FINAL_{review.decision.value}_{review.id}"
     marker = f"<!-- securepr-review:{pr.id}:{review.head_sha}:{review.decision.value}:{review.id} -->"
     owner, repo_name = repo.full_name.split("/", 1)
+    pr_number = pr.github_pr_number
     publication = _publication(db, repo, pr, review.head_sha, publication_type, marker)
     if publication.state == "PUBLISHED":
         return
+    body = body_row.content
+    review_event = review.github_review_state
+    review_head_sha = review.head_sha
+    db.commit()
     try:
+        live_pr = github_client.get_pull_request(
+            installation_id, owner, repo_name, pr_number
+        )
+        if live_pr.get("state") != "open" or live_pr.get("head_sha") != review_head_sha:
+            latest_sha = live_pr.get("head_sha")
+            if isinstance(latest_sha, str) and latest_sha and latest_sha != pr.head_sha:
+                _queue_current_revision(db, repo, pr, installation_id, latest_sha)
+            return
         result = github_client.post_review(
             installation_id,
             owner,
             repo_name,
-            pr.github_pr_number,
-            body_row.content,
-            review.github_review_state,
+            pr_number,
+            body,
+            review_event,
             idempotency_marker=marker,
-            commit_id=review.head_sha,
+            commit_id=review_head_sha,
         )
         db.add(
             m.GithubAction(
-                review_id=review.id,
+                review_id=review_id,
                 action_type="submit_review",
-                request_payload={"event": review.github_review_state, "marker": marker},
+                request_payload={"event": review_event, "marker": marker},
                 response_status=result.get("status_code"),
                 response_payload=result.get("payload")
                 if isinstance(result.get("payload"), dict)
@@ -576,13 +772,13 @@ def _publish_existing_review(
         db.commit()
         if not review.github_action_confirmed:
             raise RuntimeError(
-                f"GitHub rejected review publication for review {review.id}."
+                f"GitHub rejected review publication for review {review_id}."
             )
         if review.github_action_confirmed:
             _queue_late_ci_failures(db, repo, pr, review)
     except Exception:
         db.rollback()
-        logger.exception("Failed to publish AI review: review_id=%s", review.id)
+        logger.exception("Failed to publish AI review: review_id=%s", review_id)
         raise
 
 
@@ -607,18 +803,22 @@ def _dismiss_review_approval(
     if not publication or not publication.github_message_id:
         return "The prior GitHub review could not be located for dismissal."
     owner, repo_name = repo.full_name.split("/", 1)
+    pr_number = pr.github_pr_number
+    review_id = review.id
+    github_message_id = publication.github_message_id
+    db.commit()
     try:
         result = github_client.dismiss_review(
             installation_id,
             owner,
             repo_name,
-            pr.github_pr_number,
-            publication.github_message_id,
+            pr_number,
+            github_message_id,
             "SecurePR verification changed; this review no longer reflects the current CI decision.",
         )
-    except Exception as exc:
+    except CI_FETCH_ERRORS as exc:
         logger.exception(
-            "Could not dismiss stale SecurePR review: review_id=%s", review.id
+            "Could not dismiss stale SecurePR review: review_id=%s", review_id
         )
         result = {
             "succeeded": False,
@@ -656,10 +856,22 @@ def run_analysis(
     expected_head_sha: str | None = None,
     trigger: str = "analysis",
     event_name: str | None = None,
+    job_id: str | None = None,
+    retry_count: int = 0,
 ) -> m.Review | None:
     """Run AI analysis for one revision without waiting on any CI operation."""
-    repository_id, pull_request_id, pr_number = repo.id, pr.id, pr.github_pr_number
-    with _revision_finalization_lock(db, repository_id, pr_number):
+    repository_id = cast(str, repo.id)
+    pull_request_id = cast(str, pr.id)
+    pr_number = cast(int, pr.github_pr_number)
+    with _revision_finalization_lock(
+        db,
+        repository_id,
+        pr_number,
+        head_sha=cast(str | None, expected_head_sha or pr.head_sha),
+        job_id=job_id,
+        retry_count=retry_count,
+    ):
+        db.commit()
         db.expire_all()
         current_pr = (
             db.query(m.PullRequest).filter(m.PullRequest.id == pull_request_id).first()
@@ -724,17 +936,38 @@ def run_analysis(
                     )
                 )
                 if should_reconcile:
+                    db.commit()
                     return _run_analysis_locked(
                         db,
                         current_repo,
                         current_pr,
                         installation_id,
                         is_reevaluation=True,
-                        previous_review_id=existing.id,
+                        previous_review_id=cast(str, existing.id),
                         trigger="ci_reconciliation",
+                        job_id=job_id,
+                        retry_count=retry_count,
+                    )
+                if (
+                    existing.ai_state == "AI_UNAVAILABLE"
+                    and existing.ai_retryable_at is not None
+                    and existing.ai_retryable_at <= datetime.utcnow()
+                ):
+                    db.commit()
+                    return _run_analysis_locked(
+                        db,
+                        current_repo,
+                        current_pr,
+                        installation_id,
+                        is_reevaluation=True,
+                        previous_review_id=cast(str, existing.id),
+                        trigger="provider_retry",
+                        job_id=job_id,
+                        retry_count=retry_count,
                     )
                 if existing.decision == m.DecisionStatus.WAITING_FOR_CI:
                     return existing
+                db.commit()
                 _publish_existing_review(
                     db, current_repo, current_pr, installation_id, existing
                 )
@@ -745,9 +978,11 @@ def run_analysis(
             current_pr,
             installation_id,
             is_reevaluation=is_reevaluation,
-            previous_review_id=previous_review_id,
+            previous_review_id=cast(str | None, previous_review_id),
             trigger=trigger,
             event_name=event_name,
+            job_id=job_id,
+            retry_count=retry_count,
         )
 
 
@@ -761,13 +996,18 @@ def _run_analysis_locked(
     previous_review_id: str | None = None,
     trigger: str = "analysis",
     event_name: str | None = None,
+    job_id: str | None = None,
+    retry_count: int = 0,
 ) -> m.Review | None:
     started_clock = time.perf_counter()
     started_at = datetime.utcnow()
-    owner, repo_name = repo.full_name.split("/", 1)
+    repository_full_name = repo.full_name
+    pr_number = cast(int, pr.github_pr_number)
+    db.commit()
+    owner, repo_name = repository_full_name.split("/", 1)
     try:
         live_pr = github_client.get_pull_request(
-            installation_id, owner, repo_name, pr.github_pr_number
+            installation_id, owner, repo_name, pr_number
         )
     except Exception:
         logger.exception(
@@ -792,14 +1032,41 @@ def _run_analysis_locked(
             pr.head_sha,
             live_sha,
         )
-        pr.head_sha = live_sha
-        pr.ai_state = "AI_PENDING"
-        pr.ai_error_code = None
-        pr.ai_retryable_at = None
-        pr.ai_attempt_id = None
-        pr.updated_at = datetime.utcnow()
-        db.commit()
+        _queue_current_revision(db, repo, pr, installation_id, live_sha)
         return None
+
+    stale_auto_merge = (
+        db.query(m.Review.id)
+        .filter(
+            m.Review.pull_request_id == pr.id,
+            m.Review.head_sha != pr.head_sha,
+            m.Review.github_review_state == "APPROVE",
+            m.Review.github_action_confirmed == True,  # noqa: E712
+        )
+        .first()
+    )
+    db.commit()
+    if stale_auto_merge:
+        owner, repo_name = repository_full_name.split("/", 1)
+        try:
+            auto_merge.cancel_pending_auto_merge(
+                installation_id=installation_id,
+                owner=owner,
+                repo_name=repo_name,
+                pr_number=pr_number,
+                db=db,
+                pull_request_id=cast(str, pr.id),
+                new_head_sha=cast(str | None, pr.head_sha),
+            )
+        except Exception:
+            logger.exception(
+                "Could not reconcile auto-merge before processing a newer PR "
+                "revision: repository=%s pr_number=%s head_sha=%s",
+                repository_full_name,
+                pr_number,
+                pr.head_sha,
+            )
+            raise
 
     policy_doc = policy_engine.load_repo_policy(repo.full_name)
     policy_id = _get_or_create_policy_row(db, repo, policy_doc)
@@ -816,6 +1083,7 @@ def _run_analysis_locked(
         required_checks=revision.required_checks,
     )
     if ci_evaluation.state == "PASSED":
+        db.commit()
         ci_evaluation = _refresh_ci_before_approval(
             db, repo, pr, installation_id, revision
         )
@@ -827,6 +1095,7 @@ def _run_analysis_locked(
     analysis_ci_state = ci_evaluation.state
     analysis_complete = True
     changed_files_error = None
+    db.commit()
     try:
         changed_files = github_client.get_pr_files(
             installation_id, owner, repo_name, pr.github_pr_number
@@ -860,15 +1129,54 @@ def _run_analysis_locked(
     ai_scores = None
     ai_analysis_error = None
     ai_error_code = None
+    ai_provider_name = "groq"
+    ai_model_name = settings.GROQ_MODEL
+    ai_input_tokens = None
+    ai_output_tokens = None
     if analysis_complete:
+        ai_started = time.perf_counter()
         try:
-            ai_scores = gemini_client.score_dimensions(changed_files)
+            provider_result = groq_client.score_dimensions(changed_files)
+            if not isinstance(provider_result, AIAnalysisResult):
+                raise AIInvalidResponse("The AI provider returned an invalid result.")
+            ai_scores = provider_result.analysis
+            ai_provider_name = provider_result.provider
+            ai_model_name = provider_result.model
+            ai_input_tokens = provider_result.input_tokens
+            ai_output_tokens = provider_result.output_tokens
+            logger.info(
+                "AI review completed: provider=%s model=%s repository=%s "
+                "pr_number=%s head_sha=%s job_id=%s input_tokens=%s "
+                "output_tokens=%s duration_ms=%s retry_count=%s",
+                ai_provider_name,
+                ai_model_name,
+                repo.full_name,
+                pr.github_pr_number,
+                pr.head_sha,
+                job_id or "unknown",
+                ai_input_tokens,
+                ai_output_tokens,
+                round((time.perf_counter() - ai_started) * 1000),
+                retry_count,
+                extra={
+                    "provider": ai_provider_name,
+                    "model": ai_model_name,
+                    "repository": repo.full_name,
+                    "pr_number": pr.github_pr_number,
+                    "head_sha": pr.head_sha,
+                    "job_id": job_id or "unknown",
+                    "input_tokens": ai_input_tokens,
+                    "output_tokens": ai_output_tokens,
+                    "duration_ms": round((time.perf_counter() - ai_started) * 1000),
+                    "retry_count": retry_count,
+                },
+            )
         except Exception as exc:  # noqa: BLE001
             pr.ai_state = getattr(exc, "ai_state", "AI_FAILED")
             ai_error_code = getattr(exc, "error_code", "AI_ANALYSIS_FAILED")
             pr.ai_error_code = ai_error_code
             pr.ai_retryable_at = getattr(exc, "retryable_at", None)
-            ai_analysis_error = "Gemini analysis could not be completed."
+            ai_analysis_error = "Groq analysis could not be completed."
             logger.error(
                 "AI analysis failed: repository=%s pr=%s sha=%s state=%s error_code=%s exception_type=%s",
                 repo.full_name,
@@ -884,6 +1192,12 @@ def _run_analysis_locked(
                     "ai_state": pr.ai_state,
                     "error_code": ai_error_code,
                     "exception_type": type(exc).__name__,
+                    "provider": ai_provider_name,
+                    "model": ai_model_name,
+                    "retryable_at": pr.ai_retryable_at,
+                    "duration_ms": round((time.perf_counter() - ai_started) * 1000),
+                    "job_id": job_id or "unknown",
+                    "retry_count": retry_count,
                 },
             )
         else:
@@ -990,8 +1304,9 @@ def _run_analysis_locked(
             )
             .first()
         )
+    db.commit()
     latest_pr = github_client.get_pull_request(
-        installation_id, owner, repo_name, pr.github_pr_number
+        installation_id, owner, repo_name, pr_number
     )
     latest_sha = latest_pr.get("head_sha")
     if latest_pr.get("state") != "open":
@@ -1000,39 +1315,7 @@ def _run_analysis_locked(
         return None
     if latest_sha != pr.head_sha:
         if isinstance(latest_sha, str) and latest_sha:
-            pr.head_sha = latest_sha
-            pr.ai_state = "AI_PENDING"
-            pr.ai_error_code = None
-            pr.ai_retryable_at = None
-            pr.ai_attempt_id = None
-            db.commit()
-            _ci_revision(db, repo, pr, latest_sha)
-            enqueue_job(
-                db,
-                "REVIEW",
-                f"review:{repo.id}:{pr.id}:{latest_sha}",
-                {
-                    "repository_id": repo.id,
-                    "pull_request_id": pr.id,
-                    "installation_id": installation_id,
-                    "head_sha": latest_sha,
-                },
-            )
-            enqueue_job(
-                db,
-                "CI_REFRESH",
-                f"ci-initial:{repo.id}:{pr.id}:{latest_sha}",
-                {
-                    "repository_id": repo.id,
-                    "pull_request_id": pr.id,
-                    "installation_id": installation_id,
-                    "head_sha": latest_sha,
-                    "event_name": "pull_request",
-                    "reason": "initial",
-                },
-            )
-            _queue_review_status_update(db, repo, pr, latest_sha)
-            db.commit()
+            _queue_current_revision(db, repo, pr, installation_id, latest_sha)
         logger.info(
             "Superseding in-flight analysis: repository=%s pr=%s reviewed_sha=%s current_sha=%s",
             repo.full_name,
@@ -1043,6 +1326,7 @@ def _run_analysis_locked(
         return None
 
     if ci_evaluation.state == "PASSED":
+        db.commit()
         ci_evaluation = _refresh_ci_before_approval(
             db, repo, pr, installation_id, revision
         )
@@ -1125,6 +1409,10 @@ def _run_analysis_locked(
         ai_error_code=ai_error_code,
         ai_retryable_at=pr.ai_retryable_at,
         ai_attempt_id=pr.ai_attempt_id,
+        ai_provider=ai_provider_name,
+        ai_model=ai_model_name,
+        ai_input_tokens=ai_input_tokens,
+        ai_output_tokens=ai_output_tokens,
         analysis_started_at=started_at,
     )
     db.add(review)
@@ -1181,7 +1469,7 @@ def _run_analysis_locked(
             m.Evidence(
                 review_id=review.id,
                 evidence_type="ai_rationale",
-                source="gemini",
+                source="ai_provider",
                 content=ai_scores["summary"],
             )
         )
@@ -1199,7 +1487,7 @@ def _run_analysis_locked(
             m.Evidence(
                 review_id=review.id,
                 evidence_type="error",
-                source="gemini",
+                source="ai_provider",
                 content=f"{ai_analysis_error} Error code: {ai_error_code}.",
             )
         )
@@ -1368,24 +1656,45 @@ def _run_analysis_locked(
         )
         raise
     db.refresh(review)
-    if final_publication.state == "PUBLISHED":
+    review_id = review.id
+    review_head_sha = review.head_sha
+    publication_is_published = final_publication.state == "PUBLISHED"
+    db.commit()
+    if publication_is_published:
         review.github_action_confirmed = True
         db.commit()
     else:
         try:
+            live_pr = github_client.get_pull_request(
+                installation_id, owner, repo_name, pr_number
+            )
+            if (
+                live_pr.get("state") != "open"
+                or live_pr.get("head_sha") != review_head_sha
+            ):
+                latest_sha = live_pr.get("head_sha")
+                if (
+                    isinstance(latest_sha, str)
+                    and latest_sha
+                    and latest_sha != pr.head_sha
+                ):
+                    _queue_current_revision(db, repo, pr, installation_id, latest_sha)
+                else:
+                    db.commit()
+                return None
             result = github_client.post_review(
                 installation_id,
                 owner,
                 repo_name,
-                pr.github_pr_number,
+                pr_number,
                 body,
                 github_event,
                 idempotency_marker=marker,
-                commit_id=review.head_sha,
+                commit_id=review_head_sha,
             )
             db.add(
                 m.GithubAction(
-                    review_id=review.id,
+                    review_id=review_id,
                     action_type="submit_review",
                     request_payload={"event": github_event},
                     response_status=result.get("status_code"),
@@ -1416,19 +1725,23 @@ def _run_analysis_locked(
             raise
 
     if decision.status == m.DecisionStatus.APPROVED:
+        db.commit()
         merge_result = auto_merge.attempt(
             db=db,
             repo=repo,
             pr=pr,
             review=review,
             installation_id=installation_id,
-            policy_doc=policy_doc,
             findings=findings,
-            author_eligible=bool(eligibility and eligibility.is_enabled),
-            author_threshold=eligibility.max_risk_threshold if eligibility else None,
         )
         review.auto_merge_status = merge_result.status
-        if merge_result.status not in ("DISABLED_GLOBAL", "DISABLED_REPOSITORY"):
+        review.auto_merge_policy_revision = getattr(
+            merge_result, "policy_revision", None
+        )
+        if merge_result.status not in (
+            "DASHBOARD_CONFIGURATION_MISSING",
+            "DISABLED_DASHBOARD_CONFIGURATION",
+        ):
             review.auto_merge_attempted_at = datetime.utcnow()
         if merge_result.status != "AUTO_MERGE_ENABLED":
             review.auto_merge_failure_reason = merge_result.reason
@@ -1634,20 +1947,27 @@ def _run_analysis_locked(
                 _log_analysis_timing("total", started_clock, repo, pr)
                 return review
 
-    completion_marker = f"<!-- securepr-complete:{pr.id}:{review.head_sha} -->"
+    completion_pr_id = cast(str, pr.id)
+    completion_pr_number = cast(int, pr.github_pr_number)
+    completion_review_id = review.id
+    completion_sha = review.head_sha
+    completion_owner, repo_name = repo.full_name.split("/", 1)
+    completion_marker = (
+        f"<!-- securepr-complete:{completion_pr_id}:{completion_sha} -->"
+    )
     completion_publication = _publication(
-        db, repo, pr, review.head_sha, "COMPLETION", completion_marker
+        db, repo, pr, completion_sha, "COMPLETION", completion_marker
     )
     if decision.status == m.DecisionStatus.REVIEW_UNAVAILABLE:
         completion_summary = (
-            f"SecurePR received PR #{pr.github_pr_number}, but AI analysis was **NOT COMPLETED**. "
+            f"SecurePR received PR #{completion_pr_number}, but AI analysis was **NOT COMPLETED**. "
             "Review decision: **UNAVAILABLE**. Risk score: **Not Evaluated**. "
             f"CI status: **{ci_evaluation.state.replace('_', ' ').title()}**. "
             "**No AI approval decision has been made.** "
         )
     else:
         completion_summary = (
-            f"SecurePR review complete for PR #{pr.github_pr_number}: "
+            f"SecurePR review complete for PR #{completion_pr_number}: "
             f"**{decision.status.value}** "
             f"(risk {assessment.overall_score}/100, {assessment.category}). "
             f"{'**Auto-merge:** ' + review.auto_merge_status + ' — ' + (review.auto_merge_failure_reason or 'GitHub confirmed the request.') + '. ' if review.auto_merge_status else ''}"
@@ -1655,21 +1975,30 @@ def _run_analysis_locked(
     completion_message = (
         f"### SecurePR Review Complete\n\n"
         f"{completion_summary}"
-        f"[View detailed review]({settings.DASHBOARD_ORIGIN}/#/pr/{pr.id}) "
+        f"[View detailed review]({settings.DASHBOARD_ORIGIN}/#/pr/{completion_pr_id}) "
         f"\n\n{completion_marker}"
     )
+    db.commit()
+    latest_pr = github_client.get_pull_request(
+        installation_id, completion_owner, repo_name, completion_pr_number
+    )
+    if latest_pr.get("state") != "open" or latest_pr.get("head_sha") != completion_sha:
+        latest_sha = latest_pr.get("head_sha")
+        if isinstance(latest_sha, str) and latest_sha and latest_sha != pr.head_sha:
+            _queue_current_revision(db, repo, pr, installation_id, latest_sha)
+        return review
     try:
         result = github_client.post_issue_comment(
             installation_id,
-            owner,
+            completion_owner,
             repo_name,
-            pr.github_pr_number,
+            completion_pr_number,
             completion_message,
             idempotency_marker=completion_marker,
         )
         db.add(
             m.GithubAction(
-                review_id=review.id,
+                review_id=completion_review_id,
                 action_type="post_completion_notification",
                 request_payload={"marker": completion_marker},
                 response_status=result.get("status_code"),
@@ -1682,10 +2011,10 @@ def _run_analysis_locked(
         _mark_publication_published(db, completion_publication, result)
         db.add(
             m.Notification(
-                review_id=review.id,
-                recipient=owner,
+                review_id=completion_review_id,
+                recipient=completion_owner,
                 channel="github",
-                subject=f"PR #{pr.github_pr_number} {decision.status.value}",
+                subject=f"PR #{completion_pr_number} {decision.status.value}",
                 body=completion_message,
                 delivered=result.get("succeeded", False),
             )
@@ -1731,8 +2060,10 @@ def process_review_job(db: Session, payload: dict) -> None:
     if not repo or not pr:
         raise ValueError("Review job references a missing repository or pull request.")
     owner, repo_name = repo.full_name.split("/", 1)
+    pr_number = cast(int, pr.github_pr_number)
+    db.commit()
     live_pr = github_client.get_pull_request(
-        payload["installation_id"], owner, repo_name, pr.github_pr_number
+        payload["installation_id"], owner, repo_name, pr_number
     )
     if live_pr.get("state") != "open":
         pr.state = live_pr.get("state") or pr.state
@@ -1791,6 +2122,8 @@ def process_review_job(db: Session, payload: dict) -> None:
         previous_review_id=payload.get("previous_review_id"),
         expected_head_sha=live_sha,
         trigger="durable_review_job",
+        job_id=payload.get("_job_id"),
+        retry_count=payload.get("_retry_count", 0),
     )
 
 
@@ -1832,7 +2165,7 @@ def _fetch_ci_checks(
                     required_checks.extend(result)
                 else:
                     checks.extend(result)
-            except Exception as exc:
+            except CI_FETCH_ERRORS as exc:
                 errors.append(f"{name}: {exc}")
         return checks, required_checks, errors
     finally:
@@ -1917,7 +2250,7 @@ def process_ci_refresh_job(db: Session, payload: dict) -> None:
             payload["head_sha"],
             pr.base_branch,
         )
-    except Exception as exc:
+    except CI_FETCH_ERRORS as exc:
         checks, required_checks, errors = [], [], [str(exc)]
 
     db.expire_all()
@@ -2020,7 +2353,15 @@ def process_review_status_job(db: Session, payload: dict) -> None:
         raise ValueError(
             "Review status job references a missing repository or pull request."
         )
-    with _revision_finalization_lock(db, repo.id, pr.github_pr_number):
+    with _revision_finalization_lock(
+        db,
+        cast(str, repo.id),
+        cast(int, pr.github_pr_number),
+        head_sha=payload.get("head_sha"),
+        job_id=payload.get("_job_id"),
+        retry_count=payload.get("_retry_count", 0),
+    ):
+        db.commit()
         db.expire_all()
         repo = (
             db.query(m.Repository)
@@ -2034,7 +2375,126 @@ def process_review_status_job(db: Session, payload: dict) -> None:
         )
         if not repo or not pr:
             return
+        if pr.head_sha != payload["head_sha"]:
+            logger.info(
+                "Ignoring stale review-status job: repository=%s pr=%s "
+                "job_sha=%s current_sha=%s job_id=%s",
+                repo.full_name,
+                pr.github_pr_number if pr else "unknown",
+                payload["head_sha"],
+                pr.head_sha if pr else "unknown",
+                payload.get("_job_id", "unknown"),
+            )
+            return
         _publish_review_status_comment(db, payload, repo, pr)
+
+
+def process_auto_merge_cancel_job(db: Session, payload: dict) -> None:
+    repo = (
+        db.query(m.Repository)
+        .filter(m.Repository.id == payload["repository_id"])
+        .first()
+    )
+    pr = (
+        db.query(m.PullRequest)
+        .filter(m.PullRequest.id == payload["pull_request_id"])
+        .first()
+    )
+    if not repo or not pr:
+        raise ValueError(
+            "Auto-merge cancellation job references a missing repository or pull request."
+        )
+    with _revision_finalization_lock(
+        db,
+        cast(str, repo.id),
+        cast(int, pr.github_pr_number),
+        head_sha=cast(str | None, pr.head_sha),
+        job_id=payload.get("_job_id"),
+        retry_count=payload.get("_retry_count", 0),
+    ):
+        db.commit()
+        db.expire_all()
+        repo = (
+            db.query(m.Repository)
+            .filter(m.Repository.id == payload["repository_id"])
+            .first()
+        )
+        pr = (
+            db.query(m.PullRequest)
+            .filter(m.PullRequest.id == payload["pull_request_id"])
+            .first()
+        )
+        if not repo or not pr:
+            return
+        eligibility = auto_merge.saved_eligibility(db, repo, pr)
+        if (
+            eligibility is None
+            or eligibility.policy_revision != payload["policy_revision"]
+        ):
+            logger.info(
+                "Ignoring obsolete auto-merge cancellation: repository=%s pr=%s "
+                "job_id=%s target_policy_revision=%s current_policy_revision=%s",
+                repo.full_name,
+                pr.github_pr_number,
+                payload.get("_job_id", "unknown"),
+                payload["policy_revision"],
+                eligibility.policy_revision if eligibility else "missing",
+            )
+            return
+        current_review = (
+            db.query(m.Review)
+            .filter(
+                m.Review.pull_request_id == pr.id,
+                m.Review.head_sha == pr.head_sha,
+                m.Review.is_ci_wait_placeholder == False,
+            )
+            .order_by(m.Review.created_at.desc())
+            .first()
+        )
+        still_authorized = bool(
+            eligibility.is_enabled
+            and 0 <= eligibility.max_risk_threshold <= 100
+            and current_review
+            and current_review.ai_state == "AI_COMPLETED"
+            and current_review.decision == m.DecisionStatus.APPROVED
+            and current_review.overall_score is not None
+            and current_review.overall_score <= eligibility.max_risk_threshold
+        )
+        if still_authorized:
+            return
+        owner, repo_name = repo.full_name.split("/", 1)
+        cancelled = auto_merge.cancel_pending_auto_merge(
+            installation_id=cast(str, repo.installation_id),
+            owner=owner,
+            repo_name=repo_name,
+            pr_number=cast(int, pr.github_pr_number),
+            db=db,
+            pull_request_id=cast(str, pr.id),
+            new_head_sha=cast(str | None, pr.head_sha),
+            cancellation_status="CANCELLED_DASHBOARD_CONFIGURATION",
+            cancellation_reason=(
+                "The saved dashboard configuration no longer authorizes "
+                "this auto-merge request."
+            ),
+            stale_only=False,
+        )
+        db.add(
+            m.AuditLog(
+                actor="securepr",
+                action="reconcile_github_auto_merge_policy",
+                target_type="pull_request",
+                target_id=pr.id,
+                details_json={
+                    "repository": repo.full_name,
+                    "pr_number": pr.github_pr_number,
+                    "head_sha": pr.head_sha,
+                    "policy_revision": eligibility.policy_revision,
+                    "job_id": payload.get("_job_id"),
+                    "cancellation_result": "cancelled" if cancelled else "no_request",
+                },
+            )
+        )
+        db.commit()
 
 
 def _publish_review_status_comment(
@@ -2097,14 +2557,16 @@ def _publish_review_status_comment(
         marker=marker,
     )
     owner, repo_name = repo.full_name.split("/", 1)
+    pr_number = pr.github_pr_number
     waiting_publication = _publication(
         db, repo, pr, payload["head_sha"], "WAITING", marker
     )
+    db.commit()
     result = github_client.post_issue_comment(
         payload["installation_id"],
         owner,
         repo_name,
-        pr.github_pr_number,
+        pr_number,
         body,
         idempotency_marker=marker,
     )

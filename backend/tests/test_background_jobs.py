@@ -90,6 +90,7 @@ def test_expired_running_job_is_reclaimed_after_worker_restart(tmp_path):
         assert reclaimed.id == job_id
         assert reclaimed.state == "RUNNING"
         assert reclaimed.attempts == 2
+        assert reclaimed.lease_token == 1
         assert reclaimed.lease_until > datetime.utcnow()  # noqa: DTZ003
     engine.dispose()
 
@@ -179,5 +180,35 @@ def test_transient_database_failure_remains_retryable(tmp_path):
     )
 
     assert job.state == "QUEUED"
+    session.close()
+    engine.dispose()
+
+
+def test_stale_worker_failure_cannot_overwrite_newer_lease(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'stale-lease.db'}", future=True)
+    Base.metadata.create_all(bind=engine)
+    session = sessionmaker(bind=engine, future=True)()
+    job = m.BackgroundJob(
+        job_type="REVIEW",
+        idempotency_key="review:stale-lease",
+        payload={},
+        state="RUNNING",
+        attempts=2,
+        lease_token=2,
+    )
+    session.add(job)
+    session.commit()
+
+    updated = _record_job_failure(
+        session,
+        job,
+        OperationalError("SELECT 1", {}, Exception("stale worker")),
+        expected_lease_token=1,
+    )
+
+    session.refresh(job)
+    assert updated is False
+    assert job.state == "RUNNING"
+    assert job.lease_token == 2
     session.close()
     engine.dispose()

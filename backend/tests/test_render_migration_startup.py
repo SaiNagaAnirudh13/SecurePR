@@ -10,7 +10,8 @@ def test_render_installs_requirements_and_migrates_in_startup_wrapper():
     assert "buildCommand: pip install -r requirements.txt" in configuration
     assert "preDeployCommand:" not in configuration
     assert "startCommand: python run.py" in configuration
-    assert 'key: AUTO_MERGE_ENABLED\n        value: "false"' in configuration
+    assert "AUTO_MERGE_ENABLED" not in configuration
+    assert "AUTO_MERGE_LOW_RISK_ONLY" not in configuration
 
 
 def test_production_migration_finishes_before_uvicorn_starts(monkeypatch):

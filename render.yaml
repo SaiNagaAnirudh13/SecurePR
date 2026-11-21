@@ -13,12 +13,6 @@ services:
         value: production
       - key: SUPABASE_AUTH_AUDIENCE
         value: authenticated
-      - key: GEMINI_MODEL
-        value: gemini-3.8-flash
-      - key: GEMINI_REQUEST_TIMEOUT_SECONDS
-        value: "20"
-      - key: GEMINI_MAX_ATTEMPTS
-        value: "3"
       - key: REVIEW_RESULT_DEADLINE_SECONDS
         value: "180"
       - key: CI_API_MAX_RETRIES
@@ -27,10 +21,6 @@ services:
         value: "10"
       - key: CI_FALLBACK_POLL_INTERVAL_SECONDS
         value: "30"
-      - key: AUTO_MERGE_ENABLED
-        value: "false"
-      - key: AUTO_MERGE_LOW_RISK_ONLY
-        value: "true"
       - key: AUTO_MERGE_METHOD
         value: SQUASH
       - key: DATABASE_URL
@@ -53,8 +43,10 @@ services:
         sync: false
       - key: DASHBOARD_ORIGINS
         sync: false
-      - key: GEMINI_API_KEY
+      - key: GROQ_API_KEY
         sync: false
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
       - key: SECUREPR_BASE_URL
         sync: false
       - key: NOTIFY_WEBHOOK_URL

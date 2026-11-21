@@ -48,6 +48,8 @@ jobs:
           tests/test_health.py tests/test_dashboard_contract.py
           tests/test_check_webhook_events.py
           tests/test_pull_request_schema_migration.py
+          tests/test_postgres_reliability.py
+          migrations/versions/20261121_01_groq_review_metadata.py
           migrations/env.py migrations/versions/20261120_01_reconcile_ci_gate_schema.py
           migrations/versions/20261120_02_ai_review_lifecycle.py
         working-directory: backend
@@ -55,7 +57,7 @@ jobs:
         run: >-
           python -m mypy --ignore-missing-imports --follow-imports=skip
           app/services/ci_status.py app/services/comment_formatter.py
-          app/integrations/gemini_client.py
+          app/integrations/groq_client.py
         working-directory: backend
       - name: Audit production dependencies
         run: python -m pip_audit -r backend/requirements.txt

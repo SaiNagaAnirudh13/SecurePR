@@ -142,13 +142,13 @@ def health():
                 )
                 else "missing_configuration"
             ),
-            "gemini": {
+            "groq": {
                 "configuration": (
                     "configured"
-                    if settings.GEMINI_API_KEY and settings.GEMINI_MODEL
+                    if settings.GROQ_API_KEY and settings.GROQ_MODEL
                     else "missing_configuration"
                 ),
-                "model": settings.GEMINI_MODEL,
+                "model": settings.GROQ_MODEL,
                 "reachability": "not_checked",
             },
         },

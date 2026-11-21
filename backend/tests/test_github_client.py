@@ -218,6 +218,100 @@ def test_check_suites_are_normalized_and_reject_other_revisions(monkeypatch):
     assert result[0]["url"] == "https://github.com/octo/widgets/runs/9"
 
 
+@pytest.mark.parametrize(
+    ("branch_payload", "review_payload", "rules", "expected_count"),
+    [
+        (
+            {"protected": True},
+            {
+                "required_approving_review_count": 2,
+                "dismiss_stale_reviews": True,
+            },
+            [],
+            2,
+        ),
+        (
+            {"protected": False},
+            None,
+            [
+                {
+                    "type": "pull_request",
+                    "parameters": {
+                        "required_approving_review_count": 1,
+                        "dismiss_stale_reviews": True,
+                    },
+                }
+            ],
+            1,
+        ),
+    ],
+)
+def test_required_pull_request_reviews_accepts_stale_dismissing_protection(
+    monkeypatch, branch_payload, review_payload, rules, expected_count
+):
+    client = github_module.GitHubClient()
+    monkeypatch.setattr(client, "_headers", lambda *args, **kwargs: {})
+    responses = [FakeResponse(branch_payload)]
+    if review_payload is not None:
+        responses.append(FakeResponse(review_payload))
+    monkeypatch.setattr(
+        client, "_get_with_retry", lambda *args, **kwargs: responses.pop(0)
+    )
+    monkeypatch.setattr(client, "_get_paginated_items", lambda *args: rules)
+
+    protection = client.get_required_pull_request_reviews(
+        "42", "octo", "widgets", "main"
+    )
+
+    assert protection == {
+        "required_approving_review_count": expected_count,
+        "dismiss_stale_reviews": True,
+    }
+
+
+def test_required_pull_request_reviews_rejects_protection_without_stale_dismissal(
+    monkeypatch,
+):
+    client = github_module.GitHubClient()
+    monkeypatch.setattr(client, "_headers", lambda *args, **kwargs: {})
+    responses = [
+        FakeResponse({"protected": True}),
+        FakeResponse(
+            {
+                "required_approving_review_count": 1,
+                "dismiss_stale_reviews": False,
+            }
+        ),
+    ]
+    monkeypatch.setattr(
+        client, "_get_with_retry", lambda *args, **kwargs: responses.pop(0)
+    )
+    monkeypatch.setattr(client, "_get_paginated_items", lambda *args: [])
+
+    with pytest.raises(ValueError, match="dismiss stale approvals"):
+        client.get_required_pull_request_reviews("42", "octo", "widgets", "main")
+
+
+def test_disable_auto_merge_uses_graphql_pull_request_node_id(monkeypatch):
+    client = github_module.GitHubClient()
+    monkeypatch.setattr(client, "_headers", lambda *args, **kwargs: {})
+    calls = []
+    monkeypatch.setattr(
+        github_module.requests,
+        "post",
+        lambda *args, **kwargs: (
+            calls.append((args, kwargs))
+            or FakeResponse({"data": {"disablePullRequestAutoMerge": {}}})
+        ),
+    )
+
+    result = client.disable_pull_request_auto_merge("42", "PR_node_id")
+
+    assert result["succeeded"] is True
+    assert calls[0][1]["json"]["variables"] == {"pullRequestId": "PR_node_id"}
+    assert "disablePullRequestAutoMerge" in calls[0][1]["json"]["query"]
+
+
 def test_required_checks_combine_branch_protection_and_rulesets(monkeypatch):
     client = github_module.GitHubClient()
     monkeypatch.setattr(client, "_headers", lambda *args, **kwargs: {})

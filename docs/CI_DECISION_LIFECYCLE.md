@@ -17,11 +17,11 @@ RECEIVED
                        -> REVIEW_UNAVAILABLE
 ```
 
-AI availability is the first decision gate. Gemini must return a complete,
+AI availability is the first decision gate. Groq must return a complete,
 schema-valid analysis for the exact current PR head SHA before any risk-based
 decision is possible. An AI failure publishes an explicit `UNAVAILABLE`
 result, no risk score, and the independently observed CI state; it never
-falls back to heuristic-only risk or approval. The selected Gemini model is
+falls back to heuristic-only risk or approval. The selected Groq model is
 used as configured; SecurePR does not silently select a substitute model.
 
 `UNKNOWN`, `UNAVAILABLE`, incomplete discovery, missing required checks,
@@ -46,7 +46,7 @@ required contexts are tied to the exact PR head SHA. Discovery errors and
 incomplete pagination remain non-approvable; polling and webhook events
 reconcile the current revision.
 
-Gemini timeouts, unavailable responses, and malformed output are recorded as
+Groq timeouts, unavailable responses, and malformed output are recorded as
 explicit AI lifecycle failures. No heuristic score is published as the AI
 result: the risk category and score are not evaluated, and the review becomes
 `REVIEW_UNAVAILABLE`. It cannot request approval or auto-merge. The decision
@@ -70,13 +70,20 @@ decision. A stale job cannot publish against a newer PR head.
 
 ## Auto-merge
 
-`AUTO_MERGE_ENABLED` is false by default. A separate per-repository SecurePR
-setting is also required. SecurePR rechecks the exact head SHA, CI, branch
-protection, required reviews, GitHub repository auto-merge setting, App
-permissions, and configured merge method. It requests GitHub auto-merge through
-the GraphQL `enablePullRequestAutoMerge` mutation; it does not call GitHub's
-immediate merge endpoint or bypass branch protection. The dashboard reports
-the confirmed request separately from a GitHub-confirmed merge event.
+Only the saved dashboard configuration for the exact GitHub PR author and
+repository can authorize automatic approval and auto-merge. SecurePR rechecks
+that policy, the exact head SHA, CI, branch protection, required reviews,
+GitHub repository auto-merge setting, App permissions, and configured merge
+method. The base branch must require at least one approval and dismiss stale
+approvals on every push. On a synchronize event SecurePR cancels and verifies
+any existing auto-merge request before queueing the new revision; cancellation
+failure returns a retryable webhook error and prevents review jobs from being
+queued. SecurePR also rechecks the PR immediately after requesting auto-merge
+and cancels the request if the head or base changed. It requests GitHub
+auto-merge through the GraphQL
+`enablePullRequestAutoMerge` mutation; it does not call GitHub's immediate
+merge endpoint or bypass branch protection. The dashboard reports the
+confirmed request separately from a GitHub-confirmed merge event.
 
 GitHub App installations need read access to Checks, Commit Statuses, pull
 requests, repository metadata, and branch/ruleset protections, plus
