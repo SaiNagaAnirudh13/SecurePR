@@ -78,18 +78,23 @@ method. The base branch must require at least one approval and dismiss stale
 approvals on every push. On a synchronize event SecurePR cancels and verifies
 any existing auto-merge request before queueing the new revision; cancellation
 failure returns a retryable webhook error and prevents review jobs from being
-queued. SecurePR also rechecks the PR immediately after requesting auto-merge
-and cancels the request if the head or base changed. It requests GitHub
-auto-merge through the GraphQL
-`enablePullRequestAutoMerge` mutation; it does not call GitHub's immediate
-merge endpoint or bypass branch protection. The dashboard reports the
-confirmed request separately from a GitHub-confirmed merge event.
+queued. SecurePR also rechecks the PR immediately after requesting GitHub auto-merge
+and cancels the request if the head or base changed. When all currently
+verified requirements are met and GitHub reports a clean, mergeable PR, it
+uses the REST pull-request merge endpoint with the analyzed head SHA and
+verifies the resulting merged state. If GitHub's requirements are still
+pending, it requests protected auto-merge through GraphQL
+`enablePullRequestAutoMerge`; GitHub enforces the outstanding rules. A
+specific clean-status API response can trigger an immediate-merge fallback
+only after fresh policy, approval, risk, CI, branch-protection, and SHA
+verification. Other errors never trigger that fallback. The dashboard
+distinguishes `AUTO_MERGE_ENABLED` from a verified `MERGED` result.
 
-GitHub App installations need read access to Checks, Commit Statuses, pull
-requests, repository metadata, and branch/ruleset protections, plus
-`Pull requests: write` to publish reviews and request auto-merge. Missing
-permission or unavailable protection data blocks approval or merge rather than
-being treated as an empty successful result.
+GitHub App installations need `Pull requests: Read & write`, `Checks:
+Read-only`, `Commit statuses: Read-only`, `Issues: Read & write`,
+`Administration: Read-only`, and `Metadata: Read-only`. Missing permission or
+unavailable protection data blocks approval or merge rather than being
+treated as an empty successful result.
 
 ## Render migration startup
 

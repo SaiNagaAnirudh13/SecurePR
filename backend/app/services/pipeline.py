@@ -7,12 +7,13 @@ import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Iterator, cast
+from typing import Callable, Iterator, cast
 
 import requests
+from sqlalchemy import update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
 from app.integrations.ai_provider import AIAnalysisResult, AIInvalidResponse
@@ -33,6 +34,7 @@ from app.services.comment_formatter import (
     format_comment,
     format_review_status_comment,
 )
+from app.services.job_errors import RevisionLockUnavailable
 
 logger = logging.getLogger("securepr.pipeline")
 CI_FETCH_ERRORS = (
@@ -43,12 +45,112 @@ CI_FETCH_ERRORS = (
 )
 settings = get_settings()
 REVISION_OPERATION_LEASE_SECONDS = 300
+AUTO_MERGE_RETRY_LIMIT = 3
 _local_revision_locks: dict[tuple[str, int, str, str], threading.RLock] = {}
 _local_revision_locks_guard = threading.Lock()
 
 
-class RevisionLockUnavailable(TimeoutError):
-    """Raised when another worker currently owns a revision operation."""
+class RevisionOperationLease:
+    def __init__(
+        self,
+        db: Session,
+        operation_id: str,
+        owner_token: str,
+        fields: dict,
+    ) -> None:
+        self._factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+        self.operation_id = operation_id
+        self.owner_token = owner_token
+        self.fields = fields
+        self._lease_until = datetime.utcnow() + timedelta(
+            seconds=REVISION_OPERATION_LEASE_SECONDS
+        )
+        self._stop = threading.Event()
+        self._lost = threading.Event()
+        self._thread = threading.Thread(
+            target=self._heartbeat,
+            name=f"securepr-revision-lease-{operation_id[:8]}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self.assert_owned()
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=2)
+
+    def assert_owned(self) -> None:
+        if self._lost.is_set():
+            raise RevisionLockUnavailable(
+                "Revision operation lease ownership could not be verified.",
+                retry_at=self._lease_until,
+                lease_owner="unknown",
+                operation=self.fields["operation"],
+            )
+        now = datetime.utcnow()
+        session = self._factory()
+        try:
+            result = session.execute(
+                update(m.RevisionOperation)
+                .where(
+                    m.RevisionOperation.id == self.operation_id,
+                    m.RevisionOperation.state == "RUNNING",
+                    m.RevisionOperation.owner_token == self.owner_token,
+                    m.RevisionOperation.lease_until > now,
+                )
+                .values(
+                    lease_until=now
+                    + timedelta(seconds=REVISION_OPERATION_LEASE_SECONDS),
+                    updated_at=now,
+                )
+            )
+            if result.rowcount != 1:
+                session.rollback()
+                self._lost.set()
+                raise RevisionLockUnavailable(
+                    "Revision operation lease ownership was lost.",
+                    retry_at=self._lease_until,
+                    lease_owner="another_worker",
+                    operation=self.fields["operation"],
+                )
+            session.commit()
+            self._lease_until = now + timedelta(
+                seconds=REVISION_OPERATION_LEASE_SECONDS
+            )
+        except RevisionLockUnavailable:
+            raise
+        except Exception:
+            session.rollback()
+            self._lost.set()
+            logger.exception(
+                "Could not renew revision operation lease: repository_id=%s "
+                "pr_number=%s head_sha=%s operation=%s job_id=%s lease_owner=unknown",
+                self.fields["repository_id"],
+                self.fields["pr_number"],
+                self.fields["head_sha"],
+                self.fields["operation"],
+                self.fields["job_id"],
+                extra={**self.fields, "lease_owner": "unknown"},
+            )
+            raise RevisionLockUnavailable(
+                "Revision operation lease renewal failed; finalization is blocked.",
+                retry_at=self._lease_until,
+                lease_owner="unknown",
+                operation=self.fields["operation"],
+            )
+        finally:
+            session.close()
+
+    def _heartbeat(self) -> None:
+        interval = max(1, REVISION_OPERATION_LEASE_SECONDS // 3)
+        while not self._stop.wait(interval):
+            try:
+                self.assert_owned()
+            except RevisionLockUnavailable:
+                return
 
 
 def _for_update(query, entity):
@@ -125,11 +227,17 @@ def _claim_revision_operation(
             and revision_operation.lease_until > now
         ):
             raise RevisionLockUnavailable(
-                "Another worker is processing this PR revision operation."
+                "Another worker is processing this PR revision operation.",
+                retry_at=revision_operation.lease_until,
+                lease_owner="another_worker",
+                operation=operation,
             )
         if revision_operation.available_at > now:
             raise RevisionLockUnavailable(
-                "This PR revision operation is waiting for its retry backoff."
+                "This PR revision operation is waiting for its retry backoff.",
+                retry_at=revision_operation.available_at,
+                lease_owner="none",
+                operation=operation,
             )
 
         owner_token = m.gen_uuid()
@@ -140,8 +248,9 @@ def _claim_revision_operation(
             seconds=REVISION_OPERATION_LEASE_SECONDS
         )
         revision_operation.updated_at = now
+        operation_id = cast(str, revision_operation.id)
         db.commit()
-        return cast(str, revision_operation.id), owner_token, revision_sha
+        return operation_id, owner_token, revision_sha
     except Exception:
         db.rollback()
         raise
@@ -165,6 +274,8 @@ def _finish_revision_operation(
             revision_operation is None
             or revision_operation.state != "RUNNING"
             or revision_operation.owner_token != owner_token
+            or revision_operation.lease_until is None
+            or revision_operation.lease_until <= datetime.utcnow()
         ):
             db.rollback()
             logger.warning(
@@ -196,10 +307,17 @@ def _revision_finalization_lock(
     operation: str = "review-finalization",
     job_id: str | None = None,
     retry_count: int = 0,
-) -> Iterator[None]:
+) -> Iterator[RevisionOperationLease]:
     """Hold only a durable lease; row-lock transactions end before yielding."""
+    repository_name = (
+        db.query(m.Repository.full_name)
+        .filter(m.Repository.id == repository_id)
+        .scalar()
+    )
+    db.commit()
     fields = {
         "repository_id": repository_id,
+        "repository": repository_name or repository_id,
         "pr_number": pr_number,
         "head_sha": head_sha or "unknown",
         "operation": operation,
@@ -216,29 +334,60 @@ def _revision_finalization_lock(
         local_lock.acquire()
     try:
         db.commit()
-        operation_id, owner_token, claimed_sha = _claim_revision_operation(
-            db, repository_id, pr_number, head_sha, operation
-        )
+        try:
+            operation_id, owner_token, claimed_sha = _claim_revision_operation(
+                db, repository_id, pr_number, head_sha, operation
+            )
+        except RevisionLockUnavailable as exc:
+            fields.update(
+                head_sha=head_sha or "unknown",
+                lease_owner=exc.lease_owner,
+                failure_reason=str(exc),
+            )
+            logger.warning(
+                "PR revision operation unavailable: repository=%s repository_id=%s "
+                "pr_number=%s head_sha=%s operation=%s job_id=%s "
+                "lease_owner=%s failure_reason=%s",
+                repository_name or repository_id,
+                repository_id,
+                pr_number,
+                head_sha or "unknown",
+                operation,
+                job_id or "unknown",
+                exc.lease_owner,
+                str(exc),
+                extra=fields,
+            )
+            raise
+        lease = RevisionOperationLease(db, operation_id, owner_token, fields)
+        lease.start()
         fields["head_sha"] = claimed_sha
+        fields["lease_owner"] = "this_worker"
         logger.info(
-            "PR revision operation claimed: repository_id=%(repository_id)s "
+            "PR revision operation claimed: repository=%(repository)s "
+            "repository_id=%(repository_id)s "
             "pr_number=%(pr_number)s head_sha=%(head_sha)s operation=%(operation)s "
             "job_id=%(job_id)s retry_count=%(retry_count)s",
             fields,
             extra=fields,
         )
         try:
-            yield
+            yield lease
+            lease.assert_owned()
         except Exception as exc:
+            lease.stop()
             db.rollback()
             _finish_revision_operation(db, operation_id, owner_token, exc)
             raise
         else:
+            lease.stop()
             db.commit()
             _finish_revision_operation(db, operation_id, owner_token)
             logger.info(
-                "PR revision operation completed: repository_id=%s pr_number=%s "
+                "PR revision operation completed: repository=%s repository_id=%s "
+                "pr_number=%s "
                 "head_sha=%s operation=%s job_id=%s retry_count=%s",
+                repository_name or repository_id,
                 repository_id,
                 pr_number,
                 claimed_sha,
@@ -543,6 +692,57 @@ def _queue_review_status_update(
     )
 
 
+def _auto_merge_result_is_retryable(result: auto_merge.AutoMergeResult) -> bool:
+    if result.status in {
+        "VERIFICATION_UNAVAILABLE",
+        "BRANCH_PROTECTION_UNAVAILABLE",
+        "CI_PENDING",
+        "REQUIRED_REVIEW_PENDING",
+        "WAITING_FOR_GITHUB",
+    }:
+        return True
+    return result.status == "FAILED" and result.response_status in {
+        408,
+        425,
+        429,
+        500,
+        502,
+        503,
+        504,
+    }
+
+
+def _queue_auto_merge_retry(
+    db: Session,
+    repo: m.Repository,
+    pr: m.PullRequest,
+    review: m.Review,
+    result: auto_merge.AutoMergeResult,
+    *,
+    retry_count: int,
+) -> None:
+    if (
+        retry_count >= AUTO_MERGE_RETRY_LIMIT
+        or not _auto_merge_result_is_retryable(result)
+    ):
+        return
+    next_retry = retry_count + 1
+    delay_seconds = min(30 * (2 ** (next_retry - 1)), 120)
+    enqueue_job(
+        db,
+        "AUTO_MERGE_RETRY",
+        f"auto-merge-retry:{review.id}:{review.head_sha}:{next_retry}",
+        {
+            "repository_id": repo.id,
+            "pull_request_id": pr.id,
+            "review_id": review.id,
+            "head_sha": review.head_sha,
+            "retry_count": next_retry,
+        },
+        available_at=datetime.utcnow() + timedelta(seconds=delay_seconds),
+    )
+
+
 def _queue_review_reconciliation(
     db: Session,
     repo: m.Repository,
@@ -727,6 +927,7 @@ def _publish_existing_review(
     pr: m.PullRequest,
     installation_id: str,
     review: m.Review,
+    assert_lease_owned: Callable[[], None] | None = None,
 ) -> None:
     if review.github_action_confirmed:
         return
@@ -779,6 +980,8 @@ def _publish_existing_review(
             return
         if not _confirm_pr_revision_in_database(db, pr, review_head_sha):
             return
+        if assert_lease_owned:
+            assert_lease_owned()
         result = github_client.post_review(
             installation_id,
             owner,
@@ -789,6 +992,8 @@ def _publish_existing_review(
             idempotency_marker=marker,
             commit_id=review_head_sha,
         )
+        if assert_lease_owned:
+            assert_lease_owned()
         db.add(
             m.GithubAction(
                 review_id=review_id,
@@ -902,14 +1107,10 @@ def run_analysis(
         repository_id,
         pr_number,
         head_sha=cast(str | None, expected_head_sha or pr.head_sha),
-        operation=(
-            f"review-analysis-reevaluation:{previous_review_id or 'initial'}"
-            if is_reevaluation
-            else "review-analysis"
-        ),
+        operation="review-analysis",
         job_id=job_id,
         retry_count=retry_count,
-    ):
+    ) as lease:
         db.commit()
         db.expire_all()
         current_pr = (
@@ -986,6 +1187,7 @@ def run_analysis(
                         trigger="ci_reconciliation",
                         job_id=job_id,
                         retry_count=retry_count,
+                        assert_lease_owned=lease.assert_owned,
                     )
                 if (
                     existing.ai_state == "AI_UNAVAILABLE"
@@ -1003,12 +1205,18 @@ def run_analysis(
                         trigger="provider_retry",
                         job_id=job_id,
                         retry_count=retry_count,
+                        assert_lease_owned=lease.assert_owned,
                     )
                 if existing.decision == m.DecisionStatus.WAITING_FOR_CI:
                     return existing
                 db.commit()
                 _publish_existing_review(
-                    db, current_repo, current_pr, installation_id, existing
+                    db,
+                    current_repo,
+                    current_pr,
+                    installation_id,
+                    existing,
+                    assert_lease_owned=lease.assert_owned,
                 )
                 return existing
         return _run_analysis_locked(
@@ -1022,6 +1230,7 @@ def run_analysis(
             event_name=event_name,
             job_id=job_id,
             retry_count=retry_count,
+            assert_lease_owned=lease.assert_owned,
         )
 
 
@@ -1037,6 +1246,7 @@ def _run_analysis_locked(
     event_name: str | None = None,
     job_id: str | None = None,
     retry_count: int = 0,
+    assert_lease_owned: Callable[[], None] | None = None,
 ) -> m.Review | None:
     started_clock = time.perf_counter()
     started_at = datetime.utcnow()
@@ -1096,6 +1306,7 @@ def _run_analysis_locked(
                 db=db,
                 pull_request_id=cast(str, pr.id),
                 new_head_sha=cast(str | None, pr.head_sha),
+                assert_lease_owned=assert_lease_owned,
             )
         except Exception:
             logger.exception(
@@ -1328,21 +1539,11 @@ def _run_analysis_locked(
         if ci_evaluation.state == "PASSED"
         else (False, None)
     )
-    author = (
-        db.query(m.User).filter(m.User.github_login == pr.author_login).first()
+    eligibility = (
+        auto_merge.saved_eligibility(db, repo, pr)
         if ci_evaluation.state == "PASSED"
         else None
     )
-    eligibility = None
-    if author:
-        eligibility = (
-            db.query(m.AutoApprovalEligibility)
-            .filter(
-                m.AutoApprovalEligibility.repository_id == repo.id,
-                m.AutoApprovalEligibility.user_id == author.id,
-            )
-            .first()
-        )
     db.commit()
     latest_pr = github_client.get_pull_request(
         installation_id, owner, repo_name, pr_number
@@ -1739,6 +1940,8 @@ def _run_analysis_locked(
                 return None
             if not _confirm_pr_revision_in_database(db, pr, review_head_sha):
                 return None
+            if assert_lease_owned:
+                assert_lease_owned()
             result = github_client.post_review(
                 installation_id,
                 owner,
@@ -1749,6 +1952,8 @@ def _run_analysis_locked(
                 idempotency_marker=marker,
                 commit_id=review_head_sha,
             )
+            if assert_lease_owned:
+                assert_lease_owned()
             db.add(
                 m.GithubAction(
                     review_id=review_id,
@@ -1783,6 +1988,8 @@ def _run_analysis_locked(
 
     if decision.status == m.DecisionStatus.APPROVED:
         db.commit()
+        if assert_lease_owned:
+            assert_lease_owned()
         merge_result = auto_merge.attempt(
             db=db,
             repo=repo,
@@ -1790,7 +1997,10 @@ def _run_analysis_locked(
             review=review,
             installation_id=installation_id,
             findings=findings,
+            assert_lease_owned=assert_lease_owned,
         )
+        if assert_lease_owned:
+            assert_lease_owned()
         review.auto_merge_status = merge_result.status
         review.auto_merge_policy_revision = getattr(
             merge_result, "policy_revision", None
@@ -1803,6 +2013,9 @@ def _run_analysis_locked(
         if merge_result.status == "MERGED":
             review.auto_merged_at = datetime.utcnow()
             review.auto_merge_failure_reason = None
+            pr.state = "closed"
+            pr.merged_at = review.auto_merged_at
+            pr.merge_commit_sha = merge_result.merge_commit_sha
         elif merge_result.status != "AUTO_MERGE_ENABLED":
             review.auto_merge_failure_reason = merge_result.reason
         db.add(
@@ -1829,6 +2042,7 @@ def _run_analysis_locked(
                 ),
             )
         )
+        _queue_auto_merge_retry(db, repo, pr, review, merge_result, retry_count=0)
         db.commit()
         if merge_result.status in {
             "CI_FAILED",
@@ -2048,6 +2262,8 @@ def _run_analysis_locked(
             _queue_current_revision(db, repo, pr, installation_id, latest_sha)
         return review
     try:
+        if assert_lease_owned:
+            assert_lease_owned()
         result = github_client.post_issue_comment(
             installation_id,
             completion_owner,
@@ -2056,6 +2272,8 @@ def _run_analysis_locked(
             completion_message,
             idempotency_marker=completion_marker,
         )
+        if assert_lease_owned:
+            assert_lease_owned()
         db.add(
             m.GithubAction(
                 review_id=completion_review_id,
@@ -2421,7 +2639,7 @@ def process_review_status_job(db: Session, payload: dict) -> None:
         operation="review-status-publication",
         job_id=payload.get("_job_id"),
         retry_count=payload.get("_retry_count", 0),
-    ):
+    ) as lease:
         db.commit()
         db.expire_all()
         repo = (
@@ -2447,6 +2665,7 @@ def process_review_status_job(db: Session, payload: dict) -> None:
                 payload.get("_job_id", "unknown"),
             )
             return
+        lease.assert_owned()
         _publish_review_status_comment(db, payload, repo, pr)
 
 
@@ -2473,7 +2692,7 @@ def process_auto_merge_cancel_job(db: Session, payload: dict) -> None:
         operation="auto-merge-cancellation",
         job_id=payload.get("_job_id"),
         retry_count=payload.get("_retry_count", 0),
-    ):
+    ) as lease:
         db.commit()
         db.expire_all()
         repo = (
@@ -2488,6 +2707,7 @@ def process_auto_merge_cancel_job(db: Session, payload: dict) -> None:
         )
         if not repo or not pr:
             return
+        lease.assert_owned()
         eligibility = auto_merge.saved_eligibility(db, repo, pr)
         if (
             eligibility is None
@@ -2525,6 +2745,7 @@ def process_auto_merge_cancel_job(db: Session, payload: dict) -> None:
         if still_authorized:
             return
         owner, repo_name = repo.full_name.split("/", 1)
+        lease.assert_owned()
         cancelled = auto_merge.cancel_pending_auto_merge(
             installation_id=cast(str, repo.installation_id),
             owner=owner,
@@ -2539,6 +2760,7 @@ def process_auto_merge_cancel_job(db: Session, payload: dict) -> None:
                 "this auto-merge request."
             ),
             stale_only=False,
+            assert_lease_owned=lease.assert_owned,
         )
         db.add(
             m.AuditLog(
@@ -2559,10 +2781,158 @@ def process_auto_merge_cancel_job(db: Session, payload: dict) -> None:
         db.commit()
 
 
+def process_auto_merge_retry_job(db: Session, payload: dict) -> None:
+    repo = (
+        db.query(m.Repository)
+        .filter(m.Repository.id == payload["repository_id"])
+        .first()
+    )
+    pr = (
+        db.query(m.PullRequest)
+        .filter(m.PullRequest.id == payload["pull_request_id"])
+        .first()
+    )
+    review = (
+        db.query(m.Review)
+        .filter(m.Review.id == payload["review_id"])
+        .first()
+    )
+    if not repo or not pr or not review:
+        logger.info(
+            "Skipping auto-merge retry for missing records: job_id=%s repository_id=%s "
+            "pull_request_id=%s review_id=%s",
+            payload.get("_job_id", "unknown"),
+            payload["repository_id"],
+            payload["pull_request_id"],
+            payload["review_id"],
+        )
+        return
+    with _revision_finalization_lock(
+        db,
+        cast(str, repo.id),
+        cast(int, pr.github_pr_number),
+        head_sha=cast(str | None, payload["head_sha"]),
+        operation="review-analysis",
+        job_id=payload.get("_job_id"),
+        retry_count=payload.get("retry_count", 0),
+    ) as lease:
+        db.commit()
+        db.expire_all()
+        repo = (
+            db.query(m.Repository)
+            .filter(m.Repository.id == payload["repository_id"])
+            .first()
+        )
+        pr = (
+            db.query(m.PullRequest)
+            .filter(m.PullRequest.id == payload["pull_request_id"])
+            .first()
+        )
+        review = (
+            db.query(m.Review)
+            .filter(m.Review.id == payload["review_id"])
+            .first()
+        )
+        if (
+            not repo
+            or not pr
+            or not review
+            or pr.state != "open"
+            or pr.head_sha != payload["head_sha"]
+            or review.head_sha != payload["head_sha"]
+            or review.decision != m.DecisionStatus.APPROVED
+            or not review.github_action_confirmed
+            or review.overall_score is None
+        ):
+            logger.info(
+                "Skipping stale or unauthorized auto-merge retry: repository=%s "
+                "pr_number=%s head_sha=%s job_id=%s",
+                repo.full_name if repo else "unknown",
+                pr.github_pr_number if pr else "unknown",
+                payload["head_sha"],
+                payload.get("_job_id", "unknown"),
+            )
+            return
+        findings = [
+            {
+                "severity": finding.severity,
+                "title": finding.title,
+                "description": finding.description,
+                "file_path": finding.file_path,
+                "line_reference": finding.line_reference,
+            }
+            for finding in db.query(m.Finding)
+            .filter(m.Finding.review_id == review.id)
+            .all()
+        ]
+        lease.assert_owned()
+        result = auto_merge.attempt(
+            db=db,
+            repo=repo,
+            pr=pr,
+            review=review,
+            installation_id=cast(str, repo.installation_id),
+            findings=findings,
+            assert_lease_owned=lease.assert_owned,
+        )
+        lease.assert_owned()
+        review.auto_merge_status = result.status
+        review.auto_merge_policy_revision = result.policy_revision
+        review.auto_merge_attempted_at = datetime.utcnow()
+        if result.status == "MERGED":
+            review.auto_merged_at = datetime.utcnow()
+            review.auto_merge_failure_reason = None
+            pr.state = "closed"
+            pr.merged_at = review.auto_merged_at
+            pr.merge_commit_sha = result.merge_commit_sha
+        elif result.status != "AUTO_MERGE_ENABLED":
+            review.auto_merge_failure_reason = result.reason
+        db.add(
+            m.GithubAction(
+                review_id=review.id,
+                action_type="retry_github_auto_merge",
+                request_payload={
+                    "method": settings.AUTO_MERGE_METHOD,
+                    "retry_count": payload.get("retry_count", 0),
+                },
+                response_status=result.response_status,
+                response_payload=result.response_payload,
+                succeeded=result.status in ("AUTO_MERGE_ENABLED", "MERGED"),
+            )
+        )
+        db.add(
+            m.Evidence(
+                review_id=review.id,
+                evidence_type="auto_merge_retry",
+                source="securepr",
+                content=json.dumps(
+                    {
+                        "status": result.status,
+                        "reason": result.reason,
+                        "merge_commit_sha": result.merge_commit_sha,
+                        "retry_count": payload.get("retry_count", 0),
+                    }
+                ),
+            )
+        )
+        _queue_auto_merge_retry(
+            db,
+            repo,
+            pr,
+            review,
+            result,
+            retry_count=payload.get("retry_count", 0),
+        )
+        _queue_review_status_update(db, repo, pr, review.head_sha)
+        db.commit()
+
+
 def _publish_review_status_comment(
     db: Session, payload: dict, repo: m.Repository, pr: m.PullRequest
 ) -> None:
-    if pr.head_sha != payload["head_sha"] or pr.state != "open":
+    if pr.head_sha != payload["head_sha"] or (
+        pr.state != "open" and pr.merged_at is None
+    ):
         return
     revision = (
         db.query(m.CIRevision)

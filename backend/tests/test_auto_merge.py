@@ -9,7 +9,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.db import Base
 from app.models import models as m
-from app.services import auto_merge
+from app.services import auto_merge, pipeline
 
 CHECKS = [
     {
@@ -296,6 +296,73 @@ def test_clean_status_error_refetches_and_falls_back_to_immediate_merge(
 
     assert result.status == "MERGED"
     assert result.merge_commit_sha == "clean-fallback-sha"
+
+
+def test_clean_status_fallback_requires_fresh_review_protection(
+    db_session, monkeypatch
+):
+    repo, pr, review = _objects(db_session)
+    _enable(monkeypatch)
+    _github_ok(monkeypatch)
+    _set_blocked_github_pr(monkeypatch)
+    monkeypatch.setattr(
+        auto_merge.github_client,
+        "enable_pull_request_auto_merge",
+        lambda *args: {
+            "succeeded": False,
+            "status_code": 422,
+            "payload": {"message": "Pull request is in clean status"},
+        },
+    )
+    monkeypatch.setattr(
+        auto_merge.github_client,
+        "get_required_pull_request_reviews",
+        lambda *args: {
+            "required_approving_review_count": 1,
+            "dismiss_stale_reviews": False,
+        },
+    )
+    merge_calls = []
+    monkeypatch.setattr(
+        auto_merge.github_client,
+        "merge_pull_request",
+        lambda *args: merge_calls.append(args),
+    )
+
+    result = _attempt(db_session, repo, pr, review)
+
+    assert result.status == "NOT_ELIGIBLE"
+    assert merge_calls == []
+
+
+def test_unrelated_github_api_error_never_triggers_merge_fallback(
+    db_session, monkeypatch
+):
+    repo, pr, review = _objects(db_session)
+    _enable(monkeypatch)
+    _github_ok(monkeypatch)
+    _set_blocked_github_pr(monkeypatch)
+    monkeypatch.setattr(
+        auto_merge.github_client,
+        "enable_pull_request_auto_merge",
+        lambda *args: {
+            "succeeded": False,
+            "status_code": 500,
+            "payload": {"message": "Internal Server Error"},
+        },
+    )
+    merge_calls = []
+    monkeypatch.setattr(
+        auto_merge.github_client,
+        "merge_pull_request",
+        lambda *args: merge_calls.append(args),
+    )
+
+    result = _attempt(db_session, repo, pr, review)
+
+    assert result.status == "FAILED"
+    assert "Internal Server Error" in result.reason
+    assert merge_calls == []
 
 
 def test_already_merged_pr_is_idempotent_and_calls_no_merge_operation(
@@ -916,3 +983,141 @@ def test_merge_method_unavailable_is_not_silently_changed(db_session, monkeypatc
 
     assert result.status == "MERGE_METHOD_UNAVAILABLE"
     assert requests == []
+
+
+def test_transient_auto_merge_failure_queues_bounded_retry(db_session):
+    repo, pr, review = _objects(db_session)
+    result = auto_merge.AutoMergeResult(
+        "FAILED",
+        "GitHub temporarily unavailable.",
+        response_status=503,
+    )
+
+    pipeline._queue_auto_merge_retry(
+        db_session, repo, pr, review, result, retry_count=0
+    )
+    first = (
+        db_session.query(m.BackgroundJob)
+        .filter(m.BackgroundJob.job_type == "AUTO_MERGE_RETRY")
+        .one()
+    )
+    assert first.payload["retry_count"] == 1
+    first_available_at = first.available_at
+
+    pipeline._queue_auto_merge_retry(
+        db_session, repo, pr, review, result, retry_count=1
+    )
+    pipeline._queue_auto_merge_retry(
+        db_session, repo, pr, review, result, retry_count=2
+    )
+    pipeline._queue_auto_merge_retry(
+        db_session, repo, pr, review, result, retry_count=3
+    )
+    db_session.flush()
+
+    jobs = (
+        db_session.query(m.BackgroundJob)
+        .filter(m.BackgroundJob.job_type == "AUTO_MERGE_RETRY")
+        .order_by(m.BackgroundJob.idempotency_key)
+        .all()
+    )
+    assert len(jobs) == 3
+    assert [job.payload["retry_count"] for job in jobs] == [1, 2, 3]
+    assert jobs[0].available_at == first_available_at
+    assert jobs[1].available_at > jobs[0].available_at
+    assert jobs[2].available_at > jobs[1].available_at
+
+
+def test_auto_merge_permission_error_is_not_retried(db_session):
+    repo, pr, review = _objects(db_session)
+    result = auto_merge.AutoMergeResult(
+        "PERMISSION_MISSING",
+        "GitHub App cannot enable auto-merge.",
+        response_status=403,
+    )
+
+    pipeline._queue_auto_merge_retry(
+        db_session, repo, pr, review, result, retry_count=0
+    )
+
+    assert (
+        db_session.query(m.BackgroundJob)
+        .filter(m.BackgroundJob.job_type == "AUTO_MERGE_RETRY")
+        .count()
+        == 0
+    )
+
+
+def test_unrecognized_github_review_is_rechecked_with_bounded_retry(db_session):
+    repo, pr, review = _objects(db_session)
+    result = auto_merge.AutoMergeResult(
+        "REQUIRED_REVIEW_PENDING",
+        "GitHub has not recognized SecurePR's approval yet.",
+    )
+
+    pipeline._queue_auto_merge_retry(
+        db_session, repo, pr, review, result, retry_count=0
+    )
+
+    job = (
+        db_session.query(m.BackgroundJob)
+        .filter(m.BackgroundJob.job_type == "AUTO_MERGE_RETRY")
+        .one()
+    )
+    assert job.payload["head_sha"] == review.head_sha
+    assert job.payload["retry_count"] == 1
+
+
+def test_auto_merge_retry_job_revalidates_and_reschedules_transient_failure(
+    db_session, monkeypatch
+):
+    repo, pr, review = _objects(db_session)
+    calls = []
+
+    def transient_failure(**kwargs):
+        calls.append(kwargs)
+        return auto_merge.AutoMergeResult(
+            "FAILED",
+            "GitHub temporarily unavailable.",
+            response_status=503,
+        )
+
+    monkeypatch.setattr(pipeline.auto_merge, "attempt", transient_failure)
+    pipeline.process_auto_merge_retry_job(
+        db_session,
+        {
+            "repository_id": repo.id,
+            "pull_request_id": pr.id,
+            "review_id": review.id,
+            "head_sha": review.head_sha,
+            "retry_count": 1,
+            "_job_id": "retry-job",
+        },
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["assert_lease_owned"] is not None
+    retry = (
+        db_session.query(m.BackgroundJob)
+        .filter(m.BackgroundJob.job_type == "AUTO_MERGE_RETRY")
+        .one()
+    )
+    assert retry.payload["retry_count"] == 2
+    assert (
+        db_session.query(m.GithubAction)
+        .filter(m.GithubAction.action_type == "retry_github_auto_merge")
+        .one()
+        .response_status
+        == 503
+    )
+
+
+def test_saved_policy_matches_github_login_case_insensitively(db_session):
+    repo, pr, _review = _objects(db_session)
+    pr.author_login = "OctoCat"
+    db_session.commit()
+
+    eligibility = auto_merge.saved_eligibility(db_session, repo, pr)
+
+    assert eligibility is not None
+    assert eligibility.is_enabled is True

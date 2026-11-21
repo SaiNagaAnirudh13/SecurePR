@@ -16,6 +16,8 @@ def test_health_returns_ok_only_when_database_is_reachable(monkeypatch, tmp_path
             "CI_REFRESH": True,
             "CI_NOTIFY": True,
             "REVIEW_STATUS": True,
+            "AUTO_MERGE_CANCEL": True,
+            "AUTO_MERGE_RETRY": True,
         },
     )
 

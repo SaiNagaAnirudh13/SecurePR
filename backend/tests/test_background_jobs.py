@@ -1,3 +1,5 @@
+import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 from sqlalchemy import create_engine
@@ -6,12 +8,16 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.db import Base
 from app.models import models as m
+from app.services import pipeline
 from app.services.background_jobs import (
+    LEASE_SECONDS,
     MAX_ATTEMPTS,
+    _BackgroundJobLease,
     _record_job_failure,
     _Worker,
     enqueue_job,
 )
+from app.services.job_errors import RevisionLockUnavailable
 
 
 def test_job_and_idempotency_survive_database_session_restart(tmp_path):
@@ -211,4 +217,173 @@ def test_stale_worker_failure_cannot_overwrite_newer_lease(tmp_path):
     assert job.state == "RUNNING"
     assert job.lease_token == 2
     session.close()
+    engine.dispose()
+
+
+def test_revision_lock_conflict_is_deferred_without_spending_attempts(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'lock-conflict.db'}", future=True)
+    Base.metadata.create_all(bind=engine)
+    session = sessionmaker(bind=engine, future=True)()
+    now = datetime.utcnow()
+    job = m.BackgroundJob(
+        job_type="REVIEW",
+        idempotency_key="review:lock-conflict",
+        payload={"head_sha": "sha-one"},
+        state="RUNNING",
+        attempts=MAX_ATTEMPTS,
+        lease_token=7,
+        available_at=now,
+        lease_until=now + timedelta(seconds=LEASE_SECONDS),
+    )
+    session.add(job)
+    session.commit()
+
+    updated = _record_job_failure(
+        session,
+        job,
+        RevisionLockUnavailable(
+            "Another worker owns the revision lease.",
+            retry_at=now + timedelta(seconds=90),
+            lease_owner="another_worker",
+            operation="review-analysis",
+        ),
+        expected_lease_token=7,
+    )
+
+    session.refresh(job)
+    assert updated is True
+    assert job.state == "QUEUED"
+    assert job.attempts == MAX_ATTEMPTS - 1
+    assert job.available_at >= now + timedelta(seconds=89)
+    assert "owns the revision lease" in job.last_error
+    session.close()
+    engine.dispose()
+
+
+def test_initial_and_reevaluation_share_the_same_revision_lock(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'review-lease.db'}", future=True)
+    Base.metadata.create_all(bind=engine)
+    session = sessionmaker(bind=engine, future=True)()
+    repo = m.Repository(
+        github_repo_id="lease-test",
+        owner_login="octo",
+        name="widgets",
+        full_name="octo/widgets",
+        installation_id="99",
+    )
+    session.add(repo)
+    session.flush()
+    pr = m.PullRequest(
+        repository_id=repo.id,
+        github_pr_number=9,
+        author_login="octocat",
+        head_sha="sha-one",
+        base_branch="main",
+        state="open",
+    )
+    session.add(pr)
+    session.commit()
+    operations = []
+
+    class Lease:
+        def assert_owned(self):
+            return None
+
+    @contextmanager
+    def fake_lock(*args, **kwargs):
+        operations.append(kwargs["operation"])
+        yield Lease()
+
+    monkeypatch.setattr(pipeline, "_revision_finalization_lock", fake_lock)
+    monkeypatch.setattr(pipeline, "_run_analysis_locked", lambda *args, **kwargs: None)
+
+    pipeline.run_analysis(session, repo, pr, "99")
+    pipeline.run_analysis(
+        session,
+        repo,
+        pr,
+        "99",
+        is_reevaluation=True,
+        previous_review_id="previous-review",
+    )
+
+    assert operations == ["review-analysis", "review-analysis"]
+    session.close()
+    engine.dispose()
+
+
+def test_background_job_lease_is_renewed_during_long_work(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'job-heartbeat.db'}", future=True)
+    Base.metadata.create_all(bind=engine)
+    factory = sessionmaker(bind=engine, future=True)
+    monkeypatch.setattr("app.services.background_jobs.LEASE_SECONDS", 3)
+    with factory() as db:
+        job = m.BackgroundJob(
+            job_type="REVIEW",
+            idempotency_key="review:heartbeat",
+            payload={},
+            state="RUNNING",
+            attempts=1,
+            lease_token=1,
+            available_at=datetime.utcnow(),
+            lease_until=datetime.utcnow() + timedelta(seconds=3),
+        )
+        db.add(job)
+        db.commit()
+        original_lease_until = job.lease_until
+        lease = _BackgroundJobLease(factory, job.id, job.lease_token)
+        lease.start()
+        try:
+            time.sleep(1.2)
+            db.refresh(job)
+            assert job.lease_until > original_lease_until
+        finally:
+            lease.stop()
+    engine.dispose()
+
+
+def test_revision_operation_lease_renews_without_holding_db_transaction(
+    tmp_path, monkeypatch
+):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'revision-heartbeat.db'}", future=True
+    )
+    Base.metadata.create_all(bind=engine)
+    factory = sessionmaker(bind=engine, future=True)
+    monkeypatch.setattr(pipeline, "REVISION_OPERATION_LEASE_SECONDS", 3)
+    with factory() as db:
+        repo = m.Repository(
+            github_repo_id="lease-repo",
+            owner_login="octo",
+            name="widgets",
+            full_name="octo/widgets",
+        )
+        db.add(repo)
+        db.flush()
+        pr = m.PullRequest(
+            repository_id=repo.id,
+            github_pr_number=4,
+            head_sha="sha-one",
+            state="open",
+        )
+        db.add(pr)
+        db.commit()
+
+        with pipeline._revision_finalization_lock(
+            db,
+            repo.id,
+            pr.github_pr_number,
+            head_sha=pr.head_sha,
+            operation="test-renewal",
+        ) as lease:
+            assert not db.in_transaction()
+            with factory() as check_db:
+                operation = check_db.query(m.RevisionOperation).one()
+                original_lease_until = operation.lease_until
+            time.sleep(1.2)
+            with factory() as check_db:
+                operation = check_db.query(m.RevisionOperation).one()
+                assert operation.lease_until > original_lease_until
+            lease.assert_owned()
+            assert not db.in_transaction()
     engine.dispose()

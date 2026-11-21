@@ -11,6 +11,7 @@ from app.core.config import get_settings
 from app.integrations.github_client import github_client
 from app.models import models as m
 from app.services import ci_status, circuit_breaker
+from app.services.job_errors import RevisionLockUnavailable
 
 logger = logging.getLogger("securepr.auto_merge")
 GITHUB_VERIFICATION_ERRORS = (
@@ -128,6 +129,7 @@ def _clean_status_merge_fallback(
     merge_method,
     policy_revision,
     original_result,
+    assert_lease_owned=None,
 ):
     try:
         fallback_pr = github_client.get_pull_request(
@@ -145,6 +147,11 @@ def _clean_status_merge_fallback(
         fallback_required = github_client.get_required_status_checks(
             installation_id, owner, repo_name, base_branch
         )
+        fallback_review_requirements = (
+            github_client.get_required_pull_request_reviews(
+                installation_id, owner, repo_name, base_branch
+            )
+        )
     except GITHUB_VERIFICATION_ERRORS as exc:
         return AutoMergeResult(
             "VERIFICATION_UNAVAILABLE",
@@ -152,7 +159,21 @@ def _clean_status_merge_fallback(
             response_status=original_result.get("status_code"),
             response_payload=original_result.get("payload"),
         )
-    fallback_eligibility = saved_eligibility(db, repo, pr)
+    current_pr = (
+        db.query(m.PullRequest)
+        .filter(m.PullRequest.id == pr.id)
+        .populate_existing()
+        .first()
+    )
+    fallback_eligibility = (
+        saved_eligibility(db, repo, current_pr) if current_pr is not None else None
+    )
+    current_review = (
+        db.query(m.Review)
+        .filter(m.Review.id == review.id)
+        .populate_existing()
+        .first()
+    )
     fallback_ci = ci_status.evaluate_ci_status(
         fallback_checks + fallback_statuses,
         required_checks=fallback_required,
@@ -160,6 +181,11 @@ def _clean_status_merge_fallback(
     )
     fallback_repo = (fallback_caps.get("payload") or {}).get("repository") or {}
     fallback_github_pr = fallback_repo.get("pullRequest") or {}
+    fallback_breaker_tripped, _ = (
+        circuit_breaker.is_tripped(db, repo.id, current_pr.author_login)
+        if current_pr is not None
+        else (True, "PR is unavailable")
+    )
     authorized = (
         fallback_caps.get("succeeded")
         and fallback_eligibility is not None
@@ -167,7 +193,26 @@ def _clean_status_merge_fallback(
         and 0 <= fallback_eligibility.max_risk_threshold <= 100
         and review.overall_score <= fallback_eligibility.max_risk_threshold
         and fallback_eligibility.policy_revision == policy_revision
+        and current_pr is not None
+        and current_pr.state == "open"
+        and current_pr.head_sha == review_sha
+        and current_review is not None
+        and current_review.head_sha == review_sha
+        and current_review.decision == m.DecisionStatus.APPROVED
+        and current_review.github_action_confirmed
+        and current_review.analysis_completed_at is not None
+        and isinstance(fallback_review_requirements, dict)
+        and fallback_review_requirements.get("required_approving_review_count", 0) >= 1
+        and fallback_review_requirements.get("dismiss_stale_reviews") is True
+        and not fallback_breaker_tripped
         and fallback_repo.get("autoMergeAllowed")
+        and fallback_repo.get(
+            {
+                "MERGE": "mergeCommitAllowed",
+                "SQUASH": "squashMergeAllowed",
+                "REBASE": "rebaseMergeAllowed",
+            }[merge_method]
+        )
         and fallback_github_pr.get("state") == "OPEN"
         and not fallback_github_pr.get("isDraft")
         and fallback_github_pr.get("headRefOid") == review_sha
@@ -183,10 +228,13 @@ def _clean_status_merge_fallback(
     if not authorized:
         return AutoMergeResult(
             "NOT_ELIGIBLE",
-            "GitHub clean-status fallback failed live authorization or safety revalidation.",
+            "GitHub clean-status fallback failed fresh safety revalidation.",
             response_status=original_result.get("status_code"),
             response_payload=original_result.get("payload"),
         )
+    db.commit()
+    if assert_lease_owned:
+        assert_lease_owned()
     fallback_merge = github_client.merge_pull_request(
         installation_id,
         owner,
@@ -195,6 +243,8 @@ def _clean_status_merge_fallback(
         review_sha,
         merge_method,
     )
+    if assert_lease_owned:
+        assert_lease_owned()
     if fallback_merge.get("succeeded"):
         fallback_payload = fallback_merge.get("payload") or {}
         fallback_verified = github_client.get_pull_request(
@@ -235,8 +285,16 @@ def _capabilities_pull_request(response: dict) -> dict:
 
 
 def _disable_and_verify_auto_merge(
-    *, installation_id: str, owner: str, repo_name: str, pr_number: int, node_id: str
+    *,
+    installation_id: str,
+    owner: str,
+    repo_name: str,
+    pr_number: int,
+    node_id: str,
+    assert_lease_owned=None,
 ) -> None:
+    if assert_lease_owned:
+        assert_lease_owned()
     disabled = github_client.disable_pull_request_auto_merge(installation_id, node_id)
     if not disabled.get("succeeded"):
         raise RuntimeError(
@@ -255,6 +313,8 @@ def _disable_and_verify_auto_merge(
         raise RuntimeError(
             "GitHub still reports an active auto-merge request after cancellation."
         )
+    if assert_lease_owned:
+        assert_lease_owned()
 
 
 def cancel_pending_auto_merge(
@@ -271,8 +331,11 @@ def cancel_pending_auto_merge(
         "GitHub auto-merge was cancelled after the PR head changed."
     ),
     stale_only: bool = True,
+    assert_lease_owned=None,
 ) -> bool:
     """Cancel any existing request before processing a newer PR revision."""
+    if assert_lease_owned:
+        assert_lease_owned()
     response = github_client.get_auto_merge_capabilities(
         installation_id, owner, repo_name, pr_number
     )
@@ -283,6 +346,8 @@ def cancel_pending_auto_merge(
         )
     pull_request = _capabilities_pull_request(response)
     if not pull_request.get("autoMergeRequest"):
+        if assert_lease_owned:
+            assert_lease_owned()
         _record_auto_merge_cancellation(
             db,
             pull_request_id,
@@ -303,7 +368,10 @@ def cancel_pending_auto_merge(
         repo_name=repo_name,
         pr_number=pr_number,
         node_id=node_id,
+        assert_lease_owned=assert_lease_owned,
     )
+    if assert_lease_owned:
+        assert_lease_owned()
     _record_auto_merge_cancellation(
         db,
         pull_request_id,
@@ -377,8 +445,9 @@ def attempt(
     review,
     installation_id,
     findings,
+    assert_lease_owned=None,
 ):
-    """Revalidate the exact reviewed SHA and request auto-merge (never direct merge)."""
+    """Revalidate the exact reviewed SHA, then merge or request auto-merge."""
     settings = get_settings()
     if (
         pr.head_sha != review.head_sha
@@ -756,7 +825,21 @@ def attempt(
             and final_live_pr.get("mergeable") is True
             and final_live_pr.get("mergeable_state") == "clean"
         )
+        existing_auto_merge = final_github_pr.get("autoMergeRequest")
+        if (
+            not all_requirements_met
+            and isinstance(existing_auto_merge, dict)
+            and existing_auto_merge.get("enabledAt")
+            and existing_auto_merge.get("mergeMethod") == merge_method
+        ):
+            return AutoMergeResult(
+                "AUTO_MERGE_ENABLED",
+                "GitHub confirmed the matching auto-merge request is already enabled.",
+                policy_revision=policy_revision,
+            )
         if all_requirements_met:
+            if assert_lease_owned:
+                assert_lease_owned()
             merge_result = github_client.merge_pull_request(
                 installation_id,
                 owner,
@@ -765,6 +848,8 @@ def attempt(
                 review_sha,
                 merge_method,
             )
+            if assert_lease_owned:
+                assert_lease_owned()
             if merge_result.get("succeeded"):
                 payload = merge_result.get("payload") or {}
                 if payload.get("merged") is not True:
@@ -826,6 +911,11 @@ def attempt(
                 fallback_required = github_client.get_required_status_checks(
                     installation_id, owner, repo_name, base_branch
                 )
+                fallback_review_requirements = (
+                    github_client.get_required_pull_request_reviews(
+                        installation_id, owner, repo_name, base_branch
+                    )
+                )
             except GITHUB_VERIFICATION_ERRORS as exc:
                 return AutoMergeResult(
                     "VERIFICATION_UNAVAILABLE",
@@ -833,7 +923,23 @@ def attempt(
                     response_status=merge_result.get("status_code"),
                     response_payload=merge_result.get("payload"),
                 )
-            fallback_eligibility = saved_eligibility(db, repo, pr)
+            current_pr = (
+                db.query(m.PullRequest)
+                .filter(m.PullRequest.id == pr.id)
+                .populate_existing()
+                .first()
+            )
+            current_review = (
+                db.query(m.Review)
+                .filter(m.Review.id == review.id)
+                .populate_existing()
+                .first()
+            )
+            fallback_eligibility = (
+                saved_eligibility(db, repo, current_pr)
+                if current_pr is not None
+                else None
+            )
             fallback_ci = ci_status.evaluate_ci_status(
                 fallback_checks + fallback_statuses,
                 required_checks=fallback_required,
@@ -843,6 +949,11 @@ def attempt(
                 (fallback_caps.get("payload") or {}).get("repository") or {}
             )
             fallback_github_pr = fallback_repo.get("pullRequest") or {}
+            fallback_breaker_tripped, _ = (
+                circuit_breaker.is_tripped(db, repository_id, current_pr.author_login)
+                if current_pr is not None
+                else (True, "PR is unavailable")
+            )
             fallback_authorized = (
                 fallback_caps.get("succeeded")
                 and fallback_eligibility is not None
@@ -850,7 +961,29 @@ def attempt(
                 and 0 <= fallback_eligibility.max_risk_threshold <= 100
                 and review.overall_score <= fallback_eligibility.max_risk_threshold
                 and fallback_eligibility.policy_revision == policy_revision
+                and current_pr is not None
+                and current_pr.state == "open"
+                and current_pr.head_sha == review_sha
+                and current_review is not None
+                and current_review.head_sha == review_sha
+                and current_review.decision == m.DecisionStatus.APPROVED
+                and current_review.github_action_confirmed
+                and current_review.analysis_completed_at is not None
+                and isinstance(fallback_review_requirements, dict)
+                and fallback_review_requirements.get(
+                    "required_approving_review_count", 0
+                )
+                >= 1
+                and fallback_review_requirements.get("dismiss_stale_reviews") is True
+                and not fallback_breaker_tripped
                 and fallback_repo.get("autoMergeAllowed")
+                and fallback_repo.get(
+                    {
+                        "MERGE": "mergeCommitAllowed",
+                        "SQUASH": "squashMergeAllowed",
+                        "REBASE": "rebaseMergeAllowed",
+                    }[merge_method]
+                )
                 and fallback_github_pr.get("state") == "OPEN"
                 and not fallback_github_pr.get("isDraft")
                 and fallback_github_pr.get("headRefOid") == review_sha
@@ -866,10 +999,13 @@ def attempt(
             if not fallback_authorized:
                 return AutoMergeResult(
                     "NOT_ELIGIBLE",
-                    "GitHub clean-status fallback failed live authorization or safety revalidation.",
+                    "GitHub clean-status fallback failed fresh safety revalidation.",
                     response_status=merge_result.get("status_code"),
                     response_payload=merge_result.get("payload"),
                 )
+            db.commit()
+            if assert_lease_owned:
+                assert_lease_owned()
             fallback_merge = github_client.merge_pull_request(
                 installation_id,
                 owner,
@@ -878,6 +1014,8 @@ def attempt(
                 review_sha,
                 merge_method,
             )
+            if assert_lease_owned:
+                assert_lease_owned()
             if fallback_merge.get("succeeded"):
                 fallback_payload = fallback_merge.get("payload") or {}
                 fallback_verified = github_client.get_pull_request(
@@ -913,9 +1051,13 @@ def attempt(
                     ci_checks=final_ci_checks,
                     required_checks=final_required_checks,
                 )
+        if assert_lease_owned:
+            assert_lease_owned()
         result = github_client.enable_pull_request_auto_merge(
             installation_id, pull_request_id, merge_method
         )
+        if assert_lease_owned:
+            assert_lease_owned()
         if not result.get("succeeded"):
             message = _failure_message(result)
             if _is_permission_error(message):
@@ -940,6 +1082,7 @@ def attempt(
                     merge_method=merge_method,
                     policy_revision=policy_revision,
                     original_result=result,
+                    assert_lease_owned=assert_lease_owned,
                 )
             return AutoMergeResult(
                 "FAILED",
@@ -977,6 +1120,7 @@ def attempt(
                     repo_name=repo_name,
                     pr_number=pr_number,
                     node_id=pull_request_id,
+                    assert_lease_owned=assert_lease_owned,
                 )
             except GITHUB_VERIFICATION_ERRORS:
                 logger.exception(
@@ -1003,6 +1147,7 @@ def attempt(
                     repo_name=repo_name,
                     pr_number=pr_number,
                     node_id=pull_request_id,
+                    assert_lease_owned=assert_lease_owned,
                 )
             except GITHUB_VERIFICATION_ERRORS as exc:
                 logger.exception(
@@ -1048,6 +1193,8 @@ def attempt(
                     pr_number=pr_number,
                     node_id=pull_request_id,
                 )
+            except RevisionLockUnavailable:
+                raise
             except SQLAlchemyError:
                 logger.exception(
                     "Database failure while verifying auto-merge authorization: "

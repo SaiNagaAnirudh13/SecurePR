@@ -92,9 +92,10 @@ Alembic-managed:
 `backend/migrations/versions/20261120_01_reconcile_ci_gate_schema.py` and
 `20261120_02_ai_review_lifecycle.py` reconcile the CI and AI lifecycle
 schemas, while `20261121_01_groq_review_metadata.py` records provider, model,
-and token usage and adds fencing tokens to durable job leases. The migrations
-preserve existing rows and are forward-only where rollback could discard
-production history.
+and token usage, adds fencing tokens to durable job leases, and
+`20261121_02_revision_operation_leases.py` creates revision-scoped operation
+leases. The migrations preserve existing rows and are forward-only where
+rollback could discard production history.
 
 Render starts the backend through `python run.py`. In production, that wrapper
 validates settings, acquires a bounded PostgreSQL migration advisory lock on a
@@ -141,13 +142,13 @@ service-role key formats and requires HTTPS origins.
 4. **Webhook URL:** for local testing only, use a tunneling tool like `ngrok http 8000` and its temporary HTTPS URL. For production, use `https://<production-backend-domain>/webhooks/github`; never leave the ngrok URL configured in the production GitHub App.
 5. **Webhook secret:** generate a random string and put it in both the GitHub App form and `GITHUB_WEBHOOK_SECRET` in `.env`.
 6. **Permissions** (Repository permissions):
-   - Pull requests: **Read & write** (to read PRs and publish reviews or request GitHub auto-merge)
+   - Pull requests: **Read & write** (read PR/review state; publish reviews; invoke auto-merge and merge operations)
    - Checks: **Read-only** (to read CI check results)
    - Commit statuses: **Read-only** (to read legacy CI provider results)
    - Issues: **Read & write** (to post and update the single PR status comment)
    - Administration: **Read-only** (to inspect branch protection and rulesets)
    - Metadata: **Read-only** (mandatory)
-   - Do not grant any broader permissions than those listed. SecurePR does not request the immediate merge API or bypass branch protection.
+   - Do not grant any broader permissions than those listed. SecurePR can request GitHub auto-merge and can immediately merge a freshly verified, clean PR; it does not bypass branch protection.
 7. **Subscribe to events:** `Pull request`, `Check run`, `Check suite`, and `Commit status`.
    CI events update the authoritative revision-specific decision; no final
    decision or approval is published until required checks are verified.
@@ -241,23 +242,48 @@ Checks: Read-only, Commit statuses: Read-only, Issues: Read & write,
 Administration: Read-only, and Metadata: Read-only. Update the GitHub App
 installation after changing permissions.
 
-For auto-merge, configure the target branch with at least one required
-pull-request approval and enable **Dismiss stale pull request approvals when
-new commits are pushed** (classic branch protection) or its equivalent
-`pull_request` ruleset settings. SecurePR fails closed if it cannot verify
-these settings. This prevents a previously approved revision from satisfying
-branch protection after a push.
+Configure GitHub as follows for each repository and target branch. SecurePR
+fails closed when it cannot read a required setting or verify its state.
 
-Before requesting GitHub auto-merge, SecurePR refetches the PR, exact-SHA
-checks, branch requirements, GitHub auto-merge setting, supported merge
-methods, PR draft/state, required-review status, and permissions. Required
-reviews and checks remain enforced by GitHub; if they are outstanding, SecurePR
-does not bypass them. On pushes it cancels any prior auto-merge request before
-queueing a new revision, and it verifies the head again after enabling
-auto-merge, cancelling the request if the revision changed. It calls GitHub's GraphQL
-`enablePullRequestAutoMerge` mutation and records success only when GitHub
-confirms an enabled auto-merge request. This is not a confirmation that the PR
-has merged; only a GitHub merge event records `MERGED`.
+| GitHub setting | Where | Requirement and behavior if unavailable |
+|---|---|---|
+| **Allow auto-merge** | Repository → **Settings → General → Pull Requests** | Mandatory. The backend checks GraphQL `repository.autoMergeAllowed` before either API path. If false or unavailable, it records a blocker and does not merge. |
+| Supported merge method | Repository → **Settings → General → Pull Requests** | The method in `AUTO_MERGE_METHOD` (defaults to `SQUASH`) must be enabled. SecurePR does not silently substitute another method. |
+| Require pull-request reviews, with at least one approval | Branch protection or a branch ruleset matching the target branch | Mandatory. The GitHub App must be able to read it. Missing protection/read access blocks auto-merge. The bot's fresh approval must also be recognized by GitHub. |
+| Dismiss stale approvals when new commits are pushed | Branch protection → **Require a pull request before merging → Dismiss stale pull request approvals when new commits are pushed**, or the equivalent ruleset setting | Mandatory. SecurePR explicitly rejects auto-merge when it cannot verify this setting as enabled. |
+| Required status checks | The target branch's branch-protection/ruleset required-check list | Configure the exact GitHub context names, including case and punctuation. For the sample workflow: `build`, `dependency-audit`, `secret-scan`, and `test`. SecurePR discovers contexts from GitHub and matches them against runs/statuses on the reviewed SHA; missing, pending, failed, or mismatched required checks block an immediate merge. |
+| Require branches to be up to date | Branch protection/ruleset | Optional policy setting. SecurePR does not bypass it: an unclean/behind PR is left to GitHub auto-merge when GitHub accepts the GraphQL request; otherwise the dashboard records the blocker. |
+| App installed with access to the repository | GitHub App → **Install App** | Mandatory for the target repository. A missing installation or repository access prevents all reads and writes. |
+| App repository permissions | GitHub App → **Permissions & events → Repository permissions** | Mandatory: **Pull requests: Read & write**, **Checks: Read-only**, **Commit statuses: Read-only**, **Issues: Read & write**, **Administration: Read-only**, and **Metadata: Read-only**. Permission errors are recorded and shown; SecurePR fails closed. |
+| App event subscriptions | GitHub App → **Permissions & events → Subscribe to events** | Mandatory: **Pull request**, **Check run**, **Check suite**, and **Commit status**. Missing PR events prevent reviews being queued; missing CI events can leave CI state stale/pending. |
+
+The saved dashboard row for the exact repository and PR author's GitHub login
+is the authorization for both automatic approval and merge. There is no
+separate environment-variable auto-merge switch in this version. The
+`AUTO_MERGE_METHOD` environment setting is only an operational choice.
+
+Before any GitHub mutation, SecurePR refetches the PR and checks its exact
+head SHA, current dashboard authorization and threshold, fresh CI results,
+required branch checks/reviews, review decision, mergeability, repository
+auto-merge setting, and merge method. On a clean PR with all applicable
+requirements satisfied, it calls GitHub's REST
+`PUT /repos/{owner}/{repo}/pulls/{number}/merge` endpoint with the reviewed
+head SHA and selected method. It verifies `merged: true` with a subsequent PR
+read before reporting `MERGED`. If GitHub has not yet recognized SecurePR's
+submitted approval, or a fresh CI/protection verification is temporarily
+pending, SecurePR schedules at most three bounded auto-merge rechecks (30, 60,
+and 120 seconds). Permission, policy, stale-head, and other terminal failures
+are reported without retries. If GitHub's clean-status response comes back
+from an API attempt, SecurePR refetches the PR and freshly revalidates the
+policy, approval, risk threshold, CI, branch protection, and head before
+retrying that SHA-guarded merge. It never falls back on unrelated API errors.
+
+When GitHub's requirements are not yet all satisfied but GitHub supports
+auto-merge, SecurePR uses GraphQL `enablePullRequestAutoMerge`. It reports
+`AUTO_MERGE_ENABLED` only after GitHub confirms the request; this is not a
+claim that the PR has merged. GitHub continues enforcing its review and check
+rules. GitHub webhooks and subsequent dashboard reads update the final PR
+state; no production merge is performed by tests.
 
 The dashboard shows the saved account, repository, threshold, and enabled
 state. Every attempt and its response are stored in `github_actions` and

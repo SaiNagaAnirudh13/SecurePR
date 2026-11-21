@@ -919,9 +919,10 @@ async def github_webhook(
                     pr_number,
                     head_sha=synchronized_sha,
                     operation="auto-merge-cancellation",
-                ):
+                ) as lease:
                     db.commit()
                     db.expire_all()
+                    lease.assert_owned()
                     auto_merge.cancel_pending_auto_merge(
                         installation_id=installation_id,
                         owner=owner,
@@ -930,6 +931,7 @@ async def github_webhook(
                         db=db,
                         pull_request_id=pull_request_id,
                         new_head_sha=synchronized_sha,
+                        assert_lease_owned=lease.assert_owned,
                     )
             except Exception as exc:
                 logger.exception(
