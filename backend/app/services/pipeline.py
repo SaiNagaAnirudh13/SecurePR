@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -42,10 +43,18 @@ CI_FETCH_ERRORS = (
 )
 settings = get_settings()
 REVISION_OPERATION_LEASE_SECONDS = 300
+_local_revision_locks: dict[tuple[str, int, str, str], threading.RLock] = {}
+_local_revision_locks_guard = threading.Lock()
 
 
 class RevisionLockUnavailable(TimeoutError):
     """Raised when another worker currently owns a revision operation."""
+
+
+def _for_update(query, entity):
+    if query.session.get_bind().dialect.name == "mssql":
+        return query.with_hint(entity, "WITH (UPDLOCK, ROWLOCK)", dialect_name="mssql")
+    return query.with_for_update()
 
 
 def _claim_revision_operation(
@@ -57,15 +66,14 @@ def _claim_revision_operation(
 ) -> tuple[str, str, str]:
     """Claim a revision operation in a short row-locking transaction."""
     try:
-        pr = (
+        pr_query = (
             db.query(m.PullRequest)
             .filter(
                 m.PullRequest.repository_id == repository_id,
                 m.PullRequest.github_pr_number == pr_number,
             )
-            .with_for_update()
-            .first()
         )
+        pr = _for_update(pr_query, m.PullRequest).first()
         if pr is None:
             raise RuntimeError(
                 "Cannot claim a revision operation for a missing pull request."
@@ -103,12 +111,13 @@ def _claim_revision_operation(
             except IntegrityError:
                 pass
 
-        revision_operation = (
+        operation_query = (
             db.query(m.RevisionOperation)
             .filter_by(**identity)
-            .with_for_update()
-            .one()
         )
+        revision_operation = _for_update(
+            operation_query, m.RevisionOperation
+        ).one()
         now = datetime.utcnow()
         if (
             revision_operation.state == "RUNNING"
@@ -145,12 +154,13 @@ def _finish_revision_operation(
     error: Exception | None = None,
 ) -> None:
     try:
-        revision_operation = (
+        operation_query = (
             db.query(m.RevisionOperation)
             .filter(m.RevisionOperation.id == operation_id)
-            .with_for_update()
-            .first()
         )
+        revision_operation = _for_update(
+            operation_query, m.RevisionOperation
+        ).first()
         if (
             revision_operation is None
             or revision_operation.state != "RUNNING"
@@ -196,38 +206,50 @@ def _revision_finalization_lock(
         "job_id": job_id or "unknown",
         "retry_count": retry_count,
     }
-    db.commit()
-    operation_id, owner_token, claimed_sha = _claim_revision_operation(
-        db, repository_id, pr_number, head_sha, operation
-    )
-    fields["head_sha"] = claimed_sha
-    logger.info(
-        "PR revision operation claimed: repository_id=%(repository_id)s "
-        "pr_number=%(pr_number)s head_sha=%(head_sha)s operation=%(operation)s "
-        "job_id=%(job_id)s retry_count=%(retry_count)s",
-        fields,
-        extra=fields,
-    )
+    local_lock = None
+    if db.get_bind().dialect.name == "sqlite":
+        lock_key = (repository_id, pr_number, head_sha or "", operation)
+        with _local_revision_locks_guard:
+            local_lock = _local_revision_locks.setdefault(
+                lock_key, threading.RLock()
+            )
+        local_lock.acquire()
     try:
-        yield
-    except Exception as exc:
-        db.rollback()
-        _finish_revision_operation(db, operation_id, owner_token, exc)
-        raise
-    else:
         db.commit()
-        _finish_revision_operation(db, operation_id, owner_token)
+        operation_id, owner_token, claimed_sha = _claim_revision_operation(
+            db, repository_id, pr_number, head_sha, operation
+        )
+        fields["head_sha"] = claimed_sha
         logger.info(
-            "PR revision operation completed: repository_id=%s pr_number=%s "
-            "head_sha=%s operation=%s job_id=%s retry_count=%s",
-            repository_id,
-            pr_number,
-            claimed_sha,
-            operation,
-            job_id or "unknown",
-            retry_count,
+            "PR revision operation claimed: repository_id=%(repository_id)s "
+            "pr_number=%(pr_number)s head_sha=%(head_sha)s operation=%(operation)s "
+            "job_id=%(job_id)s retry_count=%(retry_count)s",
+            fields,
             extra=fields,
         )
+        try:
+            yield
+        except Exception as exc:
+            db.rollback()
+            _finish_revision_operation(db, operation_id, owner_token, exc)
+            raise
+        else:
+            db.commit()
+            _finish_revision_operation(db, operation_id, owner_token)
+            logger.info(
+                "PR revision operation completed: repository_id=%s pr_number=%s "
+                "head_sha=%s operation=%s job_id=%s retry_count=%s",
+                repository_id,
+                pr_number,
+                claimed_sha,
+                operation,
+                job_id or "unknown",
+                retry_count,
+                extra=fields,
+            )
+    finally:
+        if local_lock:
+            local_lock.release()
 
 
 def _verify_latest_pr_revision(
@@ -255,12 +277,11 @@ def _confirm_pr_revision_in_database(
 ) -> bool:
     db.commit()
     try:
-        current_pr = (
+        current_query = (
             db.query(m.PullRequest)
             .filter(m.PullRequest.id == pr.id)
-            .with_for_update()
-            .first()
         )
+        current_pr = _for_update(current_query, m.PullRequest).first()
         current = bool(
             current_pr
             and current_pr.state == "open"

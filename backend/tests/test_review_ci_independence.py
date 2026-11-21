@@ -928,18 +928,14 @@ def test_concurrent_workers_publish_only_one_final_review(
         try:
             worker_repo = session.query(m.Repository).filter_by(id=repo_id).one()
             worker_pr = session.query(m.PullRequest).filter_by(id=pull_request_id).one()
-            try:
-                review = _run(session, worker_repo, worker_pr)
-            except pipeline.RevisionLockUnavailable:
-                return None
-            return review.id if review else None
+            return _run(session, worker_repo, worker_pr).id
         finally:
             session.close()
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(lambda _: run_worker(), range(2)))
 
-    assert len([result for result in results if result]) == 1
+    assert results[0] == results[1]
     assert len(posted) == 1
     assert (
         db_session.query(m.Review)
