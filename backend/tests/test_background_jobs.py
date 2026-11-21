@@ -224,7 +224,7 @@ def test_revision_lock_conflict_is_deferred_without_spending_attempts(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'lock-conflict.db'}", future=True)
     Base.metadata.create_all(bind=engine)
     session = sessionmaker(bind=engine, future=True)()
-    now = datetime.utcnow()
+    now = datetime.utcnow()  # noqa: DTZ003
     job = m.BackgroundJob(
         job_type="REVIEW",
         idempotency_key="review:lock-conflict",
@@ -325,8 +325,8 @@ def test_background_job_lease_is_renewed_during_long_work(tmp_path, monkeypatch)
             state="RUNNING",
             attempts=1,
             lease_token=1,
-            available_at=datetime.utcnow(),
-            lease_until=datetime.utcnow() + timedelta(seconds=3),
+            available_at=datetime.utcnow(),  # noqa: DTZ003
+            lease_until=datetime.utcnow() + timedelta(seconds=3),  # noqa: DTZ003
         )
         db.add(job)
         db.commit()

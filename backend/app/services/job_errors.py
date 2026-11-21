@@ -13,6 +13,8 @@ class RevisionLockUnavailable(TimeoutError):
         operation: str = "unknown",
     ) -> None:
         super().__init__(message)
-        self.retry_at = retry_at or (datetime.utcnow() + timedelta(seconds=30))
+        self.retry_at = retry_at or (
+            datetime.utcnow() + timedelta(seconds=30)  # noqa: DTZ003
+        )
         self.lease_owner = lease_owner
         self.operation = operation

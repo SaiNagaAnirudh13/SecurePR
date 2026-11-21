@@ -61,7 +61,7 @@ def _record_job_failure(
     non_retryable_database_error = isinstance(exc, NON_RETRYABLE_DATABASE_ERRORS) or (
         isinstance(exc, DBAPIError) and not _is_transient_database_error(exc)
     )
-    now = datetime.utcnow()
+    now = datetime.utcnow()  # noqa: DTZ003
     if lock_conflict:
         state = "QUEUED"
         # A lock deferral is not an execution attempt; preserve the real retry budget.
@@ -534,7 +534,8 @@ class _Worker:
                             m.BackgroundJob.id == job.id,
                             m.BackgroundJob.state == "RUNNING",
                             m.BackgroundJob.lease_token == claimed_lease_token,
-                            m.BackgroundJob.lease_until > datetime.utcnow(),
+                            m.BackgroundJob.lease_until
+                            > datetime.utcnow(),  # noqa: DTZ003
                         )
                         .values(**values)
                     )

@@ -5,9 +5,10 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Callable, Iterator, cast
+from typing import cast
 
 import requests
 from sqlalchemy import update
@@ -62,7 +63,7 @@ class RevisionOperationLease:
         self.operation_id = operation_id
         self.owner_token = owner_token
         self.fields = fields
-        self._lease_until = datetime.utcnow() + timedelta(
+        self._lease_until = datetime.utcnow() + timedelta(  # noqa: DTZ003
             seconds=REVISION_OPERATION_LEASE_SECONDS
         )
         self._stop = threading.Event()
@@ -90,7 +91,7 @@ class RevisionOperationLease:
                 lease_owner="unknown",
                 operation=self.fields["operation"],
             )
-        now = datetime.utcnow()
+        now = datetime.utcnow()  # noqa: DTZ003
         session = self._factory()
         try:
             result = session.execute(
@@ -275,7 +276,8 @@ def _finish_revision_operation(
             or revision_operation.state != "RUNNING"
             or revision_operation.owner_token != owner_token
             or revision_operation.lease_until is None
-            or revision_operation.lease_until <= datetime.utcnow()
+            or revision_operation.lease_until
+            <= datetime.utcnow()  # noqa: DTZ003
         ):
             db.rollback()
             logger.warning(
@@ -739,7 +741,9 @@ def _queue_auto_merge_retry(
             "head_sha": review.head_sha,
             "retry_count": next_retry,
         },
-        available_at=datetime.utcnow() + timedelta(seconds=delay_seconds),
+        available_at=datetime.utcnow() + timedelta(  # noqa: DTZ003
+            seconds=delay_seconds
+        ),
     )
 
 
@@ -2878,9 +2882,9 @@ def process_auto_merge_retry_job(db: Session, payload: dict) -> None:
         lease.assert_owned()
         review.auto_merge_status = result.status
         review.auto_merge_policy_revision = result.policy_revision
-        review.auto_merge_attempted_at = datetime.utcnow()
+        review.auto_merge_attempted_at = datetime.utcnow()  # noqa: DTZ003
         if result.status == "MERGED":
-            review.auto_merged_at = datetime.utcnow()
+            review.auto_merged_at = datetime.utcnow()  # noqa: DTZ003
             review.auto_merge_failure_reason = None
             pr.state = "closed"
             pr.merged_at = review.auto_merged_at
