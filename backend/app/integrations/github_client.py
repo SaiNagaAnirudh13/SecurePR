@@ -388,7 +388,7 @@ class GitHubClient:
         if not isinstance(branch_data, dict) or not isinstance(
             branch_data.get("protected"), bool
         ):
-            raise ValueError("GitHub branch response is missing its protection state.")
+            raise TypeError("GitHub branch response has an invalid protection state.")
         required = []
         if branch_data["protected"]:
             checks_url = (
@@ -465,6 +465,90 @@ class GitHubClient:
 
         unique = {(item["context"], item["app_id"]): item for item in required}
         return list(unique.values())
+
+    def get_required_pull_request_reviews(
+        self, installation_id: str, owner: str, repo: str, branch: str
+    ) -> dict:
+        """Require protected branches to invalidate approvals after every push."""
+        headers = self._headers(installation_id)
+        branch_url = f"{GITHUB_API}/repos/{owner}/{repo}/branches/{branch}"
+        branch_response = self._get_with_retry(
+            branch_url, headers, allowed_statuses=(404,)
+        )
+        if branch_response.status_code == 404:
+            raise ValueError(
+                f"GitHub could not verify branch protection for '{branch}'."
+            )
+        branch_data = branch_response.json()
+        if not isinstance(branch_data, dict) or not isinstance(
+            branch_data.get("protected"), bool
+        ):
+            raise ValueError("GitHub branch response is missing its protection state.")
+
+        protections = []
+        if branch_data["protected"]:
+            reviews_url = (
+                f"{GITHUB_API}/repos/{owner}/{repo}/branches/{branch}"
+                "/protection/required_pull_request_reviews"
+            )
+            response = self._get_with_retry(
+                reviews_url, headers, allowed_statuses=(404,)
+            )
+            if response.status_code != 404:
+                protection = response.json()
+                if not isinstance(protection, dict):
+                    raise ValueError(
+                        "GitHub required-review protection response is malformed."
+                    )
+                protections.append(
+                    {
+                        "required_approving_review_count": protection.get(
+                            "required_approving_review_count"
+                        ),
+                        "dismiss_stale_reviews": protection.get(
+                            "dismiss_stale_reviews"
+                        ),
+                    }
+                )
+
+        rules_url = f"{GITHUB_API}/repos/{owner}/{repo}/rules/branches/{branch}"
+        for rule in self._get_paginated_items(rules_url, headers):
+            if rule.get("type") != "pull_request":
+                continue
+            parameters = rule.get("parameters")
+            if not isinstance(parameters, dict):
+                raise TypeError("GitHub pull-request ruleset protection is malformed.")
+            protections.append(
+                {
+                    "required_approving_review_count": parameters.get(
+                        "required_approving_review_count"
+                    ),
+                    "dismiss_stale_reviews": parameters.get("dismiss_stale_reviews"),
+                }
+            )
+
+        if not protections:
+            raise ValueError(
+                "GitHub branch protection must require pull-request reviews."
+            )
+        required_counts: list[int] = []
+        for protection in protections:
+            count = protection["required_approving_review_count"]
+            if (
+                isinstance(count, bool)
+                or not isinstance(count, int)
+                or count < 1
+                or protection["dismiss_stale_reviews"] is not True
+            ):
+                raise ValueError(
+                    "GitHub protection must require an approval and dismiss stale "
+                    "approvals when new commits are pushed."
+                )
+            required_counts.append(count)
+        return {
+            "required_approving_review_count": max(required_counts),
+            "dismiss_stale_reviews": True,
+        }
 
     def _graphql(self, installation_id: str, query: str, variables: dict) -> dict:
         response = requests.post(
@@ -546,6 +630,54 @@ class GitHubClient:
             mutation,
             {"pullRequestId": pull_request_id, "mergeMethod": merge_method},
         )
+
+    def disable_pull_request_auto_merge(
+        self, installation_id: str, pull_request_id: str
+    ) -> dict:
+        mutation = """
+        mutation($pullRequestId: ID!) {
+          disablePullRequestAutoMerge(input: {
+            pullRequestId: $pullRequestId
+          }) {
+            pullRequest {
+              id
+              autoMergeRequest { enabledAt mergeMethod }
+            }
+          }
+        }
+        """
+        return self._graphql(
+            installation_id, mutation, {"pullRequestId": pull_request_id}
+        )
+
+    def merge_pull_request(
+        self,
+        installation_id: str,
+        owner: str,
+        repo: str,
+        pr_number: int,
+        expected_head_sha: str,
+        merge_method: str,
+    ) -> dict:
+        """Call GitHub's immediate merge endpoint with an SHA guard."""
+        resp = requests.put(
+            f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}/merge",
+            headers=self._headers(installation_id),
+            json={
+                "sha": expected_head_sha,
+                "merge_method": merge_method.lower(),
+            },
+            timeout=20,
+        )
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = {"message": resp.text}
+        return {
+            "succeeded": resp.ok,
+            "status_code": resp.status_code,
+            "payload": payload,
+        }
 
     def post_review(
         self,
@@ -637,10 +769,12 @@ class GitHubClient:
         data = resp.json()
         return {
             "state": data.get("state"),
+            "merged": data.get("merged") is True,
             "mergeable": data.get("mergeable"),
             "mergeable_state": data.get("mergeable_state"),
             "head_sha": (data.get("head") or {}).get("sha"),
             "base_ref": (data.get("base") or {}).get("ref"),
+            "merge_commit_sha": data.get("merge_commit_sha"),
         }
 
     def _find_marked_record(

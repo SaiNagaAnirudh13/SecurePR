@@ -253,19 +253,9 @@
       <section id="tab-approval-config" class="tab">
         <div class="topbar">
           <div>
-            <h1>Automatic Approval Configuration</h1>
+            <h1>Auto-Approval &amp; Auto-Merge Configuration</h1>
             <p class="subtitle">Pull requests may only be automatically approved when all required checks pass, the risk score is below the configured threshold, no critical findings exist, policies pass, and the Circuit Breaker is inactive.</p>
           </div>
-        </div>
-        <div class="panel" id="autoMergeConfigPanel">
-          <h2 class="section-title">GitHub Auto-Merge</h2>
-          <p class="section-sub" id="autoMergeGlobalStatus">Loading SecurePR auto-merge configuration…</p>
-          <div class="form-row">
-            <label class="field-label" for="repoAutoMergeEnabled">Enable auto-merge for selected repository</label>
-            <input type="checkbox" id="repoAutoMergeEnabled" />
-            <button class="btn secondary" onclick="saveRepositoryAutoMerge()">Save repository setting</button>
-          </div>
-          <p class="section-sub">This setting does not enable auto-merge in GitHub or bypass branch protection. SecurePR global auto-merge remains off unless explicitly configured.</p>
         </div>
         <div class="panel">
           <div class="form-row">
@@ -274,24 +264,21 @@
               <select id="eligRepoSelect" class="control-select" onchange="onEligRepoChange()"><option value="">Select a repository…</option></select>
             </div>
             <div>
-              <label class="field-label">GitHub user</label>
-              <select id="eligUserSelect" class="control-select"><option value="">Select a known author…</option></select>
-            </div>
-            <div>
-              <label class="field-label">Or enter manually</label>
-              <input id="eligUserManual" placeholder="github username" style="width:160px;" />
+              <label class="field-label">GitHub account / PR author</label>
+              <select id="eligUserSelect" class="control-select" onchange="onEligUserChange()"><option value="">Select an account…</option></select>
             </div>
             <div>
               <label class="field-label">Max risk threshold</label>
-              <input id="eligThreshold" value="39" style="width:100px;" />
+              <input id="eligThreshold" type="number" min="0" max="100" step="1" value="39" style="width:100px;" />
             </div>
             <div>
-              <label class="field-label">Enabled</label>
+              <label class="field-label" for="eligEnabled">Enable auto-approval and auto-merge</label>
               <div style="padding-top:6px;"><input type="checkbox" id="eligEnabled" /></div>
             </div>
           </div>
-          <button class="btn" onclick="setEligibility()">Save</button>
+          <button class="btn" onclick="setEligibility()">Save configuration</button>
         </div>
+        <div class="panel"><p id="eligSavedSummary" class="section-sub">Select a repository and GitHub account to inspect the saved configuration.</p></div>
         <div class="panel" id="eligPanel"><div class="empty-state">Select a repository above to see configured users.</div></div>
       </section>
 

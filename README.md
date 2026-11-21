@@ -30,7 +30,7 @@ SecurePR/
 │   │   ├── schemas/            Pydantic request/response schemas
 │   │   ├── services/           risk engine, policy engine, circuit breaker,
 │   │   │                       impact simulator, decision engine, pipeline
-│   │   └── integrations/       GitHub App client, Gemini client
+│   │   └── integrations/       GitHub App client, Groq client
 │   ├── tests/                 pytest unit tests
 │   ├── run.py                  cloud-platform entry point (uses PORT)
 │   ├── requirements.txt
@@ -69,25 +69,27 @@ SecurePR/
 
 ## Design notes worth knowing before you run this
 
-- **The AI never decides.** Gemini contributes dimension-score opinions and
-  rationale text; `services/decision_engine.py` is pure deterministic Python
-  with no AI dependency, and it is the only thing that produces an
-  APPROVED/BLOCKED/MANUAL_REVIEW decision. AI scores can only
-  raise a heuristic risk score, never lower one (`risk_engine.blend_with_ai`).
+- **AI review is a required decision prerequisite.** Groq must return
+  validated risk dimensions, explanations, and findings for the exact PR head
+  SHA. The deterministic decision engine applies CI and repository policy to
+  that completed analysis. If AI fails or returns invalid data, SecurePR
+  records `REVIEW_UNAVAILABLE`, reports risk as not evaluated, and cannot
+  approve or auto-merge.
 - **CI gates every final decision.** A pull-request webhook queues durable
   review, status-comment, and CI-discovery jobs. SecurePR updates one
   `Waiting for CI` comment while checks are pending. CI failure blocks
   approval regardless of risk; unknown, unavailable, incomplete, empty, and
   non-success check results cannot approve. Only after every discovered
   execution and applicable required status check for the exact head SHA passes
-  does the policy engine evaluate risk and eligibility. See
+  and AI analysis are valid for the exact head SHA does the policy engine
+  evaluate risk and eligibility. See
   [`docs/CI_DECISION_LIFECYCLE.md`](docs/CI_DECISION_LIFECYCLE.md).
-- **Gemini model fallback.** `gemini-3.8-flash` is configured by default, but
-  `integrations/gemini_client.py` probes model availability at call time and
-  falls back to `GEMINI_FALLBACK_MODEL` (default `gemini-2.0-flash`) if it
-  isn't available on your account — analysis continues either way.
-- **Guarded GitHub auto-merge.** It is disabled globally by default and
-  requires per-repository opt-in. Before requesting GitHub auto-merge,
+- **Groq model selection is explicit.** SecurePR uses only the configured
+  `GROQ_MODEL`; an unavailable model or provider failure produces an
+  unavailable review instead of silently switching models or substituting
+  deterministic scores.
+- **Guarded GitHub auto-merge.** Only a saved dashboard policy for the exact
+  GitHub account and repository can authorize it. Before requesting GitHub auto-merge,
   SecurePR rechecks the reviewed commit, CI, branch protection, required
   reviews, GitHub settings, and permissions. SecurePR never performs an
   immediate or force merge. See
@@ -133,7 +135,7 @@ venv\Scripts\activate
 pip install -r requirements-dev.txt
 pytest -q
 ruff check --select E9,F63,F7,F82 app tests
-mypy --ignore-missing-imports --follow-imports=skip app/services/ci_status.py app/services/comment_formatter.py app/integrations/gemini_client.py
+mypy --ignore-missing-imports --follow-imports=skip app/services/ci_status.py app/services/comment_formatter.py app/integrations/groq_client.py
 pip-audit -r requirements.txt
 ```
 

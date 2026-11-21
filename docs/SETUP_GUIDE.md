@@ -45,7 +45,7 @@ Open `backend\.env` in VS Code and set:
 
 - `DATABASE_URL` — the Supabase PostgreSQL URL described in section 5 below.
 - `GITHUB_APP_ID`, `GITHUB_PRIVATE_KEY_PATH` or `GITHUB_PRIVATE_KEY`, and `GITHUB_WEBHOOK_SECRET` — see section 7 (GitHub App setup).
-- `GEMINI_API_KEY`, `GEMINI_MODEL` — see section 8 (Gemini setup).
+- `GROQ_API_KEY`, `GROQ_MODEL` — see section 8 (Groq setup).
 
 **Never commit `.env`** — it's already covered by `.gitignore`.
 
@@ -89,25 +89,21 @@ URL-encode special characters in the password. `sslmode=require` enables TLS
 for the Supabase connection. The numbered SQL files in `database/postgresql/`
 are the legacy bootstrap history. The deployment migration is now
 Alembic-managed:
-`backend/migrations/versions/20261120_01_reconcile_ci_gate_schema.py`
-safely reconciles the changes from SQL migration `004`, including the
-pull-request merge metadata. It adds nullable fields and widens the
-publication message type without replacing existing rows. It is forward-only
-because dropping columns during rollback could discard production data.
+`backend/migrations/versions/20261120_01_reconcile_ci_gate_schema.py` and
+`20261120_02_ai_review_lifecycle.py` reconcile the CI and AI lifecycle
+schemas, while `20261121_01_groq_review_metadata.py` records provider, model,
+and token usage and adds fencing tokens to durable job leases. The migrations
+preserve existing rows and are forward-only where rollback could discard
+production history.
 
-Render's `render.yaml` runs `alembic upgrade head` as the service
-`preDeployCommand`, before the new application instance starts. Set Render's
-`DATABASE_URL` to the intended production PostgreSQL URL; the migration
-command and backend use the same setting, and neither prints it. Configure a
-single pre-deploy migration command rather than running migrations from app
-workers. Render supports `preDeployCommand` only for paid web services,
-private services, and background workers. If the backend is on a plan that
-does not support it, move it to a supported plan or run the same command once
-as a serialized release step before routing traffic; do not rely on startup
-workers to race through migrations. Production startup verifies that the
-Alembic revision is current and does not call `create_all`; a failed or
-skipped migration prevents the app from starting. Local development retains
-`create_all` for disposable databases.
+Render starts the backend through `python run.py`. In production, that wrapper
+validates settings, acquires a bounded PostgreSQL migration advisory lock on a
+dedicated non-pooled connection, runs `alembic upgrade head`, verifies the
+revision, releases the lock on the same connection, then starts Uvicorn. A
+failed or timed-out migration prevents the app from starting. Set Render's
+`DATABASE_URL` to the intended production PostgreSQL URL; it is not printed.
+Production startup does not call `create_all`; local development retains it
+for disposable databases.
 
 For a fresh database, initialize the tables with
 `database/postgresql/001_initial_schema.sql` and the required legacy bootstrap
@@ -160,18 +156,20 @@ service-role key formats and requires HTTPS origins.
 10. Scroll down → **Generate a private key** → a `.pem` file downloads. For local development, create a `backend/secrets/` folder, store the key there, and set `GITHUB_PRIVATE_KEY_PATH=./secrets/github-app-private-key.pem`. For Render, enter the PEM contents in the backend-only `GITHUB_PRIVATE_KEY` secret setting. Literal `\n` sequences are also normalized by the backend. Do not commit the key or put it in `GITHUB_PRIVATE_KEY_PATH` as a public URL.
 11. **Install the App** on the repository you want SecurePR to analyze (Install App → choose repository).
 
-## 8. Gemini API configuration
+## 8. Groq API configuration
 
-1. Get an API key from Google AI Studio: https://aistudio.google.com/apikey.
-2. Set `GEMINI_API_KEY` in `.env`.
-3. Set `GEMINI_MODEL=gemini-3.8-flash` (the model requested for this project).
-   **Model availability note:** SecurePR automatically checks at call time whether
-   `GEMINI_MODEL` is listed for your API key. If `gemini-3.8-flash` is not yet
-   available on your account/region, it transparently falls back to
-   `GEMINI_FALLBACK_MODEL` (default `gemini-2.0-flash`, also configurable in
-   `.env`) and logs a warning — analysis continues uninterrupted either way,
-   since AI scoring is only one input into the deterministic decision engine,
-   never a requirement for it to run.
+1. Create a backend-only API key in the Groq Console.
+2. Set `GROQ_API_KEY` in `.env`.
+3. Set `GROQ_MODEL` to a supported model available to your API key. The
+   initial model is `openai/gpt-oss-120b`; Groq currently lists it as a
+   production model with strict JSON-schema structured-output support.
+   SecurePR uses only that configured model and does not silently substitute
+   another model. A missing model, authentication failure, quota exhaustion,
+   provider outage, timeout, or invalid response leaves the AI review
+   unavailable; no risk score or approval is produced.
+4. Short transient rate limits and network errors use bounded retries.
+   Longer `Retry-After` delays are queued for later; daily quota exhaustion is
+   not repeatedly retried.
 
 ## 9. CI-gated review lifecycle
 
@@ -221,51 +219,50 @@ Configure `GITHUB_WEBHOOK_SECRET` and subscribe the GitHub App to `Pull
 request`, `Check run`, `Check suite`, and `Commit status` events. Database
 migrations preserve lifecycle and publication state across process restarts.
 
-## 10. Safe auto-merge
+## 10. Safe auto-approval and auto-merge
 
-Auto-merge is off by default and is considered only after the authoritative
-decision is `APPROVED` for the current PR head SHA.
+The dashboard's saved policy for one GitHub account and repository is the sole
+user authorization for automatic approval and GitHub auto-merge. Select a
+known PR author, repository, maximum risk threshold (0-100), and enabled
+state, then save. Unsaved form values have no effect. No environment variable,
+repository toggle, or policy-file category can enable this behavior.
 
-The repository policy's `auto_merge_allowed_risk_categories` defaults to
-`["LOW"]`; MEDIUM/HIGH categories require explicit inclusion in that
-repository's policy. `AUTO_MERGE_LOW_RISK_ONLY=true` remains a global cap
-that a repository policy cannot override. CI is refetched for the exact
-reviewed SHA, including required branch-protection/ruleset checks. SecurePR
-waits on pending checks and blocks on failed checks. Empty, missing-required,
-non-success, unknown, or unavailable verification never permits a request.
-SecurePR does not silently change the configured merge method.
+The backend reloads the persisted row for the exact repository and PR author
+for every decision. Missing, disabled, inconsistent, or out-of-range settings
+fail closed. AI analysis must be validated and complete; the reviewed SHA
+must still be current; all discovered and required CI checks must pass; and
+GitHub must confirm permissions, branch protection, required reviews, merge
+method, and repository auto-merge settings. The Circuit Breaker remains an
+emergency stop.
 
-For local testing, set the following in `backend/.env` and restart the backend:
+The `AUTO_MERGE_METHOD` setting selects the operational GitHub method only; it
+does not authorize a merge. The GitHub App needs Pull requests: Read & write,
+Checks: Read-only, Commit statuses: Read-only, Issues: Read & write,
+Administration: Read-only, and Metadata: Read-only. Update the GitHub App
+installation after changing permissions.
 
-```env
-AUTO_MERGE_ENABLED=true
-AUTO_MERGE_LOW_RISK_ONLY=true
-```
-
-After the backend has initialized the schema, explicitly opt in only the test repository:
-
-```sql
-UPDATE repositories SET is_auto_merge_enabled = TRUE
-WHERE full_name = 'OWNER/REPOSITORY';
-```
-
-Set `AUTO_MERGE_ENABLED=false` or that repository flag to `FALSE` to disable it. Both switches must be true. The App also needs Pull requests: Read & write, Checks: Read-only, Commit statuses: Read-only, Issues: Read & write, Administration: Read-only, and Metadata: Read-only. Update the GitHub App installation after changing permissions.
+For auto-merge, configure the target branch with at least one required
+pull-request approval and enable **Dismiss stale pull request approvals when
+new commits are pushed** (classic branch protection) or its equivalent
+`pull_request` ruleset settings. SecurePR fails closed if it cannot verify
+these settings. This prevents a previously approved revision from satisfying
+branch protection after a push.
 
 Before requesting GitHub auto-merge, SecurePR refetches the PR, exact-SHA
 checks, branch requirements, GitHub auto-merge setting, supported merge
 methods, PR draft/state, required-review status, and permissions. Required
 reviews and checks remain enforced by GitHub; if they are outstanding, SecurePR
-does not bypass them. It calls GitHub's GraphQL
+does not bypass them. On pushes it cancels any prior auto-merge request before
+queueing a new revision, and it verifies the head again after enabling
+auto-merge, cancelling the request if the revision changed. It calls GitHub's GraphQL
 `enablePullRequestAutoMerge` mutation and records success only when GitHub
 confirms an enabled auto-merge request. This is not a confirmation that the PR
 has merged; only a GitHub merge event records `MERGED`.
 
-The dashboard distinguishes SecurePR global/repository opt-out, GitHub
-auto-merge disabled, missing App permission, pending/failed CI, missing
-required review, confirmed auto-merge request, and GitHub-confirmed merge.
-Every attempt and its response are stored in `github_actions` and review
-evidence. Failures are reported accurately; SecurePR never claims a merge
-without GitHub confirmation.
+The dashboard shows the saved account, repository, threshold, and enabled
+state. Every attempt and its response are stored in `github_actions` and
+review evidence. Failures are reported accurately; SecurePR never claims a
+merge without GitHub confirmation.
 
 ## 11. Start the application
 
@@ -322,12 +319,11 @@ automatically. Set the following backend **public configuration**:
 - `SECUREPR_ENV=production`
 - `SUPABASE_AUTH_AUDIENCE`
 - `SUPABASE_JWT_ALGORITHM`
-- `GEMINI_MODEL`, `GEMINI_FALLBACK_MODEL`, and
-  `GEMINI_REQUEST_TIMEOUT_SECONDS`
+- `GROQ_MODEL` (defaults to `openai/gpt-oss-120b`)
 - `REVIEW_RESULT_DEADLINE_SECONDS`
 - `CI_API_MAX_RETRIES`, `CI_FALLBACK_MAX_POLLS`,
   `CI_FALLBACK_POLL_INTERVAL_SECONDS`
-- `AUTO_MERGE_ENABLED`, `AUTO_MERGE_LOW_RISK_ONLY`, `AUTO_MERGE_METHOD`
+- `AUTO_MERGE_METHOD` (defaults to `SQUASH`; does not authorize auto-merge)
 - `SECUREPR_BASE_URL` — the Render HTTPS origin
 - `DASHBOARD_ORIGIN` — the canonical Vercel HTTPS origin
 - `DASHBOARD_ORIGINS` — comma-separated HTTPS CORS origins, including the
@@ -336,9 +332,24 @@ automatically. Set the following backend **public configuration**:
 Enter these backend **secrets/private settings** in Render:
 `DATABASE_URL`, `SUPABASE_URL`, `SECUREPR_OPERATOR_IDS`,
 `SECUREPR_ADMIN_IDS`, `GITHUB_APP_ID`, `GITHUB_PRIVATE_KEY`,
-`GITHUB_WEBHOOK_SECRET`, and `GEMINI_API_KEY`. `SUPABASE_JWT_SECRET` is needed
+`GITHUB_WEBHOOK_SECRET`, and `GROQ_API_KEY`. `SUPABASE_JWT_SECRET` is needed
 only when using legacy HS256 JWT signing. `NOTIFY_WEBHOOK_URL` is optional.
 Do not paste any of these values into this guide or a tracked file.
+
+Before upgrading an existing deployment, disable saved dashboard auto-approval
+and cancel every outstanding GitHub auto-merge request for installed
+repositories. A request already accepted by GitHub can outlive a backend
+deployment, so do not re-enable dashboard configurations until the migration,
+Groq verification, branch-protection checks, and controlled concurrency tests
+have passed.
+
+For an existing Gemini deployment, add `GROQ_API_KEY` as a secret on the
+Render backend service and set `GROQ_MODEL` there (the initial supported
+choice is `openai/gpt-oss-120b`). Remove `GEMINI_API_KEY`, `GEMINI_MODEL`,
+`GEMINI_REQUEST_TIMEOUT_SECONDS`, and `GEMINI_MAX_ATTEMPTS`. Also remove
+`AUTO_MERGE_ENABLED` and `AUTO_MERGE_LOW_RISK_ONLY`; neither is read or needed.
+Keep `AUTO_MERGE_METHOD` only as an operational preference. Never add
+`GROQ_API_KEY` to Vercel or any other frontend environment.
 
 Set these Vercel **public build environment variables** for Production,
 Preview, and Development as appropriate:
@@ -372,7 +383,7 @@ processing; a sleeping instance can delay webhook responses.
 | PostgreSQL driver install fails                                       | Re-run `pip install -r requirements.txt` in the backend environment.                                                                                                                                                                                                                                                                                 |
 | Database connection/schema errors                                    | Check that `DATABASE_URL` is a valid Supabase URL with URL-encoded password and `sslmode=require`, and that outbound network access to Supabase is available.                                                                                                                                                                                       |
 | Webhook never fires                                                   | Confirm the GitHub App's webhook URL is reachable from the internet (`ngrok` for local tests, permanent HTTPS backend URL for production), and that the App is installed on the repository.                                                                                                                                                           |
-| Gemini calls fail silently                                            | Check `GEMINI_API_KEY` is set; SecurePR falls back to heuristic-only scoring automatically and logs a warning — this is expected behavior, not a crash.                                                                                                                                                                                               |
+| Groq analysis is unavailable                                         | Check the `AI Review Status` and safe error category in the dashboard, then verify `GROQ_API_KEY`, quota, and the configured `GROQ_MODEL`. SecurePR does not substitute heuristic-only scores or approve without validated AI output.                                                                                                                                 |
 | GitHub review/comment doesn't post                                    | Check the App's permissions include Pull requests: Read & write, and that the installation ID stored for the repo matches an active installation.                                                                                                                                                                                                     |
 | AI review remains queued or processing                                 | Check the `background_jobs` row for the revision, `last_error`, attempt count, and worker logs. A final decision is intentionally withheld until CI verification succeeds or a failure is confirmed.                                                                      |
 | CI state is unavailable                                                | Check the stored `ci_revisions.error`, GitHub App Check/Status/Administration permissions, rate-limit responses, and webhook delivery history. Retries continue with capped backoff; no approval is published while verification is unavailable.                       |

@@ -31,6 +31,7 @@ logger = logging.getLogger("securepr")
 
 settings = get_settings()
 production_runtime = is_production_runtime(settings)
+migration_status = "not_checked"
 
 app = FastAPI(
     title="SecurePR",
@@ -64,6 +65,7 @@ app.include_router(dashboard.router)
 
 @app.on_event("startup")
 def on_startup():
+    global migration_status
     validate_production_settings(settings)
     if not settings.GITHUB_WEBHOOK_SECRET:
         logger.warning(
@@ -85,10 +87,12 @@ def on_startup():
                 "Production database migrations are not current; "
                 "run `alembic upgrade head` before starting the application."
             )
+        migration_status = "current"
     else:
         # Local development can create new databases; production schema changes
         # are exclusively applied by the Render pre-deploy migration command.
         Base.metadata.create_all(bind=get_engine())
+        migration_status = "local_schema_created"
     start_background_workers()
     logger.info("Database schema verified.")
 
@@ -125,6 +129,29 @@ def health():
         "service": "SecurePR",
         "env": settings.SECUREPR_ENV,
         "workers": workers,
+        "dependencies": {
+            "database": "available",
+            "migrations": migration_status,
+            "github_app": (
+                "configured"
+                if settings.GITHUB_APP_ID
+                and settings.GITHUB_WEBHOOK_SECRET
+                and (
+                    settings.GITHUB_PRIVATE_KEY
+                    or Path(settings.GITHUB_PRIVATE_KEY_PATH).is_file()
+                )
+                else "missing_configuration"
+            ),
+            "groq": {
+                "configuration": (
+                    "configured"
+                    if settings.GROQ_API_KEY and settings.GROQ_MODEL
+                    else "missing_configuration"
+                ),
+                "model": settings.GROQ_MODEL,
+                "reachability": "not_checked",
+            },
+        },
     }
 
 

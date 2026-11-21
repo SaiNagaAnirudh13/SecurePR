@@ -141,6 +141,9 @@ table tr.clickable:hover { background: var(--panel-2); }
 .badge.APPROVED { background: var(--green-soft); color: var(--green); }
 .badge.BLOCKED { background: var(--red-soft); color: var(--red); }
 .badge.MANUAL_REVIEW { background: var(--yellow-soft); color: var(--yellow); }
+.badge.REVIEW_UNAVAILABLE, .badge.AI_FAILED, .badge.AI_UNAVAILABLE, .badge.AI_INVALID_RESPONSE { background: rgba(246,179,60,.15); color: var(--yellow); }
+.badge.WAITING_FOR_AI, .badge.AI_PENDING, .badge.AI_RUNNING { background: var(--accent-soft); color: var(--accent); }
+.badge.AI_COMPLETED { background: var(--green-soft); color: var(--green); }
 .badge.WAITING_FOR_CI { background: var(--accent-soft); color: var(--accent); }
 .badge.PENDING { background: rgba(144,160,189,.15); color: var(--muted); }
 .badge.LOW { background: var(--green-soft); color: var(--green); }
@@ -155,6 +158,7 @@ table tr.clickable:hover { background: var(--panel-2); }
 .badge.pending, .badge.running, .badge.discovering { background: var(--accent-soft); color: var(--accent); }
 .badge.neutral, .badge.no_checks, .badge.unknown { background: rgba(144,160,189,.15); color: var(--muted); }
 .badge.unavailable, .badge.timed_out { background: rgba(246,179,60,.15); color: var(--yellow); }
+.ai-unavailable { color: var(--yellow); font-weight: 700; }
 
 .avatar-chip { display: inline-flex; align-items: center; gap: 8px; }
 .avatar-circle {

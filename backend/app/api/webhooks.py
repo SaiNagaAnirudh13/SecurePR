@@ -3,7 +3,7 @@ import hmac
 import json
 import logging
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 from fastapi import (
     APIRouter,
@@ -18,7 +18,9 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.db import get_db
 from app.models import models as m
+from app.services import auto_merge
 from app.services.background_jobs import enqueue_job
+from app.services.pipeline import _revision_finalization_lock
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
@@ -384,6 +386,7 @@ def _get_or_create_pr(
             title=gh_pr.get("title", ""),
             author_login=gh_pr.get("user", {}).get("login", ""),
             head_sha=gh_pr.get("head", {}).get("sha", ""),
+            ai_state="AI_PENDING",
             base_branch=gh_pr.get("base", {}).get("ref", ""),
             head_branch=gh_pr.get("head", {}).get("ref", ""),
             state=gh_pr.get("state", ""),
@@ -404,10 +407,16 @@ def _get_or_create_pr(
             pr_number,
         )
 
-        pr.head_sha = gh_pr.get("head", {}).get(
+        new_head_sha = gh_pr.get("head", {}).get(
             "sha",
             pr.head_sha,
         )
+        if new_head_sha != pr.head_sha:
+            pr.ai_state = "AI_PENDING"
+            pr.ai_error_code = None
+            pr.ai_retryable_at = None
+            pr.ai_attempt_id = None
+        pr.head_sha = new_head_sha
         pr.title = gh_pr.get("title", pr.title)
         pr.author_login = gh_pr.get("user", {}).get("login", pr.author_login)
         pr.base_branch = gh_pr.get("base", {}).get("ref", pr.base_branch)
@@ -896,6 +905,45 @@ async def github_webhook(
                 "repository_id": str(repo.id),
                 "pull_request_id": str(pr.id),
             }
+
+        if action == "synchronize":
+            owner, repo_name = repo.full_name.split("/", 1)
+            repository_id = cast(str, repo.id)
+            pull_request_id = cast(str, pr.id)
+            pr_number = cast(int, pr.github_pr_number)
+            synchronized_sha = cast(str, expected_head_sha)
+            try:
+                with _revision_finalization_lock(
+                    db,
+                    repository_id,
+                    pr_number,
+                    head_sha=synchronized_sha,
+                    operation="auto-merge-cancellation",
+                ):
+                    db.commit()
+                    db.expire_all()
+                    auto_merge.cancel_pending_auto_merge(
+                        installation_id=installation_id,
+                        owner=owner,
+                        repo_name=repo_name,
+                        pr_number=pr_number,
+                        db=db,
+                        pull_request_id=pull_request_id,
+                        new_head_sha=synchronized_sha,
+                    )
+            except Exception as exc:
+                logger.exception(
+                    "Could not cancel an existing auto-merge request before "
+                    "processing the new PR revision: repository=%s pr_number=%s "
+                    "head_sha=%s",
+                    repo.full_name,
+                    pr.github_pr_number,
+                    expected_head_sha,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Existing GitHub auto-merge state could not be safely reconciled.",
+                ) from exc
 
         logger.info(
             "PR analysis queued: event_type=%s repository=%s pr_number=%s "

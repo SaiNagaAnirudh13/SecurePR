@@ -48,6 +48,9 @@ def postgres_migration_database():
     connection = engine.connect()
     with connection.begin():
         connection.exec_driver_sql(
+            "CREATE TABLE repositories (id VARCHAR(36) PRIMARY KEY)"
+        )
+        connection.exec_driver_sql(
             """
             CREATE TABLE pull_requests (
                 id VARCHAR(36) PRIMARY KEY,
@@ -67,7 +70,27 @@ def postgres_migration_database():
         connection.exec_driver_sql(
             """
             CREATE TABLE reviews (
-                id VARCHAR(36) PRIMARY KEY
+                id VARCHAR(36) PRIMARY KEY,
+                decision VARCHAR(14) NOT NULL DEFAULT 'PENDING',
+                lifecycle_state VARCHAR(14) NOT NULL DEFAULT 'RECEIVED'
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE background_jobs (
+                id VARCHAR(36) PRIMARY KEY,
+                job_type VARCHAR(32) NOT NULL,
+                state VARCHAR(16) NOT NULL DEFAULT 'QUEUED'
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE auto_approval_eligibility (
+                id VARCHAR(36) PRIMARY KEY,
+                is_enabled BOOLEAN NOT NULL DEFAULT false,
+                max_risk_threshold INTEGER NOT NULL DEFAULT 39
             )
             """
         )
@@ -108,6 +131,25 @@ def postgres_migration_database():
                 "VALUES ('existing-publication', 'REVIEW')"
             )
         )
+        connection.execute(
+            text(
+                "INSERT INTO reviews (id, decision, lifecycle_state) "
+                "VALUES ('existing-review', 'PENDING', 'RECEIVED')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO background_jobs (id, job_type, state) "
+                "VALUES ('existing-job', 'REVIEW', 'QUEUED')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO auto_approval_eligibility "
+                "(id, is_enabled, max_risk_threshold) "
+                "VALUES ('existing-policy', true, 39)"
+            )
+        )
 
     config = Config(os.path.join(BACKEND_DIR, "alembic.ini"))
     config.attributes["connection"] = connection
@@ -137,7 +179,14 @@ def test_postgres_migration_adds_columns_and_preserves_existing_pr(
             )
         )
     }
-    assert {"merged_at", "merge_commit_sha"}.issubset(columns)
+    assert {
+        "merged_at",
+        "merge_commit_sha",
+        "ai_state",
+        "ai_error_code",
+        "ai_retryable_at",
+        "ai_attempt_id",
+    }.issubset(columns)
     assert connection.execute(
         text("SELECT id, title, head_sha FROM pull_requests WHERE id = 'existing-pr'")
     ).one() == ("existing-pr", "Existing PR", "original-sha")
@@ -146,6 +195,7 @@ def test_postgres_migration_adds_columns_and_preserves_existing_pr(
         migrated_pr = session.query(m.PullRequest).filter_by(id="existing-pr").one()
         assert migrated_pr.merged_at is None
         assert migrated_pr.merge_commit_sha is None
+        assert migrated_pr.ai_state == "AI_UNAVAILABLE"
     finally:
         session.close()
 
@@ -157,6 +207,113 @@ def test_postgres_migration_adds_columns_and_preserves_existing_pr(
         )
     ).scalar_one()
     assert publication_length == 64
+    assert connection.execute(
+        text(
+            "SELECT decision, lifecycle_state FROM reviews WHERE id = 'existing-review'"
+        )
+    ).one() == ("PENDING", "RECEIVED")
+    assert (
+        connection.execute(
+            text("SELECT lease_token FROM background_jobs WHERE id = 'existing-job'")
+        ).scalar_one()
+        == 0
+    )
+    assert (
+        connection.execute(
+            text(
+                "SELECT policy_revision FROM auto_approval_eligibility "
+                "WHERE id = 'existing-policy'"
+            )
+        ).scalar_one()
+        == 0
+    )
+    state_lengths = connection.execute(
+        text(
+            "SELECT column_name, character_maximum_length "
+            "FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = 'reviews' "
+            "AND column_name IN ('decision', 'lifecycle_state')"
+        )
+    ).all()
+    assert dict(state_lengths) == {"decision": 40, "lifecycle_state": 40}
+
+
+def test_postgres_migration_saves_all_decision_and_lifecycle_states(
+    postgres_migration_database,
+):
+    connection, config = postgres_migration_database
+    command.upgrade(config, "head")
+
+    for decision in m.DecisionStatus:
+        connection.execute(
+            text(
+                "UPDATE reviews SET decision = :decision WHERE id = 'existing-review'"
+            ),
+            {"decision": decision.value},
+        )
+        assert (
+            connection.execute(
+                text("SELECT decision FROM reviews WHERE id = 'existing-review'")
+            ).scalar_one()
+            == decision.value
+        )
+
+    lifecycle_states = {"RECEIVED", "ANALYSIS_FAILED"} | {
+        decision.value for decision in m.DecisionStatus
+    }
+    for lifecycle_state in lifecycle_states:
+        connection.execute(
+            text(
+                "UPDATE reviews SET lifecycle_state = :lifecycle_state "
+                "WHERE id = 'existing-review'"
+            ),
+            {"lifecycle_state": lifecycle_state},
+        )
+        assert (
+            connection.execute(
+                text("SELECT lifecycle_state FROM reviews WHERE id = 'existing-review'")
+            ).scalar_one()
+            == lifecycle_state
+        )
+
+
+def test_postgres_migration_keeps_preexpanded_columns_and_existing_values(
+    postgres_migration_database,
+):
+    connection, config = postgres_migration_database
+    command.upgrade(config, "20261120_02")
+
+    with connection.begin():
+        connection.exec_driver_sql(
+            "ALTER TABLE reviews ALTER COLUMN decision TYPE VARCHAR(64)"
+        )
+        connection.exec_driver_sql(
+            "ALTER TABLE reviews ALTER COLUMN lifecycle_state TYPE VARCHAR(64)"
+        )
+        connection.execute(
+            text(
+                "UPDATE reviews SET decision = 'REVIEW_UNAVAILABLE', "
+                "lifecycle_state = 'REVIEW_UNAVAILABLE' "
+                "WHERE id = 'existing-review'"
+            )
+        )
+
+    command.upgrade(config, "head")
+
+    lengths = connection.execute(
+        text(
+            "SELECT column_name, character_maximum_length "
+            "FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = 'reviews' "
+            "AND column_name IN ('decision', 'lifecycle_state')"
+        )
+    ).all()
+    assert dict(lengths) == {"decision": 64, "lifecycle_state": 64}
+    assert connection.execute(
+        text(
+            "SELECT decision, lifecycle_state FROM reviews WHERE id = 'existing-review'"
+        )
+    ).one() == ("REVIEW_UNAVAILABLE", "REVIEW_UNAVAILABLE")
 
 
 def test_postgres_migration_rerun_is_safe(postgres_migration_database):
@@ -177,10 +334,28 @@ def test_postgres_migration_rerun_is_safe(postgres_migration_database):
                 "SELECT COUNT(*) FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "
                 "AND table_name = 'pull_requests' "
-                "AND column_name IN ('merged_at', 'merge_commit_sha')"
+                "AND column_name IN ('merged_at', 'merge_commit_sha', 'ai_state', "
+                "'ai_error_code', 'ai_retryable_at', 'ai_attempt_id')"
+            )
+        ).scalar_one()
+        == 6
+    )
+    assert (
+        connection.execute(
+            text(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND ((table_name = 'reviews' AND column_name = 'auto_merge_policy_revision') "
+                "OR (table_name = 'auto_approval_eligibility' AND column_name = 'policy_revision'))"
             )
         ).scalar_one()
         == 2
+    )
+    assert (
+        connection.execute(
+            text("SELECT lease_token FROM background_jobs WHERE id = 'existing-job'")
+        ).scalar_one()
+        == 0
     )
 
 
@@ -264,3 +439,8 @@ def test_pull_request_model_is_usable_after_schema_creation(tmp_path):
     finally:
         session.close()
         engine.dispose()
+
+
+def test_review_model_state_columns_fit_ai_lifecycle_values():
+    assert m.Review.__table__.c.decision.type.length == 40
+    assert m.Review.__table__.c.lifecycle_state.type.length == 40

@@ -82,7 +82,7 @@ def test_dashboard_route_rejects_missing_bearer_token(monkeypatch):
     "token",
     [
         "not-a-jwt",
-        make_token(key="wrong-signing-key"),
+        make_token(key="another-test-signing-key-not-the-right-one"),
         make_token(exp_offset=-60),
     ],
 )
@@ -174,11 +174,14 @@ def test_webhook_rejects_missing_or_invalid_hmac_without_bearer(monkeypatch, sig
 
 def test_valid_hmac_webhook_does_not_require_supabase_bearer(monkeypatch):
     body = b'{"zen":"test"}'
-    signature = "sha256=" + hmac.new(
-        WEBHOOK_SECRET.encode(),
-        body,
-        hashlib.sha256,
-    ).hexdigest()
+    signature = (
+        "sha256="
+        + hmac.new(
+            WEBHOOK_SECRET.encode(),
+            body,
+            hashlib.sha256,
+        ).hexdigest()
+    )
     response = make_client(monkeypatch).post(
         "/webhooks/github",
         content=body,

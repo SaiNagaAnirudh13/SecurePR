@@ -6,6 +6,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
@@ -23,7 +24,7 @@ from sqlalchemy import (
     true,
 )
 from sqlalchemy import Enum as SAEnum
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.db import Base
 
@@ -36,6 +37,8 @@ class DecisionStatus(str, enum.Enum):
     APPROVED = "APPROVED"
     BLOCKED = "BLOCKED"
     MANUAL_REVIEW = "MANUAL_REVIEW"
+    REVIEW_UNAVAILABLE = "REVIEW_UNAVAILABLE"
+    WAITING_FOR_AI = "WAITING_FOR_AI"
     WAITING_FOR_CI = "WAITING_FOR_CI"
     PENDING = "PENDING"
 
@@ -83,9 +86,6 @@ class Repository(Base):
     )
     installation_id = Column(String(64))
     is_active = Column(Boolean, default=True, nullable=False, server_default=true())
-    is_auto_merge_enabled = Column(
-        Boolean, default=False, nullable=False, server_default=false()
-    )
     created_at = Column(
         DateTime, default=datetime.utcnow, nullable=False, server_default=func.now()
     )
@@ -108,6 +108,15 @@ class PullRequest(Base):
     state = Column(
         String(32), default="open", nullable=False, server_default=text("'open'")
     )
+    ai_state = Column(
+        String(32),
+        default="AI_UNAVAILABLE",
+        nullable=False,
+        server_default=text("'AI_UNAVAILABLE'"),
+    )
+    ai_error_code = Column(String(64), nullable=True)
+    ai_retryable_at = Column(DateTime, nullable=True)
+    ai_attempt_id = Column(String(36), nullable=True)
     merged_at = Column(DateTime, nullable=True)
     merge_commit_sha = Column(String(64), nullable=True)
     created_at = Column(
@@ -213,6 +222,9 @@ class AutoApprovalEligibility(Base):
     max_risk_threshold = Column(
         Integer, default=39, nullable=False, server_default=text("39")
     )
+    policy_revision: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
     updated_by = Column(String(255))
     updated_at = Column(
         DateTime,
@@ -283,6 +295,7 @@ class Review(Base):
             native_enum=False,
             create_constraint=True,
             name="ck_reviews_decision",
+            length=40,
         ),
         default=DecisionStatus.PENDING,
         nullable=False,
@@ -290,11 +303,24 @@ class Review(Base):
     )
     decision_reasons = Column(JSON)  # list[str]
     lifecycle_state = Column(
-        String(32),
+        String(40),
         default="RECEIVED",
         nullable=False,
         server_default=text("'RECEIVED'"),
     )
+    ai_state = Column(
+        String(32),
+        default="AI_UNAVAILABLE",
+        nullable=False,
+        server_default=text("'AI_UNAVAILABLE'"),
+    )
+    ai_error_code = Column(String(64), nullable=True)
+    ai_retryable_at = Column(DateTime, nullable=True)
+    ai_attempt_id = Column(String(36), nullable=True)
+    ai_provider = Column(String(32), nullable=True)
+    ai_model = Column(String(128), nullable=True)
+    ai_input_tokens = Column(Integer, nullable=True)
+    ai_output_tokens = Column(Integer, nullable=True)
     ci_verified_at = Column(DateTime, nullable=True)
     circuit_breaker_active = Column(
         Boolean, default=False, nullable=False, server_default=false()
@@ -307,6 +333,9 @@ class Review(Base):
     # Kept separate from the immutable SecurePR decision: GitHub may reject a
     # merge for branch-protection, permissions, or a race after approval.
     auto_merge_status = Column(String(48), nullable=True)
+    auto_merge_policy_revision: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
     auto_merge_attempted_at = Column(DateTime, nullable=True)
     auto_merged_at = Column(DateTime, nullable=True)
     merge_commit_sha = Column(String(64), nullable=True)
@@ -356,6 +385,9 @@ class BackgroundJob(Base):
         String(16), nullable=False, default="QUEUED", server_default=text("'QUEUED'")
     )
     attempts = Column(Integer, nullable=False, default=0, server_default=text("0"))
+    lease_token = Column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
     available_at = Column(
         DateTime, nullable=False, default=datetime.utcnow, server_default=func.now()
     )
@@ -374,6 +406,49 @@ class BackgroundJob(Base):
 
     __table_args__ = (
         Index("ix_background_jobs_dispatch", "job_type", "state", "available_at"),
+    )
+
+
+class RevisionOperation(Base):
+    """Lease for one operation on an immutable pull-request revision."""
+
+    __tablename__ = "revision_operations"
+    id = Column(String(36), primary_key=True, default=gen_uuid)
+    repository_id = Column(
+        String(36), ForeignKey("repositories.id"), nullable=False
+    )
+    pull_request_id = Column(
+        String(36), ForeignKey("pull_requests.id"), nullable=False
+    )
+    head_sha = Column(String(64), nullable=False)
+    operation = Column(String(128), nullable=False)
+    state = Column(
+        String(16), nullable=False, default="QUEUED", server_default=text("'QUEUED'")
+    )
+    attempts = Column(Integer, nullable=False, default=0, server_default=text("0"))
+    owner_token = Column(String(36), nullable=True)
+    available_at = Column(
+        DateTime, nullable=False, default=datetime.utcnow, server_default=func.now()
+    )
+    lease_until = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
+    updated_at = Column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "repository_id",
+            "pull_request_id",
+            "head_sha",
+            "operation",
+            name="uq_revision_operation_identity",
+        ),
+        Index("ix_revision_operations_lease", "state", "available_at", "lease_until"),
     )
 
 

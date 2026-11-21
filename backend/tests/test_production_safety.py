@@ -31,7 +31,9 @@ def production_settings(**overrides):
 def test_production_requires_webhook_secret():
     settings = production_settings(GITHUB_WEBHOOK_SECRET="")
 
-    with pytest.raises(RuntimeError, match="requires configuration for: GITHUB_WEBHOOK_SECRET"):
+    with pytest.raises(
+        RuntimeError, match="requires configuration for: GITHUB_WEBHOOK_SECRET"
+    ):
         validate_production_settings(settings)
 
 
@@ -48,7 +50,9 @@ def test_production_requires_inline_or_existing_github_private_key():
 def test_production_requires_supabase_auth_audience():
     settings = production_settings(SUPABASE_AUTH_AUDIENCE="")
 
-    with pytest.raises(RuntimeError, match="requires configuration for: SUPABASE_AUTH_AUDIENCE"):
+    with pytest.raises(
+        RuntimeError, match="requires configuration for: SUPABASE_AUTH_AUDIENCE"
+    ):
         validate_production_settings(settings)
 
 
@@ -60,14 +64,18 @@ def test_production_requires_operator_allowlists():
 
 
 def test_production_rejects_database_without_ssl():
-    settings = production_settings(DATABASE_URL="postgresql://securepr@db.example.invalid/postgres")
+    settings = production_settings(
+        DATABASE_URL="postgresql://securepr@db.example.invalid/postgres"
+    )
 
     with pytest.raises(RuntimeError, match="DATABASE_URL must use SSL"):
         validate_production_settings(settings)
 
 
 def test_hs256_production_requires_server_side_signing_secret():
-    settings = production_settings(SUPABASE_JWT_ALGORITHM="HS256", SUPABASE_JWT_SECRET="")
+    settings = production_settings(
+        SUPABASE_JWT_ALGORITHM="HS256", SUPABASE_JWT_SECRET=""
+    )
 
     with pytest.raises(RuntimeError, match="requires a SUPABASE_JWT_SECRET"):
         validate_production_settings(settings)
@@ -91,7 +99,9 @@ def test_platform_port_activates_production_validation(monkeypatch):
     monkeypatch.setenv("PORT", "8000")
 
     with pytest.raises(RuntimeError, match="requires configuration"):
-        validate_production_settings(Settings(_env_file=None, SECUREPR_ENV="development"))
+        validate_production_settings(
+            Settings(_env_file=None, SECUREPR_ENV="development")
+        )
 
 
 def test_production_cors_uses_only_configured_dashboard_origins():
@@ -120,7 +130,9 @@ def test_cors_rejects_wildcard_origins():
 
 
 def test_production_cors_rejects_default_local_origin():
-    settings = production_settings(DASHBOARD_ORIGINS="", DASHBOARD_ORIGIN="http://localhost:5173")
+    settings = production_settings(
+        DASHBOARD_ORIGINS="", DASHBOARD_ORIGIN="http://localhost:5173"
+    )
 
     with pytest.raises(ValueError, match="non-local"):
         get_dashboard_origins(settings)
@@ -129,11 +141,20 @@ def test_production_cors_rejects_default_local_origin():
 def test_run_uses_platform_port(monkeypatch):
     import run
 
-    called = {}
+    calls = []
     monkeypatch.setenv("PORT", "12345")
-    monkeypatch.setattr(run.uvicorn, "run", lambda *args, **kwargs: called.update(kwargs))
+    monkeypatch.setattr(run, "get_settings", lambda: object())
+    monkeypatch.setattr(run, "is_production_runtime", lambda _: True)
+    monkeypatch.setattr(
+        run, "_upgrade_production_schema", lambda: calls.append("migrate")
+    )
+    monkeypatch.setattr(
+        run.uvicorn, "run", lambda *args, **kwargs: calls.append(("serve", kwargs))
+    )
 
     run.main()
 
-    assert called["host"] == "0.0.0.0"
-    assert called["port"] == 12345
+    assert calls == [
+        "migrate",
+        ("serve", {"host": "0.0.0.0", "port": 12345}),
+    ]
