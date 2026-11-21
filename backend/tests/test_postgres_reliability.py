@@ -294,15 +294,17 @@ def test_transient_database_job_failure_is_rescheduled(isolated_job_sessions):
         )
         assert recorded
 
-        db.refresh(claimed)
-        assert claimed.state == "QUEUED"
-        assert claimed.available_at > datetime.utcnow()
-        claimed.available_at = datetime.utcnow() - timedelta(seconds=1)
+        persisted = (
+            db.query(m.BackgroundJob).filter(m.BackgroundJob.id == claimed.id).one()
+        )
+        assert persisted.state == "QUEUED"
+        assert persisted.available_at > datetime.utcnow()
+        persisted.available_at = datetime.utcnow() - timedelta(seconds=1)
         db.commit()
         retried = background_jobs._Worker("REVIEW")._claim(db)
 
         assert retried is not None
-        assert retried.id == claimed.id
+        assert retried.id == persisted.id
         assert retried.attempts == 2
 
 

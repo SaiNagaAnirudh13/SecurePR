@@ -171,21 +171,22 @@ def test_transient_database_failure_remains_retryable(tmp_path):
         job_type="REVIEW",
         idempotency_key="review:transient-error",
         payload={},
-        state="RUNNING",
-        attempts=1,
-        available_at=datetime.utcnow(),
-        lease_until=datetime.utcnow() + timedelta(minutes=5),
     )
     session.add(job)
     session.commit()
 
+    claimed = _Worker("REVIEW")._claim(session)
+    assert claimed is not None
     _record_job_failure(
         session,
-        job,
+        claimed,
         OperationalError("SELECT 1", {}, Exception("connection interrupted")),
+        expected_lease_token=claimed.lease_token,
     )
 
-    assert job.state == "QUEUED"
+    persisted = session.query(m.BackgroundJob).filter_by(id=claimed.id).one()
+    assert persisted.state == "QUEUED"
+    assert persisted.attempts == 1
     session.close()
     engine.dispose()
 
